@@ -105,8 +105,9 @@ static int bq27xxx_battery_hdq_add_slave(struct w1_slave *sl)
 	if (match) {
 		di->chip = (uintptr_t)match->data;
 		di->name = "battery";
-		di->cache_only = true;
-		di->cache_refresh_ms = 30000;
+		/* Only the BQ27545 profile needs cached telemetry. */
+		di->cache_only = di->chip == BQ27545;
+		di->cache_refresh_ms = di->cache_only ? 30000 : 0;
 		if (of_device_is_compatible(sl->dev.of_node,
 					    "apple,d11-bq27545") ||
 		    of_device_is_compatible(sl->dev.of_node,
@@ -149,6 +150,7 @@ static const struct of_device_id bq27xxx_battery_hdq_of_match[] = {
 	{ .compatible = "apple,d11-bq27545", .data = (void *)BQ27545 },
 	{ .compatible = "apple,d111-bq27545", .data = (void *)BQ27545 },
 	{ .compatible = "ti,bq27545-hdq", .data = (void *)BQ27545 },
+	{ .compatible = "ti,bq27540-hdq", .data = (void *)BQ27541 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, bq27xxx_battery_hdq_of_match);
