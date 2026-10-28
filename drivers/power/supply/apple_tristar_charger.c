@@ -8,7 +8,11 @@
  * board maximum:
  *   USB-C cable: CC level on the orientation-selected lane (1.5 A / 3 A)
  *   USB-A cable: Apple D+/D- divider (BrickID) on both Tristar mux banks
+ *   USB host: what the USB device controller reports through vbus_draw
+ *             above 500 mA (an Apple host's current grant)
  * Anything unidentified gets the fallback, the 500 mA of a USB 2.0 port.
+ * The mux is not sampled while a USB session is active: mux changes have
+ * stalled USB data.
  *
  * A source change does not reset the limit in hardware. The PMIC's event
  * controller runs the handler of its PMU line before it reads the event
@@ -132,6 +136,9 @@ struct tristar_charger {
 	unsigned int code;	/* last verified input limit */
 	unsigned int target_code;
 	unsigned int source_ma;
+	/* What the USB host allows (vbus_draw), valid for usb_epoch only. */
+	unsigned int usb_ma;
+	unsigned int usb_epoch;
 	enum power_supply_usb_type usb_type;
 	char source[96];
 	u64 attach_ns;
@@ -534,6 +541,50 @@ static int tristar_identify(struct tristar_charger *chg, unsigned int *ma,
 
 /* ---- Policy ---- */
 
+/*
+ * A USB session reported in this epoch: a PMU source event may mean another
+ * host, so it ends what the previous one allowed. Caller holds lock.
+ */
+static unsigned int tristar_usb_ma(struct tristar_charger *chg)
+{
+	return chg->usb_epoch == READ_ONCE(chg->epoch) ? chg->usb_ma : 0;
+}
+
+/*
+ * The device controller reported a host and no disconnect since, in any
+ * epoch: a PMU event ends a host's allowance, not its data session, so the
+ * mux stays untouched until the session ends. Caller holds lock.
+ */
+static bool tristar_usb_session(struct tristar_charger *chg)
+{
+	return chg->usb_ma;
+}
+
+/* The highest grant the source allows, up to the board maximum. */
+static unsigned int tristar_target_code(struct tristar_charger *chg)
+{
+	unsigned int ma = max(chg->source_ma, tristar_usb_ma(chg));
+
+	if (ma <= tristar_code_ma(TRISTAR_CHG_FALLBACK_CODE))
+		return TRISTAR_CHG_FALLBACK_CODE;
+	return tristar_ma_code(min(ma, chg->max_ma));
+}
+
+/* Follow a changed allowance once the source is identified. Caller holds lock. */
+static void tristar_update_target(struct tristar_charger *chg)
+{
+	if (chg->phase != TRISTAR_RAMPING && chg->phase != TRISTAR_CHARGING)
+		return;
+	chg->target_code = tristar_target_code(chg);
+	if (chg->code > chg->target_code) {
+		tristar_withdraw(chg, chg->target_code);
+		chg->phase = TRISTAR_CHARGING;
+	} else if (chg->code < chg->target_code && chg->phase == TRISTAR_CHARGING) {
+		chg->phase = TRISTAR_RAMPING;
+		chg->step_ns = 0;
+	}
+}
+
 static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 {
 	chg->present = true;
@@ -554,9 +605,17 @@ static void tristar_run_identification(struct tristar_charger *chg, u64 now)
 {
 	unsigned int ma, fallback_ma = tristar_code_ma(TRISTAR_CHG_FALLBACK_CODE);
 	char what[sizeof(chg->source)];
+	bool usb = tristar_usb_session(chg);
 	int ret;
 
-	ret = tristar_identify(chg, &ma, what, sizeof(what));
+	if (usb) {
+		/* A USB session is active: do not disturb its data lines. */
+		ma = 0;
+		strscpy(what, "USB host", sizeof(what));
+		ret = 0;
+	} else {
+		ret = tristar_identify(chg, &ma, what, sizeof(what));
+	}
 	if (ret == -EUCLEAN) {
 		chg->phase = TRISTAR_FAULT;
 		strscpy(chg->source, "Tristar mux restore failed", sizeof(chg->source));
@@ -576,7 +635,7 @@ static void tristar_run_identification(struct tristar_charger *chg, u64 now)
 		}
 		return;
 	}
-	if (!ma && chg->retries < TRISTAR_UNIDENTIFIED_RETRIES) {
+	if (!ma && !usb && chg->retries < TRISTAR_UNIDENTIFIED_RETRIES) {
 		chg->retries++;
 		/* The settle check fires SETTLE_MS after attach_ns. */
 		chg->attach_ns = now + (TRISTAR_RETRY_MS - TRISTAR_SETTLE_MS) * NSEC_PER_MSEC;
@@ -586,8 +645,7 @@ static void tristar_run_identification(struct tristar_charger *chg, u64 now)
 	}
 	strscpy(chg->source, what, sizeof(chg->source));
 	chg->source_ma = ma;
-	chg->target_code = ma > fallback_ma ?
-		tristar_ma_code(min(ma, chg->max_ma)) : TRISTAR_CHG_FALLBACK_CODE;
+	chg->target_code = tristar_target_code(chg);
 	if (chg->target_code <= TRISTAR_CHG_FALLBACK_CODE) {
 		chg->phase = TRISTAR_CHARGING;
 		dev_dbg(chg->dev, "%s: %u mA\n", what, fallback_ma);
@@ -665,6 +723,7 @@ static void tristar_poll(struct work_struct *work)
 			chg->phase = TRISTAR_EMPTY;
 			chg->source[0] = '\0';
 			chg->source_ma = 0;
+			chg->usb_ma = 0;
 			chg->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 			if (tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE))
 				dev_crit(chg->dev, "Handoff write failed; input limit unverified\n");
@@ -840,19 +899,58 @@ static int tristar_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		val->intval = chg->usb_type;
+		if (val->intval == POWER_SUPPLY_USB_TYPE_UNKNOWN && tristar_usb_session(chg))
+			val->intval = POWER_SUPPLY_USB_TYPE_SDP;
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 		val->intval = tristar_code_ma(chg->code) * 1000;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		/* What the identified source advertises; 0 when unknown. */
-		val->intval = chg->source_ma * 1000;
+		/* What the identified source or USB host allows; 0 when unknown. */
+		val->intval = max(chg->source_ma, tristar_usb_ma(chg)) * 1000;
 		break;
 	default:
 		mutex_unlock(&chg->lock);
 		return -EINVAL;
 	}
 	mutex_unlock(&chg->lock);
+	return 0;
+}
+
+/*
+ * The USB device controller reports what the host allows the device to draw
+ * (vbus_draw) as the input current limit: 0 without a session, 100 mA
+ * unconfigured, the configuration's bMaxPower, 2 mA suspended, or more after
+ * an Apple host's current grant. Not writable from user space.
+ */
+static int tristar_set_property(struct power_supply *psy,
+				enum power_supply_property psp,
+				const union power_supply_propval *val)
+{
+	struct tristar_charger *chg = power_supply_get_drvdata(psy);
+	unsigned int old_code;
+
+	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
+		return -EINVAL;
+
+	mutex_lock(&chg->lock);
+	old_code = chg->code;
+	/*
+	 * With nothing attached there is no session: a late report (the
+	 * suspend draw after a disconnect) must not make the next source look
+	 * like a USB host.
+	 */
+	chg->usb_ma = chg->present ? max(val->intval, 0) / 1000 : 0;
+	chg->usb_epoch = READ_ONCE(chg->epoch);
+	dev_dbg(chg->dev, "USB host allows %u mA\n", chg->usb_ma);
+	if (!chg->stopping) {
+		tristar_update_target(chg);
+		mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
+	}
+	mutex_unlock(&chg->lock);
+
+	if (READ_ONCE(chg->code) != old_code)
+		power_supply_changed(psy);
 	return 0;
 }
 
@@ -867,11 +965,13 @@ static const struct power_supply_desc tristar_desc = {
 	.name = "lightning",
 	.type = POWER_SUPPLY_TYPE_USB,
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
+		     BIT(POWER_SUPPLY_USB_TYPE_SDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID) |
 		     BIT(POWER_SUPPLY_USB_TYPE_C),
 	.properties = tristar_properties,
 	.num_properties = ARRAY_SIZE(tristar_properties),
 	.get_property = tristar_get_property,
+	.set_property = tristar_set_property,
 };
 
 /* ---- Probe ---- */

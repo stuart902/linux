@@ -381,10 +381,12 @@ config APPLE_TRISTAR_CHARGER
 	  (CBTL1610) Lightning port controller, such as the iPad 5 and iPad 6.
 
 	  The driver identifies the attached source (Apple USB-A chargers by
-	  their BrickID, USB-C sources by their CC advertisement) and raises
-	  the PMIC input-current limit to what the source supports, up to the
-	  board maximum. Unidentified sources get 500 mA. Every source change
-	  drops the limit before the new source is identified.
+	  their BrickID, USB-C sources by their CC advertisement, USB hosts by
+	  what the USB device controller reports) and raises the PMIC
+	  input-current limit to what the source supports, up to the board
+	  maximum. Unidentified sources get 500 mA. Every source change drops
+	  the limit before the new source is identified. PMU events come from
+	  the PMIC GPIO driver's event interrupt controller.
 
 	  This driver can also be built as a module. If so, the module will be
 	  called apple_tristar_charger.
