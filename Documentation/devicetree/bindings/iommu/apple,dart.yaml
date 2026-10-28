@@ -61,11 +61,43 @@ properties:
   power-domains:
     maxItems: 1
 
+  apple,error-reflector:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Physical address of the page that faulting transactions are redirected
+      to, so that they complete instead of stalling the master. From the
+      Apple device tree property "error-reflector" of the same DART.
+
+  apple,fetch-config:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Value of the table fetch configuration register, from the Apple device
+      tree property "fetch-config" of the same DART.
+
+  apple,diag-config:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Value of the diagnostic configuration register, from the Apple device
+      tree property "diag-config" of the same DART.
+
 required:
   - compatible
   - reg
   - '#iommu-cells'
   - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,s5l8960x-dart
+    then:
+      properties:
+        apple,error-reflector: false
+        apple,fetch-config: false
+        apple,diag-config: false
 
 additionalProperties: false
 
@@ -98,4 +130,15 @@ examples:
 
     master2 {
       iommus = <&dart2a 0>, <&dart2b 1>;
+    };
+
+  - |+
+    dart3: iommu@1008000 {
+      compatible = "apple,s8000-dart", "apple,s5l8960x-dart";
+      reg = <0x1008000 0x4000>;
+      interrupts = <1 245 4>;
+      #iommu-cells = <5>;
+      apple,error-reflector = /bits/ 64 <0x20fffc000>;
+      apple,fetch-config = <0x000e0303>;
+      apple,diag-config = <0x00000100>;
     };
