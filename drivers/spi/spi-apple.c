@@ -45,6 +45,7 @@
 
 #define APPLE_SPI_CFG_T8010_BASE	0x0010401e
 #define APPLE_SPI_CFG_T7000_BASE	0x00004018
+#define APPLE_SPI_CFG_S8000_BASE	0x00004018
 #define APPLE_SPI_CFG_T8010_PIOEN	BIT(5)
 #define APPLE_SPI_CFG_T8010_16BIT	BIT(15)
 
@@ -120,8 +121,16 @@
 struct apple_spi_hw {
 	bool legacy_status;
 	bool has_descriptor_dma;
+	/* T7000: the SPI version 1 configuration register layout. */
+	bool spi_v1;
+	/*
+	 * S8000: the T8010 register layout, driven by byte-wide PIO only,
+	 * without the descriptor format, DMA or the interrupt registers.
+	 */
+	bool pio_only;
 	unsigned int min_clk_div;
 	u32 default_word_delay;
+	u32 cfg_base;
 };
 
 struct apple_spi {
@@ -172,17 +181,29 @@ static void apple_spi_t8010_write_status_config(struct apple_spi *spi,
 			  APPLE_SPI_T8010_DESC_STATUS_CFG);
 }
 
+static void apple_spi_t8010_clear_status(struct apple_spi *spi)
+{
+	if (spi->hw->pio_only) {
+		reg_write(spi, APPLE_SPI_STATUS,
+			  APPLE_SPI_T8010_DESC_STATUS_CFG);
+		return;
+	}
+
+	reg_write(spi, APPLE_SPI_STATUS, ~0);
+	reg_write(spi, APPLE_SPI_IF_XFER, ~0);
+	reg_write(spi, APPLE_SPI_IF_FIFO, ~0);
+}
+
 static void apple_spi_init(struct apple_spi *spi)
 {
 	if (spi->hw->legacy_status) {
 		reg_write(spi, APPLE_SPI_CTRL, 0);
-		reg_write(spi, APPLE_SPI_PIN, 0);
-		reg_write(spi, APPLE_SPI_STATUS, ~0);
-		reg_write(spi, APPLE_SPI_IF_XFER, ~0);
-		reg_write(spi, APPLE_SPI_IF_FIFO, ~0);
+		/* S8000: leave the native chip select inactive (high). */
+		reg_write(spi, APPLE_SPI_PIN,
+			  spi->hw->pio_only ? APPLE_SPI_PIN_CS : 0);
+		apple_spi_t8010_clear_status(spi);
 		reg_write(spi, APPLE_SPI_WORD_DELAY, spi->word_delay);
-		reg_write(spi, APPLE_SPI_CFG, spi->hw->has_descriptor_dma ?
-			  APPLE_SPI_CFG_T8010_BASE : APPLE_SPI_CFG_T7000_BASE);
+		reg_write(spi, APPLE_SPI_CFG, spi->hw->cfg_base);
 		return;
 	}
 
@@ -344,11 +365,12 @@ static u32 apple_spi_t7000_config(struct spi_device *device,
 	return cfg;
 }
 
-static u32 apple_spi_t8010_config(struct spi_device *device,
+static u32 apple_spi_t8010_config(struct apple_spi *spi,
+				  struct spi_device *device,
 				  unsigned int bits_per_word,
 				  bool use_descriptor)
 {
-	u32 cfg = APPLE_SPI_CFG_T8010_BASE;
+	u32 cfg = spi->hw->cfg_base;
 
 	if (use_descriptor) {
 		unsigned int word_index = bits_per_word == 16;
@@ -396,10 +418,11 @@ static int apple_spi_t8010_calc_div(struct apple_spi *spi,
 	return 0;
 }
 
-static u32 apple_spi_t8010_dma_config(struct spi_device *device,
+static u32 apple_spi_t8010_dma_config(struct apple_spi *spi,
+				      struct spi_device *device,
 				      unsigned int bits_per_word)
 {
-	u32 cfg = apple_spi_t8010_config(device, bits_per_word, true);
+	u32 cfg = apple_spi_t8010_config(spi, device, bits_per_word, true);
 
 	return (cfg & ~APPLE_SPI_T8010_DESC_CFG_DEFAULT) |
 	       FIELD_PREP(APPLE_SPI_CFG_MODE, APPLE_SPI_CFG_MODE_DMA);
@@ -465,7 +488,7 @@ static int apple_spi_transfer_one_t8010_dma(struct spi_controller *ctlr,
 	reg_write(spi, APPLE_SPI_WORD_DELAY,
 		  apple_spi_t8010_word_delay(spi, device, true));
 	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_T8010_DESC_STATUS_CFG);
-	cfg = apple_spi_t8010_dma_config(device, bits_per_word);
+	cfg = apple_spi_t8010_dma_config(spi, device, bits_per_word);
 	reg_write(spi, APPLE_SPI_CFG,
 		  cfg & ~FIELD_PREP(APPLE_SPI_CFG_MODE, APPLE_SPI_CFG_MODE_DMA));
 	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_T8010_ENABLE);
@@ -552,9 +575,7 @@ static void apple_spi_t8010_reset_fifos(struct apple_spi *spi)
 	reg_read(spi, APPLE_SPI_CTRL);
 	reg_write(spi, APPLE_SPI_CTRL, 0);
 	reg_read(spi, APPLE_SPI_CTRL);
-	reg_write(spi, APPLE_SPI_STATUS, ~0);
-	reg_write(spi, APPLE_SPI_IF_XFER, ~0);
-	reg_write(spi, APPLE_SPI_IF_FIFO, ~0);
+	apple_spi_t8010_clear_status(spi);
 }
 
 static void apple_spi_t8010_prepare_xfer(struct apple_spi *spi,
@@ -688,9 +709,9 @@ static int apple_spi_transfer_one_t8010_pio(struct spi_controller *ctlr,
 		  apple_spi_t8010_word_delay(spi, device, use_descriptor));
 	apple_spi_t8010_prepare_xfer(spi, use_descriptor);
 
-	cfg = spi->hw->has_descriptor_dma ?
-		apple_spi_t8010_config(device, bits_per_word, use_descriptor) :
-		apple_spi_t7000_config(device, bits_per_word);
+	cfg = spi->hw->spi_v1 ?
+		apple_spi_t7000_config(device, bits_per_word) :
+		apple_spi_t8010_config(spi, device, bits_per_word, use_descriptor);
 	if (use_descriptor)
 		cfg &= ~(APPLE_SPI_T8010_DESC_CFG_DEFAULT | BIT(0));
 
@@ -715,8 +736,9 @@ static int apple_spi_transfer_one_t8010_pio(struct spi_controller *ctlr,
 		status = reg_read(spi, APPLE_SPI_STATUS);
 		if (time_after(jiffies, deadline)) {
 			dev_err(&ctlr->dev,
-				"T8010 PIO timed out: tx %u/%u rx %u/%u status=%#x fifo=%#x\n",
+				"PIO timed out: tx %u/%u rx %u/%u status=%#x fifo=%#x\n",
 				tx_done, words, rx_done, words, status,
+				spi->hw->pio_only ? 0 :
 				reg_read(spi, APPLE_SPI_FIFOSTAT));
 			apple_spi_t8010_finish_xfer(spi, cfg, use_descriptor);
 			return -ETIMEDOUT;
@@ -973,14 +995,18 @@ static int apple_spi_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(spi->clk),
 				     "Unable to find or enable bus clock\n");
 
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
+	/* PIO-only transfers are polled and never enable an interrupt. */
+	if (!spi->hw->pio_only) {
+		irq = platform_get_irq(pdev, 0);
+		if (irq < 0)
+			return irq;
 
-	ret = devm_request_irq(&pdev->dev, irq, apple_spi_irq, 0,
-			       dev_name(&pdev->dev), spi);
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret, "Unable to bind to interrupt\n");
+		ret = devm_request_irq(&pdev->dev, irq, apple_spi_irq, 0,
+				       dev_name(&pdev->dev), spi);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "Unable to bind to interrupt\n");
+	}
 
 	spi->word_delay = spi->hw->default_word_delay;
 	of_property_read_u32(pdev->dev.of_node, "apple,t8010-word-delay",
@@ -991,7 +1017,9 @@ static int apple_spi_probe(struct platform_device *pdev)
 	ctlr->mode_bits = SPI_CPHA | SPI_CPOL;
 	if (!spi->hw->legacy_status)
 		ctlr->mode_bits |= SPI_LSB_FIRST;
-	if (spi->hw->legacy_status)
+	if (spi->hw->pio_only)
+		ctlr->bits_per_word_mask = SPI_BPW_MASK(8);
+	else if (spi->hw->legacy_status)
 		ctlr->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(16);
 	else
 		ctlr->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
@@ -1038,15 +1066,25 @@ static int apple_spi_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct apple_spi_hw apple_spi_hw_s8000 = {
+	.legacy_status = true,
+	.pio_only = true,
+	.min_clk_div = 2,
+	.cfg_base = APPLE_SPI_CFG_S8000_BASE,
+};
+
 static const struct apple_spi_hw apple_spi_hw_t8010 = {
 	.legacy_status = true,
 	.has_descriptor_dma = true,
 	.min_clk_div = 2,
+	.cfg_base = APPLE_SPI_CFG_T8010_BASE,
 };
 
 static const struct apple_spi_hw apple_spi_hw_t7000 = {
 	.legacy_status = true,
+	.spi_v1 = true,
 	.min_clk_div = 1,
+	.cfg_base = APPLE_SPI_CFG_T7000_BASE,
 };
 
 static const struct apple_spi_hw apple_spi_hw_default = {
@@ -1055,6 +1093,7 @@ static const struct apple_spi_hw apple_spi_hw_default = {
 
 static const struct of_device_id apple_spi_of_match[] = {
 	{ .compatible = "apple,t7000-spi", .data = &apple_spi_hw_t7000, },
+	{ .compatible = "apple,s8000-spi", .data = &apple_spi_hw_s8000, },
 	{ .compatible = "apple,t8010-spi", .data = &apple_spi_hw_t8010, },
 	{ .compatible = "apple,t8103-spi", .data = &apple_spi_hw_default, },
 	{ .compatible = "apple,spi", .data = &apple_spi_hw_default, },
