@@ -6,10 +6,21 @@
 
 /dts-v1/;
 
+#define S800X_IPAD5_PCIE
+
 #include "s8003.dtsi"
 #include "s800x-ipad5.dtsi"
 
 / {
 	compatible = "apple,j71t", "apple,s8003", "apple,arm-platform";
 	model = "Apple iPad 5 (Wi-Fi) (TSMC)";
+};
+
+&touchscreen {
+	firmware-name = "apple/j71t-fwstart.z2fw";
+};
+
+/* ADT uart2/wlan module-instance */
+&wifi {
+	brcm,board-type = "apple,feara";
 };
