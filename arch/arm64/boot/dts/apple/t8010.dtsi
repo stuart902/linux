@@ -368,30 +368,27 @@
 		pcie0_dart0: iommu@601008000 {
 			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
 			reg = <0x6 0x01008000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupts = <AIC_IRQ 271 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_pcie>;
-			apple,dma-range = <0x0 0x80000000 0x0 0x3c000000>;
 			status = "disabled";
 		};
 
 		pcie0_dart2: iommu@603008000 {
 			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
 			reg = <0x6 0x03008000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupts = <AIC_IRQ 277 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_pcie>;
-			apple,dma-range = <0x0 0x80000000 0x0 0x3ffff000>;
 			status = "disabled";
 		};
 
 		pcie0_dart3: iommu@604008000 {
 			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
 			reg = <0x6 0x04008000 0x0 0x4000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupts = <AIC_IRQ 280 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_pcie>;
-			apple,dma-range = <0x0 0x80000000 0x0 0x3ffff000>;
 			status = "disabled";
 		};
 
@@ -427,7 +424,7 @@
 			apple,nvmmu-iova = <0xbc000000>;
 			apple,nvme-hmb = <&nvme_hmb>;
 
-			iommu-map = <0x100 &pcie0_dart0 0 1>;
+			iommu-map = <0x100 &pcie0_dart0 0 0x0 0x80000000 0x0 0x3c000000 1>;
 			iommu-map-mask = <0xff00>;
 
 			#address-cells = <3>;

@@ -32,8 +32,8 @@
 };
 
 &pcie0 {
-	iommu-map = <0x100 &pcie0_dart0 0 1>,
-		    <0x200 &pcie0_dart2 0 1>;
+	iommu-map = <0x100 &pcie0_dart0 0 0x0 0x80000000 0x0 0x3c000000 1>,
+		    <0x200 &pcie0_dart2 0 0x0 0x80000000 0x0 0x3ffff000 1>;
 	pinctrl-0 = <&wifi_clkreq>;
 	pinctrl-names = "default";
 
