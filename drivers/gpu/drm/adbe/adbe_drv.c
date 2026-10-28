@@ -43,6 +43,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
+#include <linux/timer.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
@@ -119,6 +120,7 @@
 #define ADBE_KICK_WAIT_US	(20 * USEC_PER_MSEC)	/* iOS allows 1 s */
 #define ADBE_PARK_WAIT_US	(100 * USEC_PER_MSEC)
 #define ADBE_FLIP_VBLANKS	3	/* complete on VBI if bit 10 never comes */
+#define ADBE_FLIP_TIMEOUT_MS	100	/* complete anyway without an interrupt */
 #define ADBE_INTEN_VBLANK	(ADP_ST_VBI | ADP_ST_APPLIED)
 
 struct adbe {
@@ -149,6 +151,7 @@ struct adbe {
 	unsigned int event_vbls;
 	bool event_applied;
 	u64 kick_seq;
+	struct timer_list flip_timer;
 };
 
 static struct adbe *to_adbe(struct drm_device *drm)
@@ -290,6 +293,25 @@ static irqreturn_t adbe_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* Safety net: never leave a flip pending if no interrupt completes it. */
+static void adbe_flip_timeout(struct timer_list *t)
+{
+	struct adbe *adbe = timer_container_of(adbe, t, flip_timer);
+	struct drm_pending_vblank_event *done;
+	unsigned long flags;
+
+	spin_lock_irqsave(&adbe->drm.event_lock, flags);
+	done = adbe->event;
+	adbe->event = NULL;
+	spin_unlock_irqrestore(&adbe->drm.event_lock, flags);
+	if (!done)
+		return;
+
+	dev_warn_ratelimited(adbe->drm.dev, "flip not acknowledged in %u ms\n",
+			     ADBE_FLIP_TIMEOUT_MS);
+	adbe_send_event(adbe, done);
+}
+
 /*
  * Push one plane update: base and, if it changed, stride. Sleeps for at most
  * ADBE_KICK_WAIT_US on the FIFO; a busy FIFO skips the update. If @event is
@@ -334,6 +356,9 @@ static int adbe_kick(struct adbe *adbe, u32 base, u32 stride,
 		*event = NULL;
 	}
 	spin_unlock_irqrestore(&adbe->drm.event_lock, flags);
+	if (armed)
+		mod_timer(&adbe->flip_timer,
+			  jiffies + msecs_to_jiffies(ADBE_FLIP_TIMEOUT_MS));
 
 	adbe->cur_base = base;
 	return 0;
@@ -510,6 +535,7 @@ static void adbe_crtc_atomic_disable(struct drm_crtc *crtc,
 	struct drm_pending_vblank_event *done;
 	unsigned long flags;
 
+	timer_delete_sync(&adbe->flip_timer);
 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
 	done = adbe->event;
 	adbe->event = NULL;
@@ -820,6 +846,7 @@ static int adbe_probe(struct platform_device *pdev)
 	if (IS_ERR(adbe))
 		return PTR_ERR(adbe);
 	platform_set_drvdata(pdev, adbe);
+	timer_setup(&adbe->flip_timer, adbe_flip_timeout, 0);
 
 	adbe->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(adbe->regs))
@@ -893,6 +920,7 @@ static void adbe_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&adbe->drm);
 	drm_atomic_helper_shutdown(&adbe->drm);
+	timer_delete_sync(&adbe->flip_timer);
 	writel(adbe->saved_inten, adbe->regs + ADP_INTEN);
 }
 
