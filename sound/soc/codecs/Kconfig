@@ -86,6 +86,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_CS42L52
 	imply SND_SOC_CS42L56
 	imply SND_SOC_CS42L73
+	imply SND_SOC_CS42L81
 	imply SND_SOC_CS42L84
 	imply SND_SOC_CS4234
 	imply SND_SOC_CS4265
@@ -1031,6 +1032,16 @@ config SND_SOC_CS42L56
 config SND_SOC_CS42L73
 	tristate "Cirrus Logic CS42L73 CODEC"
 	depends on I2C
+
+config SND_SOC_CS42L81
+	tristate "Cirrus Logic CS42L81 CODEC"
+	depends on SPI_MASTER
+	select REGMAP
+	help
+	  Enable support for the Cirrus Logic CS42L81, an Apple-specific
+	  audio codec controlled over SPI. It has integrated speaker
+	  drivers, a headphone driver and digital microphone inputs, and is
+	  used in the Apple A9 iPad 5 together with the S8000 MCA.
 
 config SND_SOC_CS42L83
 	tristate "Cirrus Logic CS42L83 CODEC"
