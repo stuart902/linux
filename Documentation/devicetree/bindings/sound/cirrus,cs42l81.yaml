@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/cirrus,cs42l81.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Cirrus Logic CS42L81 audio codec
+
+maintainers:
+  - Berkay Kösebay <brkosebay@users.noreply.github.com>
+
+description: |
+  Apple-specific Cirrus Logic codec with integrated speaker drivers, a
+  headphone driver and digital microphone inputs, used in the A9 iPad 5.
+  It is controlled over SPI with a 5-byte paged register protocol.
+
+  Codec pins for the machine's routing: outputs SPKOUT and HPOUT, digital
+  microphone inputs DMIC1A and DMIC1B.
+
+allOf:
+  - $ref: dai-common.yaml#
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: cirrus,cs42l81
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: mclk
+
+  mute-gpios:
+    maxItems: 1
+    description: Speaker mute line, asserted while the speakers are muted.
+
+  cirrus,speaker-max-gain:
+    $ref: /schemas/types.yaml#/definitions/int32
+    minimum: -10200
+    maximum: 1200
+    description:
+      Maximum speaker gain the volume control allows, in 0.01 dB units.
+      Without it, the control goes up to +12 dB.
+
+  '#sound-dai-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - '#sound-dai-cells'
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    spi {
+      #address-cells = <1>;
+      #size-cells = <0>;
+
+      audio-codec@0 {
+        compatible = "cirrus,cs42l81";
+        reg = <0>;
+        spi-max-frequency = <1000000>;
+        clocks = <&mca0>;
+        clock-names = "mclk";
+        mute-gpios = <&pinctrl_ap 64 GPIO_ACTIVE_LOW>;
+        cirrus,speaker-max-gain = <(-300)>;
+        #sound-dai-cells = <0>;
+      };
+    };
