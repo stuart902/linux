@@ -17,6 +17,7 @@ properties:
     enum:
       - apple,j293-touchbar
       - apple,j493-touchbar
+      - apple,j71b-touchscreen
       - apple,j172-touchscreen
       - apple,d11-touchscreen
       - apple,d111-touchscreen
@@ -91,6 +92,36 @@ properties:
     description:
       Dynamic shape acceleration calibration blob supplied by the bootloader
 
+  apple,z2-display-offset-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    maxItems: 4096
+    description:
+      Touch-to-display offset calibration blob supplied by the bootloader
+
+  apple,z2-firefly-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    maxItems: 262144
+    description:
+      Firefly calibration blob supplied by the bootloader
+
+  apple,z2-pressure-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    maxItems: 262144
+    description:
+      Pressure effect correction blob supplied by the bootloader
+
+  apple,z2-firefly-p100-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    maxItems: 262144
+    description:
+      Firefly P100 calibration blob supplied by the bootloader
+
+  apple,z2-ext-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    maxItems: 262144
+    description:
+      Extended multi-touch calibration blob supplied by the bootloader
+
 required:
   - compatible
   - interrupts
@@ -118,6 +149,22 @@ allOf:
         - display-sync1-gpios
         - pinctrl-0
         - pinctrl-names
+        - spi-cpha
+        - spi-cpol
+        - apple,z2-bpw16-min-len
+        - apple,z2-no-init-ack
+  - if:
+      properties:
+        compatible:
+          const: apple,j71b-touchscreen
+    then:
+      properties:
+        display-sync-gpios: false
+        display-sync1-gpios: false
+      required:
+        - clocks
+        - power-ana-gpios
+        - power-ldo-gpios
         - spi-cpha
         - spi-cpol
         - apple,z2-bpw16-min-len
