@@ -1252,11 +1252,6 @@ static void spi_toggle_csgpiod(struct spi_device *spi, u8 idx, bool enable, bool
 	else
 		/* Polarity handled by GPIO library */
 		gpiod_set_value_cansleep(spi_get_csgpiod(spi, idx), activate);
-
-	if (activate)
-		spi_delay_exec(&spi->cs_setup, NULL);
-	else
-		spi_delay_exec(&spi->cs_inactive, NULL);
 }
 
 static void spi_set_cs(struct spi_device *spi, bool enable, bool force)
@@ -1309,6 +1304,10 @@ static void spi_set_cs(struct spi_device *spi, bool enable, bool force)
 		spi->controller->set_cs(spi, !enable);
 	}
 
+	/*
+	 * The delays run once, after every chip select has changed, including
+	 * when the chip select is a GPIO.
+	 */
 	if (spi_is_csgpiod(spi) || !spi->controller->set_cs_timing) {
 		if (activate)
 			spi_delay_exec(&spi->cs_setup, NULL);
