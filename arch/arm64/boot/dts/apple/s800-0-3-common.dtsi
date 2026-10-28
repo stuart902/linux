@@ -12,6 +12,7 @@
 / {
 	aliases {
 		ausbphy0 = &ausbphy0;
+		nvme-hmb = &nvme_hmb; /* Used by loader */
 		serial0 = &serial0;
 	};
 
@@ -40,7 +41,10 @@
 		#size-cells = <2>;
 		ranges;
 
-		/* To be filled by loader */
+		nvme_hmb: nvme-hmb@0 {
+			reg = <0 0 0 0>; /* To be filled by loader */
+			no-map;
+		};
 	};
 };
 
