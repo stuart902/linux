@@ -475,8 +475,8 @@ enum apple_h9p_port_result {
  * @has_nvmmu: the storage port has an NVMMU ("nvmmu" window and interrupt)
  * @port3_link_events: port 3's event interrupt is armed by @setup_port, and
  *	its link event re-enables the root complex
- * @no_port_irqs: leave the per-port interrupts alone (iOS's T7000 code
- *	doesn't use them)
+ * @no_port_irqs: leave the per-port interrupts alone (iOS's T7000 and S8003
+ *	code doesn't use them)
  * @nvme_mode_ports: ports carrying the ANS NVMe endpoint, for which the root
  *                   complex is switched into NVMe mode before they power up
  * @link_settle_ms: delay between link training and the first configuration
@@ -487,7 +487,6 @@ enum apple_h9p_port_result {
  * @port_tunables: port block tunables (S8003 only)
  * @nvmmu_init_busy: NVMMU TCB control bit that is set while its init runs
  * @nvmmu_inv_fifo: wait for the NVMMU invalidate FIFO before invalidating
- * @port_irq_after_link: enable a port's interrupt only once its link is up
  * @j172_bridge_quirk: replay J172 firmware's bridge transactions on port 3
  */
 struct apple_h9p_hw {
@@ -509,7 +508,6 @@ struct apple_h9p_hw {
 	struct apple_h9p_tunables port_tunables;
 	u32 nvmmu_init_busy;
 	bool nvmmu_inv_fifo;
-	bool port_irq_after_link;
 	bool j172_bridge_quirk;
 };
 
@@ -1025,8 +1023,7 @@ static int apple_h9p_pcie_request_port_irqs(struct apple_h9p_pcie *pcie)
 		if (irq < 0)
 			return irq;
 
-		armed_later = (pcie->hw->port3_link_events && port == 3) ||
-			      pcie->hw->port_irq_after_link;
+		armed_later = pcie->hw->port3_link_events && port == 3;
 		port_irq->pcie = pcie;
 		port_irq->index = port;
 		port_irq->irq = irq;
@@ -2450,7 +2447,6 @@ static int apple_s8003_setup_port(struct apple_h9p_pcie *pcie,
 				  unsigned int port,
 				  enum apple_h9p_port_result *result)
 {
-	struct apple_h9p_port_irq *port_irq = &pcie->port_irq[port];
 	struct device *dev = pcie->dev;
 	int ret;
 
@@ -2477,11 +2473,6 @@ static int apple_s8003_setup_port(struct apple_h9p_pcie *pcie,
 		dev_warn(dev, "disabling port %u after setup failed: %d\n",
 			 port, ret);
 		return 0;
-	}
-
-	if (port_irq->irq > 0 && !port_irq->enabled) {
-		enable_irq(port_irq->irq);
-		port_irq->enabled = true;
 	}
 
 	*result = APPLE_H9P_PORT_READY;
@@ -2979,7 +2970,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 	/* AppleNVMeMMU on S8003 polls the init bit itself */
 	.nvmmu_init_busy = H9P_NVMMU_TCB_CTRL_INIT,
 	.nvmmu_inv_fifo = true,
-	.port_irq_after_link = true,
+	.no_port_irqs = true,
 };
 
 static const struct of_device_id apple_h9p_pcie_of_match[] = {
