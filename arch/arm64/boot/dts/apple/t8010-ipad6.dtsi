@@ -100,6 +100,9 @@
 			gpio-controller;
 			#gpio-cells = <2>;
 			gpio-reserved-ranges = <0 13>, <15 9>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&pinctrl_ap 38 IRQ_TYPE_LEVEL_LOW>;
 		};
 
 		rtc@500 {
@@ -111,9 +114,22 @@
 
 		tristar_charger: charger@180 {
 			compatible = "apple,j71b-tristar-charger", "apple,tristar-charger";
-			reg = <0x180 0x10>, <0xa00 0x04>, <0x140 0x1e>, <0x4000 0x03>;
-			reg-names = "status", "control", "event", "adc";
-			interrupts-extended = <&pinctrl_ap 38 IRQ_TYPE_LEVEL_LOW>;
+			reg = <0x180 0x10>, <0xa00 0x04>, <0x4000 0x03>;
+			reg-names = "status", "control", "adc";
+			interrupt-parent = <&pmu_gpio>;
+			/*
+			 * The PMU line, ADC done, then the events the iPadOS
+			 * charger subscribes to.
+			 */
+			interrupts = <240 IRQ_TYPE_EDGE_RISING>,
+				     <176 IRQ_TYPE_EDGE_RISING>,
+				     <16 IRQ_TYPE_EDGE_RISING>,
+				     <40 IRQ_TYPE_EDGE_RISING>,
+				     <41 IRQ_TYPE_EDGE_RISING>,
+				     <42 IRQ_TYPE_EDGE_RISING>,
+				     <43 IRQ_TYPE_EDGE_RISING>,
+				     <72 IRQ_TYPE_EDGE_RISING>,
+				     <77 IRQ_TYPE_EDGE_RISING>;
 			apple,tristar = <&tristar>;
 			input-current-limit-microamp = <2400000>;
 		};

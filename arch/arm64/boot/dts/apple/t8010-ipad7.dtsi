@@ -17,6 +17,13 @@
 /delete-node/ &tristar_charger;
 /delete-node/ &tristar;
 
+/* The PMU event line of the iPad 7 is not described yet. */
+&pmu_gpio {
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts-extended;
+};
+
 &battery_info {
 	charge-full-design-microamp-hours = <8557000>;
 };
