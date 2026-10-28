@@ -518,6 +518,19 @@ config KHADAS_MCU_FAN_THERMAL
 	  If you say yes here you get support for the FAN controlled
 	  by the Microcontroller found on the Khadas VIM boards.
 
+config APPLE_S8003_THERMAL
+	tristate "Apple S8003 on-die temperature sensors"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && THERMAL_OF
+	help
+	  Support for the on-die temperature sensors of the Apple A9
+	  (S8003) SoC, as used in the iPad 5. The sensors are exposed as
+	  thermal zone sensors described in the device tree, and through
+	  the thermal hwmon bridge. The driver keeps the calibration and
+	  the hardware alarm configuration the bootloader programmed.
+
+	  If built as a module, it will be called apple_s8003_thermal.
+
 config LOONGSON2_THERMAL
 	tristate "Loongson-2 SoC series thermal driver"
 	depends on LOONGARCH || COMPILE_TEST
