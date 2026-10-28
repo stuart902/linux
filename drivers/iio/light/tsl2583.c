@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/overflow.h>
+#include <linux/property.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
 #include <linux/pm_runtime.h>
@@ -276,12 +277,47 @@ static bool apple_als_record_is_supported(const struct tsl2583_chip_info *info,
 	return true;
 }
 
+/*
+ * The record comes from the bootloader (the ADT's resolved alsCalibration)
+ * or from a SysCfg NVMEM cell. The caller frees it.
+ */
+static u8 *apple_als_read_calibration(struct device *dev, size_t *len)
+{
+	struct nvmem_cell *cell;
+	u8 *data;
+	int ret;
+
+	if (device_property_present(dev, "apple,als-calibration")) {
+		ret = device_property_count_u8(dev, "apple,als-calibration");
+		if (ret <= 0)
+			return ERR_PTR(ret ?: -EINVAL);
+		*len = ret;
+
+		data = kmalloc(*len, GFP_KERNEL);
+		if (!data)
+			return ERR_PTR(-ENOMEM);
+		ret = device_property_read_u8_array(dev, "apple,als-calibration",
+						    data, *len);
+		if (ret) {
+			kfree(data);
+			return ERR_PTR(ret);
+		}
+
+		return data;
+	}
+
+	cell = devm_nvmem_cell_get(dev, "calibration");
+	if (IS_ERR(cell))
+		return ERR_CAST(cell);
+
+	return nvmem_cell_read(cell, len);
+}
+
 static int apple_als_load_calibration(struct tsl2583_chip *chip)
 {
 	const struct tsl2583_chip_info *info = chip->info;
 	struct device *dev = &chip->client->dev;
 	struct apple_als_calibration *cal = &chip->cal;
-	struct nvmem_cell *cell;
 	const u8 *record;
 	size_t len;
 	u32 checksum = 0;
@@ -290,12 +326,7 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 	int ret;
 	int i;
 
-	cell = devm_nvmem_cell_get(dev, "calibration");
-	if (IS_ERR(cell))
-		return dev_err_probe(dev, PTR_ERR(cell),
-				     "failed to get LSCI calibration\n");
-
-	data = nvmem_cell_read(cell, &len);
+	data = apple_als_read_calibration(dev, &len);
 	if (IS_ERR(data))
 		return dev_err_probe(dev, PTR_ERR(data),
 				     "failed to read LSCI calibration\n");
