@@ -11,10 +11,11 @@ maintainers:
 
 description: |
   Charging on Apple devices whose Lightning port uses a Tristar (NXP CBTL1610)
-  port controller and a D2365-family PMIC. The node is a child of the PMIC.
-  It identifies the attached source through the Tristar and the PMIC ADC and
-  sets the PMIC input-current limit, which iBoot leaves at 100 mA. PMU events
-  come from the PMIC's event interrupt controller (the PMIC GPIO node).
+  port controller and a D2365-family PMIC, such as the iPad 5 and iPad 6. The
+  node is a child of the PMIC. It identifies the attached source through the
+  Tristar and the PMIC ADC and sets the PMIC input-current limit, which iBoot
+  leaves at 100 mA. PMU events come from the PMIC's event interrupt
+  controller (the PMIC GPIO node).
 
 allOf:
   - $ref: power-supply.yaml#
@@ -24,6 +25,7 @@ properties:
     items:
       - enum:
           - apple,j71b-tristar-charger
+          - apple,j71t-tristar-charger
       - const: apple,tristar-charger
 
   reg:
