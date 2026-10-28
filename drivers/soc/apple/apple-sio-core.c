@@ -13,7 +13,6 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
-#include <linux/idr.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -66,7 +65,6 @@
 #define APPLE_SIO_OP_READY		0x6d
 #define APPLE_SIO_READY_PARAMETER	0x03
 #define APPLE_SIO_RX_IRQ_INDEX		2
-#define APPLE_SIO_MAX_TAG		0xfe
 #define APPLE_SIO_READY_TIMEOUT_MS	5000
 #define APPLE_SIO_TX_TIMEOUT_US		200000
 #define APPLE_SIO_RX_DRAIN_LIMIT	256
@@ -92,6 +90,7 @@ struct apple_sio_async {
 	apple_sio_async_callback_t callback;
 	void *callback_data;
 	unsigned long key;
+	u8 endpoint;
 	u8 tag;
 	u8 expected_opcode;
 	int status;
@@ -114,7 +113,10 @@ struct apple_sio {
 	struct mutex tx_lock;
 	/* Protect the final transmit status check and message write. */
 	spinlock_t tx_hw_lock;
-	struct ida tags;
+	/* Protect the per-endpoint tag bitmaps. */
+	spinlock_t tag_lock;
+	/* Bit n set: tag n is in use on that endpoint (bit 0 is never used). */
+	u32 tags[APPLE_SIO_MAX_ENDPOINTS];
 	struct xarray pending;
 	struct apple_sio_region ep0_general;
 	struct apple_sio_region ep0_spi;
@@ -150,6 +152,51 @@ static void apple_sio_submit_setup(struct apple_sio *sio);
 static unsigned long apple_sio_request_key(u8 endpoint, u8 tag)
 {
 	return ((unsigned long)endpoint << 8) | tag;
+}
+
+/*
+ * The firmware keeps 32 response slots per endpoint and indexes them by
+ * tag - 1 (AppleSmartIODMAController::responseForEndpointAndTag), so tags
+ * are allocated per endpoint in 1..APPLE_SIO_MAX_TAG. A negative @fixed_tag
+ * takes the lowest free tag.
+ */
+static int apple_sio_tag_alloc(struct apple_sio *sio, u8 endpoint,
+			       int fixed_tag)
+{
+	unsigned long flags;
+	u32 *map;
+	int tag;
+
+	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS ||
+	    fixed_tag > APPLE_SIO_MAX_TAG || fixed_tag == 0)
+		return -EINVAL;
+
+	map = &sio->tags[endpoint];
+	spin_lock_irqsave(&sio->tag_lock, flags);
+	if (fixed_tag > 0) {
+		tag = (*map & BIT(fixed_tag)) ? -EBUSY : fixed_tag;
+	} else {
+		tag = ffz(*map | BIT(0));
+		if (tag > APPLE_SIO_MAX_TAG)
+			tag = -EBUSY;
+	}
+	if (tag > 0)
+		*map |= BIT(tag);
+	spin_unlock_irqrestore(&sio->tag_lock, flags);
+
+	return tag;
+}
+
+static void apple_sio_tag_free(struct apple_sio *sio, u8 endpoint, u8 tag)
+{
+	unsigned long flags;
+
+	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS || tag > APPLE_SIO_MAX_TAG)
+		return;
+
+	spin_lock_irqsave(&sio->tag_lock, flags);
+	sio->tags[endpoint] &= ~BIT(tag);
+	spin_unlock_irqrestore(&sio->tag_lock, flags);
 }
 
 void *apple_sio_desc0_alloc(struct apple_sio *sio, unsigned int slots,
@@ -253,7 +300,7 @@ static void apple_sio_dispatch(struct apple_sio *sio, u64 message)
 		return;
 	}
 
-	ida_free(&sio->tags, request->tag);
+	apple_sio_tag_free(sio, request->endpoint, request->tag);
 	if (request->callback)
 		request->callback(request->callback_data, request->status,
 				  request->response);
@@ -370,7 +417,7 @@ static void apple_sio_async_finish(struct apple_sio_async *request,
 {
 	struct apple_sio *sio = request->sio;
 
-	ida_free(&sio->tags, request->tag);
+	apple_sio_tag_free(sio, request->endpoint, request->tag);
 	request->status = status;
 	request->response = response;
 	if (notify && request->callback)
@@ -400,16 +447,14 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 	if (!request)
 		return ERR_PTR(-ENOMEM);
 
-	if (fixed_tag >= 0)
-		tag = ida_alloc_range(&sio->tags, fixed_tag, fixed_tag, gfp);
-	else
-		tag = ida_alloc_range(&sio->tags, 1, APPLE_SIO_MAX_TAG, gfp);
+	tag = apple_sio_tag_alloc(sio, endpoint, fixed_tag);
 	if (tag < 0) {
 		kfree(request);
 		return ERR_PTR(tag);
 	}
 
 	request->sio = sio;
+	request->endpoint = endpoint;
 	INIT_LIST_HEAD(&request->shutdown_node);
 	init_completion(&request->done);
 	refcount_set(&request->refs, 2);
@@ -423,7 +468,7 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 
 	ret = xa_insert(&sio->pending, request->key, request, gfp);
 	if (ret) {
-		ida_free(&sio->tags, tag);
+		apple_sio_tag_free(sio, endpoint, tag);
 		apple_sio_async_put(request);
 		apple_sio_async_put(request);
 		return ERR_PTR(ret);
@@ -825,7 +870,7 @@ static int apple_sio_probe(struct platform_device *pdev)
 	sio->setup_status = -EINPROGRESS;
 	mutex_init(&sio->tx_lock);
 	spin_lock_init(&sio->tx_hw_lock);
-	ida_init(&sio->tags);
+	spin_lock_init(&sio->tag_lock);
 	xa_init(&sio->pending);
 	spin_lock_init(&sio->desc0_lock);
 	platform_set_drvdata(pdev, sio);
@@ -932,7 +977,6 @@ out_pm_put:
 	pm_runtime_put_sync(dev);
 out_destroy_allocators:
 	xa_destroy(&sio->pending);
-	ida_destroy(&sio->tags);
 	return ret;
 }
 
@@ -948,7 +992,6 @@ static void apple_sio_remove(struct platform_device *pdev)
 			  sio->firmware_buffer, sio->firmware_dma);
 	pm_runtime_put_sync(sio->dev);
 	xa_destroy(&sio->pending);
-	ida_destroy(&sio->tags);
 }
 
 static const struct of_device_id apple_sio_of_match[] = {

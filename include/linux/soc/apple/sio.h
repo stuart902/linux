@@ -7,6 +7,12 @@
 struct apple_sio;
 struct apple_sio_async;
 
+/* Endpoint numbers are 8 bits; the firmware uses 0x00..0x81. */
+#define APPLE_SIO_MAX_ENDPOINTS		0x82
+
+/* Request tags are allocated per endpoint in 1..APPLE_SIO_MAX_TAG. */
+#define APPLE_SIO_MAX_TAG		31
+
 typedef void (*apple_sio_async_callback_t)(void *data, int status,
 					   u64 response);
 
