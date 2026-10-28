@@ -84,6 +84,11 @@
 &i2c0 {
 	status = "okay";
 
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+
 	d2365_pmic: pmic@3c {
 		compatible = "apple,angel-pmic", "apple,i2c-pmic";
 		reg = <0x3c>;
@@ -102,6 +107,15 @@
 			reg = <0x500 0x10>;
 			nvmem-cells = <&rtc_offset>;
 			nvmem-cell-names = "rtc_offset";
+		};
+
+		tristar_charger: charger@180 {
+			compatible = "apple,j71b-tristar-charger", "apple,tristar-charger";
+			reg = <0x180 0x10>, <0xa00 0x04>, <0x140 0x1e>, <0x4000 0x03>;
+			reg-names = "status", "control", "event", "adc";
+			interrupts-extended = <&pinctrl_ap 38 IRQ_TYPE_LEVEL_LOW>;
+			apple,tristar = <&tristar>;
+			input-current-limit-microamp = <2400000>;
 		};
 
 		nvmem@5000 {

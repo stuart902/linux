@@ -13,6 +13,10 @@
  */
 #include "t8010-ipad6.dtsi"
 
+/* The iPad 7 port controller is Bellatrix, with its own charger policy. */
+/delete-node/ &tristar_charger;
+/delete-node/ &tristar;
+
 &battery_info {
 	charge-full-design-microamp-hours = <8557000>;
 };
