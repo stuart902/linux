@@ -261,8 +261,8 @@ static blk_status_t nvme_pci_apple_ans_alloc_req(struct nvme_dev *dev,
 	return BLK_STS_OK;
 }
 
-static void nvme_pci_apple_ans_free_req(struct nvme_dev *dev,
-					struct apple_ans_nvme_req *req)
+static int nvme_pci_apple_ans_free_req(struct nvme_dev *dev,
+				       struct apple_ans_nvme_req *req)
 {
 	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
 	unsigned long flags;
@@ -270,21 +270,25 @@ static void nvme_pci_apple_ans_free_req(struct nvme_dev *dev,
 	int ret;
 
 	if (!ans || !req)
-		return;
+		return -EINVAL;
 
 	tag = req - ans->req;
 	if (tag >= APPLE_ANS_NVMMU_MAX_REQS)
-		return;
+		return -EINVAL;
 
 	ret = apple_ans_nvmmu_map(dev->dev, tag, NULL, 0, NULL);
-	if (ret)
-		dev_warn_ratelimited(dev->dev,
-				     "failed to release ANS DMA slot %u: %d\n",
-				     tag, ret);
+	if (ret) {
+		/* The controller may still hold this slot: never reuse it. */
+		dev_err_ratelimited(dev->dev,
+				    "failed to release ANS DMA slot %u: %d\n",
+				    tag, ret);
+		return ret;
+	}
 
 	spin_lock_irqsave(&ans->req_lock, flags);
 	__clear_bit(tag, ans->used_req);
 	spin_unlock_irqrestore(&ans->req_lock, flags);
+	return 0;
 }
 
 static blk_status_t nvme_pci_apple_ans_map_bvec(struct nvme_dev *dev,
@@ -359,6 +363,8 @@ static bool nvme_pci_apple_ans_unmap_data(struct request *req)
 	if (!iod->dma_private)
 		return false;
 
+	/* Detach the controller from the pages before unmapping them. */
+	nvme_pci_apple_ans_free_req(dev, iod->dma_private);
 	for (i = 0; i < iod->nr_dma_vecs; i++)
 		dma_unmap_page(dev->dev, iod->dma_vecs[i].addr,
 			       iod->dma_vecs[i].len, rq_dma_dir(req));
@@ -368,7 +374,6 @@ static bool nvme_pci_apple_ans_unmap_data(struct request *req)
 	}
 	iod->nr_dma_vecs = 0;
 
-	nvme_pci_apple_ans_free_req(dev, iod->dma_private);
 	iod->dma_private = NULL;
 	iod->cmd.common.flags &= ~NVME_CMD_APPLE_ANS_FLATDMA;
 	return true;
