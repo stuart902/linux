@@ -30,9 +30,19 @@
 #include "core.h"
 #include "pinmux.h"
 
+struct apple_gpio_soc_data {
+	/*
+	 * S8000 platform-function modes (iOS GPIO driver): routing a pin to
+	 * a peripheral also clears bit 4, and selecting the GPIO function
+	 * puts the pin in output mode.
+	 */
+	bool s8000_mux;
+};
+
 struct apple_gpio_pinctrl {
 	struct device *dev;
 	struct pinctrl_dev *pctldev;
+	const struct apple_gpio_soc_data *soc;
 
 	void __iomem *base;
 	struct regmap *map;
@@ -52,6 +62,7 @@ struct apple_gpio_pinctrl {
 #define REG_GPIOx_IN_IRQ_DN  5
 #define REG_GPIOx_IN_IRQ_ANY 6
 #define REG_GPIOx_IN_IRQ_OFF 7
+#define REG_GPIOx_S8000_MUX  BIT(4)
 #define REG_GPIOx_PERIPH     GENMASK(6, 5)
 #define REG_GPIOx_PULL       GENMASK(8, 7)
 #define REG_GPIOx_PULL_OFF   0
@@ -181,10 +192,24 @@ static int apple_gpio_pinmux_set(struct pinctrl_dev *pctldev, unsigned int func,
 				 unsigned int group)
 {
 	struct apple_gpio_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
+	u32 mask = REG_GPIOx_PERIPH | REG_GPIOx_INPUT_ENABLE;
+	u32 value = FIELD_PREP(REG_GPIOx_PERIPH, func) | REG_GPIOx_INPUT_ENABLE;
 
-	apple_gpio_set_reg(
-		pctl, group, REG_GPIOx_PERIPH | REG_GPIOx_INPUT_ENABLE,
-		FIELD_PREP(REG_GPIOx_PERIPH, func) | REG_GPIOx_INPUT_ENABLE);
+	/*
+	 * This reproduces iOS' masks for the iPad 5 touch display sync:
+	 * peripheral route 2 writes mask 0x270 / value 0x240, the GPIO
+	 * function mask 0x27e / value 0x202. The pin's data and pull fields
+	 * are kept.
+	 */
+	if (pctl->soc && pctl->soc->s8000_mux) {
+		mask |= REG_GPIOx_S8000_MUX;
+		if (!func) {
+			mask |= REG_GPIOx_MODE;
+			value |= FIELD_PREP(REG_GPIOx_MODE, REG_GPIOx_OUT);
+		}
+	}
+
+	apple_gpio_set_reg(pctl, group, mask, value);
 
 	return 0;
 }
@@ -460,6 +485,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (!pctl)
 		return -ENOMEM;
 	pctl->dev = &pdev->dev;
+	pctl->soc = of_device_get_match_data(&pdev->dev);
 	pctl->gpio_chip.irq.num_parents = nirqs;
 	dev_set_drvdata(&pdev->dev, pctl);
 
@@ -526,7 +552,12 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	return apple_gpio_register(pctl);
 }
 
+static const struct apple_gpio_soc_data apple_gpio_s8000_data = {
+	.s8000_mux = true,
+};
+
 static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
+	{ .compatible = "apple,s8000-pinctrl", .data = &apple_gpio_s8000_data },
 	{ .compatible = "apple,t8103-pinctrl", },
 	{ .compatible = "apple,pinctrl", },
 	{ }
