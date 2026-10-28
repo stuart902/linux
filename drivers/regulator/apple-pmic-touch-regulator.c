@@ -43,6 +43,23 @@ static const struct regulator_desc apple_adelyn_touch_core = {
 	.off_on_delay = 1000,
 };
 
+/*
+ * Angel (D2365, iPad 5) pmuL(0x21f): LDO index 31, enable-only, through
+ * register 0x31c bit 0 (iOS 0xfffffff006bbe488, 0xfffffff006bbe388,
+ * 0xfffffff006bbcdd8). The ADT names only the function, so the register
+ * and bit are not yet confirmed by a second source.
+ */
+static const struct regulator_desc apple_angel_touch_analog = {
+	.name = "angel-touch-analog",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x31c,
+	.enable_mask = 0x01,
+	.enable_val = 0x01,
+	.disable_val = 0,
+};
+
 static const struct regulator_desc apple_chestnut_touch_hv = {
 	.name = "chestnut-touch-hv",
 	.ops = &apple_pmic_touch_regulator_ops,
@@ -90,6 +107,10 @@ static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
 	{
 		.compatible = "apple,adelyn-touch-core-regulator",
 		.data = &apple_adelyn_touch_core,
+	},
+	{
+		.compatible = "apple,angel-touch-analog-regulator",
+		.data = &apple_angel_touch_analog,
 	},
 	{
 		.compatible = "apple,chestnut-touch-hv-regulator",
