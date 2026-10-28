@@ -53,11 +53,14 @@ struct apple_ans_nvme_req {
  * @enable_settle_ms: time between setting CC.EN and the first CSTS read
  * @rdy_timeout_ms: give up on a CSTS.RDY transition after this long, rather
  *                  than after CAP.TO (0: CAP.TO only)
+ * @late_bus_master: let the controller master the bus only after the
+ *                   preinit has stopped it and reset the NVMMU slots
  */
 struct apple_ans_host {
 	u32 l1ss_ctl1;
 	unsigned int enable_settle_ms;
 	unsigned int rdy_timeout_ms;
+	bool late_bus_master;
 };
 
 static const struct apple_ans_host apple_ans_host_s8003 = {
@@ -68,6 +71,7 @@ static const struct apple_ans_host apple_ans_host_s8003 = {
 	 */
 	.enable_settle_ms = 100,
 	.rdy_timeout_ms = 5000,
+	.late_bus_master = true,
 };
 
 static const struct apple_ans_host apple_ans_host_t8010 = {
@@ -143,6 +147,7 @@ static int nvme_pci_apple_ans_init(struct nvme_dev *dev, int node)
 		return -ENOMEM;
 
 	ans->host = match->data;
+	dev->late_bus_master = ans->host->late_bus_master;
 	spin_lock_init(&ans->req_lock);
 	dev->dma_data = ans;
 	return 0;

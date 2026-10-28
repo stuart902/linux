@@ -3176,7 +3176,8 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	if (pci_enable_device_mem(pdev))
 		return result;
 
-	pci_set_master(pdev);
+	if (!dev->late_bus_master)
+		pci_set_master(pdev);
 
 	if (readl(dev->bar + NVME_REG_CSTS) == -1) {
 		dev_dbg(dev->ctrl.device, "reading CSTS register failed\n");
@@ -3241,6 +3242,9 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 		if (result)
 			goto free_irq;
 	}
+
+	if (dev->late_bus_master)
+		pci_set_master(pdev);
 
 	nvme_map_cmb(dev);
 

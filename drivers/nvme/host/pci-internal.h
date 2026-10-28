@@ -78,6 +78,8 @@ struct nvme_dev {
 	mempool_t *dmavec_mempool;
 	const struct nvme_pci_dma_ops *dma_ops;
 	void *dma_data;
+	/* Enable bus mastering only once the glue's preinit has run */
+	bool late_bus_master;
 
 	/* shadow doorbell buffer support: */
 	__le32 *dbbuf_dbs;
