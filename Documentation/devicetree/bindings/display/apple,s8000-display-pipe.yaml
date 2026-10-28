@@ -14,14 +14,17 @@ description:
   with the compatible "adbe0,s8000" in the Apple device tree. It contains
   the ADP/ADBE display pipe that scans out to the internal eDP panel. The
   bootloader leaves the pipe, the eDP link and the panel running; the pipe
-  reads memory through the display DART, which the bootloader leaves in
-  bypass.
+  reads memory through the display DART (dart-disp0), which the bootloader
+  leaves in bypass. The DART has no node of its own: it must not be reset
+  under the running scanout, so its two register windows are listed here
+  and only read, to check that the scanout bypasses translation.
 
 properties:
   compatible:
     const: apple,s8000-display-pipe
 
   reg:
+    minItems: 6
     items:
       - description:
           ADP window, with the control and interrupt registers, the
@@ -31,6 +34,20 @@ properties:
       - description: Display block window C
       - description: Display block window D
       - description: Seven-register side block
+      - description: Display DART (dart-disp0), first window
+      - description: Display DART (dart-disp0), second window
+
+  reg-names:
+    minItems: 6
+    items:
+      - const: adp
+      - const: disp-a
+      - const: disp-b
+      - const: disp-c
+      - const: disp-d
+      - const: side
+      - const: dart0
+      - const: dart1
 
   interrupts:
     items:
@@ -71,7 +88,11 @@ examples:
                   <0x2 0x06440000 0x0 0x8000>,
                   <0x2 0x06480000 0x0 0x8000>,
                   <0x2 0x064c0000 0x0 0x8000>,
-                  <0x2 0x06500000 0x0 0x1c>;
+                  <0x2 0x06500000 0x0 0x1c>,
+                  <0x2 0x06304000 0x0 0x4000>,
+                  <0x2 0x06300000 0x0 0x4000>;
+            reg-names = "adp", "disp-a", "disp-b", "disp-c", "disp-d",
+                        "side", "dart0", "dart1";
             interrupt-parent = <&aic>;
             interrupts = <AIC_IRQ 140 IRQ_TYPE_LEVEL_HIGH>,
                          <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
