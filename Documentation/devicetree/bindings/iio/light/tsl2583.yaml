@@ -11,9 +11,10 @@ maintainers:
 
 description: |
   Ambient light sensing with an i2c interface. The Apple CT819 and CT821
-  factory calibration is stored in SysCfg. On systems where the SysCfg NVMEM
-  provider is created by boot firmware, the static board tree omits the
-  NVMEM link and firmware adds both NVMEM properties before kernel handoff.
+  factory calibration is stored in SysCfg. Boot firmware either copies the
+  resolved record into apple,als-calibration or, where it creates the SysCfg
+  NVMEM provider, adds both NVMEM properties before kernel handoff. The
+  static board tree carries neither.
 
 properties:
   compatible:
@@ -36,6 +37,15 @@ properties:
 
   vcc-supply:
     description: Regulator that provides power to the sensor
+
+  apple,als-calibration:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 1024
+    description:
+      Apple factory LSCI ambient-light calibration record, the raw bytes of
+      the ADT alsCalibration property as resolved by iBoot. Used instead of
+      nvmem-cells when present.
 
   nvmem-cells:
     description:
@@ -68,6 +78,7 @@ allOf:
           - nvmem-cells
     else:
       properties:
+        apple,als-calibration: false
         nvmem-cells: false
         nvmem-cell-names: false
 
@@ -84,6 +95,18 @@ examples:
             reg = <0x29>;
             nvmem-cells = <&als_calibration>;
             nvmem-cell-names = "calibration";
+        };
+    };
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        light-sensor@39 {
+            compatible = "apple,ct819", "amstaos,tsl2581";
+            reg = <0x39>;
+            /* Copied by the bootloader from the ADT; header only here */
+            apple,als-calibration = [00 02 01 08 48 00 a2 f8];
         };
     };
 ...
