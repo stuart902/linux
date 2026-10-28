@@ -157,6 +157,15 @@
 #define H9P_NVMMU_FLATDMA_BASE		0x40000000ULL
 #define H9P_NVMMU_FLATDMA_STRIDE	SZ_8M
 #define H9P_NVMMU_SART_ALIGNMENT	SZ_1M
+/*
+ * TCB layout: dword 0 direction, 1 page count, 2 first page, 4-5 page list.
+ * The direction is the controller's view: READ when it reads memory (an NVMe
+ * write), WRITE when it writes memory (an NVMe read).
+ */
+#define H9P_NVMMU_TCB_FLAGS		0
+#define H9P_NVMMU_TCB_NPAGES		1
+#define H9P_NVMMU_TCB_PAGE0		2
+#define H9P_NVMMU_TCB_SGL		4
 #define H9P_NVMMU_TCB_READ		0x100
 #define H9P_NVMMU_TCB_WRITE		0x200
 
@@ -1257,9 +1266,15 @@ out_put_node:
 	return ret;
 }
 
+/*
+ * Program TCBs the way iOS (AppleNVMeMMU) does: exactly one direction per
+ * TCB, since iOS rejects in-out transfers, and the page count written last
+ * when mapping and first when retiring, because a non-zero count is what
+ * makes the TCB valid to the NVMMU.
+ */
 int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 			const u64 *pages, unsigned int npages,
-			dma_addr_t *iova)
+			bool to_memory, dma_addr_t *iova)
 {
 	struct apple_h9p_nvmmu *nvmmu;
 	struct apple_h9p_pcie *pcie;
@@ -1299,23 +1314,12 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 
 	tcb = (u32 *)nvmmu->tcb + tag * H9P_NVMMU_TCB_DWORDS;
 	sgl = (u32 *)nvmmu->tcb_sgl + tag * H9P_NVMMU_SGL_WORDS;
+
+	WRITE_ONCE(tcb[H9P_NVMMU_TCB_NPAGES], 0);
+	dma_wmb();
 	memset(tcb, 0, H9P_NVMMU_TCB_BYTES);
-	memset(sgl, 0, H9P_NVMMU_SGL_WORDS * sizeof(*sgl));
 
-	if (npages) {
-		tcb[0] = H9P_NVMMU_TCB_READ | H9P_NVMMU_TCB_WRITE;
-		tcb[1] = npages;
-		tcb[2] = pages[0] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
-		for (i = 0; i < npages; i++)
-			sgl[i] = pages[i] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
-
-		sgl_dma = nvmmu->tcb_sgl_dma +
-			  tag * H9P_NVMMU_SGL_WORDS * sizeof(*sgl);
-		memcpy(&tcb[4], &sgl_dma, sizeof(sgl_dma));
-		if (iova)
-			*iova = H9P_NVMMU_FLATDMA_BASE +
-				tag * H9P_NVMMU_FLATDMA_STRIDE;
-	} else {
+	if (!npages) {
 		dma_wmb();
 		h9p_writel_flush(tag, nvmmu->base + H9P_NVMMU_TCB_CTRL);
 		if (iova)
@@ -1323,7 +1327,22 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 		return 0;
 	}
 
+	memset(sgl, 0, H9P_NVMMU_SGL_WORDS * sizeof(*sgl));
+	for (i = 0; i < npages; i++)
+		sgl[i] = pages[i] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
+
+	tcb[H9P_NVMMU_TCB_FLAGS] = to_memory ? H9P_NVMMU_TCB_WRITE :
+					       H9P_NVMMU_TCB_READ;
+	tcb[H9P_NVMMU_TCB_PAGE0] = pages[0] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
+	sgl_dma = nvmmu->tcb_sgl_dma + tag * H9P_NVMMU_SGL_WORDS * sizeof(*sgl);
+	memcpy(&tcb[H9P_NVMMU_TCB_SGL], &sgl_dma, sizeof(sgl_dma));
+
 	dma_wmb();
+	WRITE_ONCE(tcb[H9P_NVMMU_TCB_NPAGES], npages);
+	dma_wmb();
+
+	if (iova)
+		*iova = H9P_NVMMU_FLATDMA_BASE + tag * H9P_NVMMU_FLATDMA_STRIDE;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_ans_nvmmu_map);
