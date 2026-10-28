@@ -1052,6 +1052,10 @@ struct dwc2_hregs_backup {
  * @new_connection:	Used in host mode. True if there are new connected
  *			device
  * @enabled:		Indicates the enabling state of controller
+ * @usb_psy_name:	Name of the power supply told what the host allows
+ *			the device to draw (vbus_draw), or NULL
+ * @vbus_draw_work:	Work passing @vbus_draw_ma to that power supply
+ * @vbus_draw_ma:	Current the gadget may draw, from vbus_draw
  *
  */
 struct dwc2_hsotg {
@@ -1225,6 +1229,9 @@ struct dwc2_hsotg {
 	unsigned int remote_wakeup_allowed:1;
 	struct dwc2_hsotg_ep *eps_in[MAX_EPS_CHANNELS];
 	struct dwc2_hsotg_ep *eps_out[MAX_EPS_CHANNELS];
+	const char *usb_psy_name;
+	struct work_struct vbus_draw_work;
+	unsigned int vbus_draw_ma;
 #endif /* CONFIG_USB_DWC2_PERIPHERAL || CONFIG_USB_DWC2_DUAL_ROLE */
 };
 

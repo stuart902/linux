@@ -22,6 +22,8 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/slab.h>
+#include <linux/power_supply.h>
+#include <linux/property.h>
 
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
@@ -4762,13 +4764,39 @@ static int dwc2_hsotg_vbus_session(struct usb_gadget *gadget, int is_active)
  *
  * Report how much power the device may consume to the phy.
  */
+static void dwc2_hsotg_vbus_draw_work(struct work_struct *work)
+{
+	struct dwc2_hsotg *hsotg = container_of(work, struct dwc2_hsotg,
+						vbus_draw_work);
+	union power_supply_propval val;
+	struct power_supply *psy;
+	int ret;
+
+	psy = power_supply_get_by_name(hsotg->usb_psy_name);
+	if (!psy)
+		return;
+	val.intval = READ_ONCE(hsotg->vbus_draw_ma) * 1000;
+	ret = power_supply_set_property(psy, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+					&val);
+	if (ret)
+		dev_dbg(hsotg->dev, "setting VBUS draw (%d uA) failed: %d\n",
+			val.intval, ret);
+	power_supply_put(psy);
+}
+
 static int dwc2_hsotg_vbus_draw(struct usb_gadget *gadget, unsigned int mA)
 {
 	struct dwc2_hsotg *hsotg = to_hsotg(gadget);
 
-	if (IS_ERR_OR_NULL(hsotg->uphy))
+	if (!IS_ERR_OR_NULL(hsotg->uphy))
+		return usb_phy_set_power(hsotg->uphy, mA);
+	if (!hsotg->usb_psy_name)
 		return -ENOTSUPP;
-	return usb_phy_set_power(hsotg->uphy, mA);
+
+	/* Called in atomic context; the power supply may sleep. */
+	WRITE_ONCE(hsotg->vbus_draw_ma, mA);
+	schedule_work(&hsotg->vbus_draw_work);
+	return 0;
 }
 
 static void dwc2_gadget_set_speed(struct usb_gadget *g, enum usb_device_speed speed)
@@ -5018,6 +5046,9 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 
 	hsotg->gadget.ops = &dwc2_hsotg_gadget_ops;
 	hsotg->gadget.name = dev_name(dev);
+	if (!device_property_read_string(dev, "usb-psy-name",
+					 &hsotg->usb_psy_name))
+		INIT_WORK(&hsotg->vbus_draw_work, dwc2_hsotg_vbus_draw_work);
 	hsotg->gadget.otg_caps = &hsotg->params.otg_caps;
 	hsotg->remote_wakeup_allowed = 0;
 
@@ -5102,6 +5133,8 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 int dwc2_hsotg_remove(struct dwc2_hsotg *hsotg)
 {
 	usb_del_gadget_udc(&hsotg->gadget);
+	if (hsotg->usb_psy_name)
+		cancel_work_sync(&hsotg->vbus_draw_work);
 	dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep, hsotg->ctrl_req);
 
 	return 0;
