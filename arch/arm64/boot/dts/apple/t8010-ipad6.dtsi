@@ -270,6 +270,11 @@
 	status = "okay";
 };
 
+/* Tell the Lightning charger what the USB host allows. */
+&usbdev {
+	usb-psy-name = "lightning";
+};
+
 &wlan_uart2 {
 	pinctrl-0 = <&wlan_uart2_pins>;
 	pinctrl-names = "default";

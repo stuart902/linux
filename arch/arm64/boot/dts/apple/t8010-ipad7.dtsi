@@ -17,6 +17,10 @@
 /delete-node/ &tristar_charger;
 /delete-node/ &tristar;
 
+&usbdev {
+	/delete-property/ usb-psy-name;
+};
+
 /* The PMU event line of the iPad 7 is not described yet. */
 &pmu_gpio {
 	/delete-property/ interrupt-controller;
