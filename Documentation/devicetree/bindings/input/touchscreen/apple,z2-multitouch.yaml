@@ -30,6 +30,12 @@ properties:
   reset-gpios:
     maxItems: 1
 
+  attn-gpios:
+    maxItems: 1
+    description:
+      The controller's attention (interrupt) line, read back as a GPIO to
+      see whether reports are still pending
+
   power-ana-gpios:
     maxItems: 1
 
@@ -199,6 +205,7 @@ allOf:
     else:
       properties:
         ana-supply: false
+        attn-gpios: false
   - if:
       properties:
         compatible:
@@ -286,6 +293,7 @@ examples:
             reg = <0>;
             spi-max-frequency = <12048192>;
             interrupts-extended = <&pinctrl_ap 65 IRQ_TYPE_EDGE_FALLING>;
+            attn-gpios = <&pinctrl_ap 65 GPIO_ACTIVE_LOW>;
             reset-gpios = <&pinctrl_ap 75 GPIO_ACTIVE_LOW>;
             power-ldo-gpios = <&pinctrl_ap 73 GPIO_ACTIVE_HIGH>;
             ana-supply = <&touch_analog>;
