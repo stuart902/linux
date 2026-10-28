@@ -60,9 +60,6 @@
 #define TSL2583_STA_ADC_VALID		0x10
 #define TSL2583_STA_ADC_INTR		0x20
 
-/* Lux calculation constants */
-#define TSL2583_LUX_CALC_OVER_FLOW	65535
-
 #define TSL2583_INTERRUPT_DISABLED	0x00
 
 #define TSL2583_CHIP_ID			0x90
@@ -73,21 +70,14 @@
 /* Nominal length of one ADC integration cycle on the generic TSL258x parts */
 #define TSL2583_INTEGRATION_CYCLE_US	2700
 
-/*
- * Apple pairs the TSL258x register interface with its own factory LSCI
- * calibration record. The record layout is versioned; every version shares
- * the same 8 byte header and the same fixed-point scale for the lux
- * coefficients, but differs in the record size and in the number of
- * calibrated gain steps.
- */
+/* The LSCI record layout is versioned; see tsl2583.h for what they share. */
 #define APPLE_ALS_CAL_HEADER_SIZE	8
-#define APPLE_ALS_CAL_SCALE		65536
-#define APPLE_ALS_LUX_FUDGE_SCALE	255
-#define APPLE_ALS_MAX_GAIN_COUNT	8
 
 #define CT819_CAL_RECORD_SIZE_V2	0x40
 #define CT819_CAL_GAIN_COUNT		4
 #define CT819_CAL_RATIO_OFF		0x30
+/* AppleEmbeddedLightSensor publishes ALSSensorMax = 5000 for the CT819. */
+#define CT819_LUX_MAX			5000
 
 #define CT821_CAL_RECORD_SIZE_V3	0x54
 #define CT821_CAL_RECORD_DATA_SIZE_V3	0x52
@@ -95,20 +85,6 @@
 #define CT821_CAL_GAIN_COUNT_OFF	0x30
 #define CT821_CAL_RATIO_OFF		0x36
 #define CT821_INTEGRATION_CYCLE_US	2780
-
-struct apple_als_calibration {
-	u16 lux_fudge;
-	u16 integration_time;
-	u8 gain;
-	s32 a_coeff1;
-	s32 b_coeff1;
-	s32 upper_range;
-	s32 a_coeff2;
-	s32 b_coeff2;
-	u8 ch0_dark_counts;
-	u8 ch1_dark_counts;
-	u32 gain_factor[APPLE_ALS_MAX_GAIN_COUNT][2];
-};
 
 /* Per-device data */
 struct tsl2583_als_info {
@@ -189,6 +165,9 @@ struct gainadj {
  * @cal_ratio_off:	offset of the gain ratio pair of the second gain step
  * @cal_ratio_scale:	fixed-point scale of the recorded gain ratios
  * @integration_cycle_us: length of one ADC integration cycle
+ * @counts_per_cycle:	ADC counts per integration cycle, zero if only the 16 bit
+ *			range limits them
+ * @lux_max:		largest lux value the calibrated computation reports
  */
 struct tsl2583_chip_info {
 	const struct gainadj *gainadj;
@@ -209,6 +188,8 @@ struct tsl2583_chip_info {
 	unsigned int cal_ratio_off;
 	unsigned int cal_ratio_scale;
 	unsigned int integration_cycle_us;
+	unsigned int counts_per_cycle;
+	unsigned int lux_max;
 };
 
 static const struct gainadj tsl2583_gainadj[] = {
@@ -611,83 +592,14 @@ done:
 	return ret;
 }
 
-/*
- * Scale a raw channel reading back to the integration time and gain the
- * factory calibration was taken at.
- */
-static int apple_als_normalize_channel(struct tsl2583_chip *chip, u16 raw,
-				       int channel, u32 *normalized)
-{
-	const struct apple_als_calibration *cal = &chip->cal;
-	u64 value;
-	u32 calibration_gain;
-	u32 current_gain;
-	u16 calibration_cycles;
-
-	calibration_cycles = cal->integration_time * USEC_PER_MSEC /
-				     chip->info->integration_cycle_us;
-	current_gain = cal->gain_factor[chip->als_settings.als_gain][channel];
-	calibration_gain = cal->gain_factor[cal->gain][channel];
-	if (!calibration_cycles || !chip->integration_cycles ||
-	    !current_gain || !calibration_gain)
-		return -EINVAL;
-
-	value = (u64)raw * calibration_cycles *
-		calibration_gain;
-	value = DIV_ROUND_CLOSEST_ULL(value,
-				      (u64)chip->integration_cycles *
-				      current_gain);
-	*normalized = min_t(u64, value, U32_MAX);
-
-	return 0;
-}
-
 static int apple_als_get_lux(struct tsl2583_chip *chip, u16 ch0, u16 ch1)
 {
-	const struct apple_als_calibration *cal = &chip->cal;
-	s64 lux_scaled;
-	s32 a_coeff;
-	s32 b_coeff;
-	u64 lux;
-	u32 norm_ch0;
-	u32 norm_ch1;
-
-	if (ch0 == U16_MAX || ch1 == U16_MAX)
-		return TSL2583_LUX_CALC_OVER_FLOW;
-
-	if (apple_als_normalize_channel(chip, ch0, 0, &norm_ch0) ||
-	    apple_als_normalize_channel(chip, ch1, 1, &norm_ch1))
-		return -EINVAL;
-	norm_ch0 = max_t(u32, norm_ch0, cal->ch0_dark_counts) -
-		   cal->ch0_dark_counts;
-	norm_ch1 = max_t(u32, norm_ch1, cal->ch1_dark_counts) -
-		   cal->ch1_dark_counts;
-
-	if (!norm_ch0)
-		return 0;
-
-	if ((u64)norm_ch1 * APPLE_ALS_CAL_SCALE <=
-	    (u64)norm_ch0 * cal->upper_range) {
-		a_coeff = cal->a_coeff1;
-		b_coeff = cal->b_coeff1;
-	} else {
-		a_coeff = cal->a_coeff2;
-		b_coeff = cal->b_coeff2;
-	}
-
-	lux_scaled = (s64)norm_ch0 * a_coeff - (s64)norm_ch1 * b_coeff;
-	if (lux_scaled <= 0)
-		return 0;
-
-	if (check_mul_overflow((u64)lux_scaled, (u64)cal->lux_fudge, &lux))
-		return TSL2583_LUX_CALC_OVER_FLOW;
-	lux = div_u64(lux, APPLE_ALS_CAL_SCALE * APPLE_ALS_LUX_FUDGE_SCALE);
-	if (check_mul_overflow(lux,
-			       (u64)chip->als_settings.als_gain_trim, &lux))
-		return TSL2583_LUX_CALC_OVER_FLOW;
-	lux = div_u64(lux, 1000);
-
-	return min_t(u64, lux, TSL2583_LUX_CALC_OVER_FLOW);
+	return apple_als_calc_lux(&chip->cal, chip->als_settings.als_gain,
+				  chip->integration_cycles,
+				  chip->info->integration_cycle_us,
+				  chip->info->counts_per_cycle,
+				  chip->als_settings.als_gain_trim,
+				  chip->info->lux_max, ch0, ch1);
 }
 
 /*
@@ -1407,6 +1319,8 @@ static const struct tsl2583_chip_info ct819_chip_info = {
 	.cal_ratio_off = CT819_CAL_RATIO_OFF,
 	.cal_ratio_scale = CT819_CAL_RATIO_SCALE,
 	.integration_cycle_us = TSL2583_INTEGRATION_CYCLE_US,
+	.counts_per_cycle = CT819_COUNTS_PER_CYCLE,
+	.lux_max = CT819_LUX_MAX,
 };
 
 static const struct tsl2583_chip_info ct821_chip_info = {
@@ -1428,6 +1342,7 @@ static const struct tsl2583_chip_info ct821_chip_info = {
 	.cal_ratio_off = CT821_CAL_RATIO_OFF,
 	.cal_ratio_scale = CT821_CAL_RATIO_SCALE,
 	.integration_cycle_us = CT821_INTEGRATION_CYCLE_US,
+	.lux_max = TSL2583_LUX_CALC_OVER_FLOW,
 };
 
 static int tsl2583_probe(struct i2c_client *clientp)
