@@ -202,6 +202,10 @@ static void apple_spi_init(struct apple_spi *spi)
 		reg_write(spi, APPLE_SPI_PIN,
 			  spi->hw->pio_only ? APPLE_SPI_PIN_CS : 0);
 		apple_spi_t8010_clear_status(spi);
+		if (spi->hw->pio_only) {
+			reg_write(spi, APPLE_SPI_RXCNT, 0);
+			reg_write(spi, APPLE_SPI_TXCNT, 0);
+		}
 		reg_write(spi, APPLE_SPI_WORD_DELAY, spi->word_delay);
 		reg_write(spi, APPLE_SPI_CFG, spi->hw->cfg_base);
 		return;
@@ -561,6 +565,11 @@ out_terminate:
 	return ret;
 }
 
+static void apple_spi_pm_put(void *data)
+{
+	pm_runtime_put_noidle(data);
+}
+
 static void apple_spi_t8010_dma_release(void *data)
 {
 	dma_release_channel(data);
@@ -736,9 +745,8 @@ static int apple_spi_transfer_one_t8010_pio(struct spi_controller *ctlr,
 		status = reg_read(spi, APPLE_SPI_STATUS);
 		if (time_after(jiffies, deadline)) {
 			dev_err(&ctlr->dev,
-				"PIO timed out: tx %u/%u rx %u/%u status=%#x fifo=%#x\n",
+				"T8010 PIO timed out: tx %u/%u rx %u/%u status=%#x fifo=%#x\n",
 				tx_done, words, rx_done, words, status,
-				spi->hw->pio_only ? 0 :
 				reg_read(spi, APPLE_SPI_FIFOSTAT));
 			apple_spi_t8010_finish_xfer(spi, cfg, use_descriptor);
 			return -ETIMEDOUT;
@@ -766,6 +774,111 @@ static int apple_spi_transfer_one_t8010_pio(struct spi_controller *ctlr,
 
 	apple_spi_t8010_finish_xfer(spi, cfg, use_descriptor);
 	return 0;
+}
+
+/*
+ * S8000 byte-wide PIO, in the register order validated on the iPad 5:
+ * stop, clock divider, word delay, status, configuration, enable, the
+ * word counts and only then PIO mode. The FIFOs are fed continuously, never
+ * with more than one FIFO's worth of words not yet read back, so that a
+ * long upload (the 57016-byte touch firmware) keeps the clock running and
+ * the RX FIFO cannot overflow.
+ */
+static int apple_spi_transfer_one_s8000(struct spi_controller *ctlr,
+					struct spi_device *device,
+					struct spi_transfer *t)
+{
+	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
+	unsigned long rate = clk_get_rate(spi->clk);
+	unsigned long deadline = jiffies +
+		msecs_to_jiffies(APPLE_SPI_T8010_TIMEOUT_MS);
+	unsigned int sent = 0, received = 0, iterations = 0;
+	const u8 *tx = t->tx_buf;
+	u8 *rx = t->rx_buf;
+	u32 cfg, div, status, tx_level, rx_level, word_delay;
+	int delay_ns, ret = 0;
+
+	if (!t->len)
+		return 0;
+
+	ret = apple_spi_t8010_calc_div(spi, t->speed_hz ?: device->max_speed_hz,
+				       &div);
+	if (ret)
+		return ret;
+	t->effective_speed_hz = rate / div;
+
+	/* WORD_DELAY counts input clock cycles. */
+	word_delay = spi->word_delay;
+	delay_ns = spi_delay_to_ns(&t->word_delay, t);
+	if (delay_ns < 0)
+		return delay_ns;
+	if (delay_ns)
+		word_delay = DIV_ROUND_UP_ULL((u64)rate * delay_ns, NSEC_PER_SEC);
+
+	cfg = spi->hw->cfg_base;
+	if (device->mode & SPI_CPHA)
+		cfg |= APPLE_SPI_CFG_CPHA;
+	if (device->mode & SPI_CPOL)
+		cfg |= APPLE_SPI_CFG_CPOL;
+
+	reg_write(spi, APPLE_SPI_CTRL, 0);
+	reg_write(spi, APPLE_SPI_CLKDIV, div);
+	reg_write(spi, APPLE_SPI_WORD_DELAY, word_delay);
+	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_T8010_DESC_STATUS_CFG);
+	reg_write(spi, APPLE_SPI_CFG, cfg);
+	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_T8010_ENABLE);
+	reg_write(spi, APPLE_SPI_RXCNT, t->len);
+	reg_write(spi, APPLE_SPI_TXCNT, t->len);
+	reg_write(spi, APPLE_SPI_CFG, cfg | APPLE_SPI_CFG_T8010_PIOEN);
+
+	while (received < t->len) {
+		status = reg_read(spi, APPLE_SPI_STATUS);
+		tx_level = FIELD_GET(APPLE_SPI_STATUS_T8010_TXFIFO, status);
+		rx_level = FIELD_GET(APPLE_SPI_STATUS_T8010_RXFIFO, status);
+		if (tx_level > APPLE_SPI_FIFO_DEPTH ||
+		    rx_level > APPLE_SPI_FIFO_DEPTH ||
+		    rx_level > sent - received) {
+			dev_err(&ctlr->dev,
+				"invalid PIO FIFO state: tx %u rx %u status=%#x\n",
+				sent, received, status);
+			ret = -EIO;
+			break;
+		}
+
+		reg_write(spi, APPLE_SPI_STATUS, status);
+		while (rx_level--) {
+			u8 value = reg_read(spi, APPLE_SPI_RXDATA);
+
+			if (rx)
+				rx[received] = value;
+			received++;
+		}
+
+		while (sent < t->len && tx_level < APPLE_SPI_FIFO_DEPTH &&
+		       sent - received < APPLE_SPI_FIFO_DEPTH) {
+			reg_write(spi, APPLE_SPI_TXDATA, tx ? tx[sent] : 0xff);
+			sent++;
+			tx_level++;
+		}
+
+		if (time_after(jiffies, deadline)) {
+			dev_err(&ctlr->dev,
+				"PIO timed out: tx %u/%u rx %u/%u status=%#x\n",
+				sent, t->len, received, t->len, status);
+			ret = -ETIMEDOUT;
+			break;
+		}
+		if (!(++iterations & 0xff))
+			cond_resched();
+		cpu_relax();
+	}
+
+	reg_write(spi, APPLE_SPI_CFG, cfg);
+	reg_write(spi, APPLE_SPI_CTRL, 0);
+	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_T8010_DESC_STATUS_CFG);
+	reg_read(spi, APPLE_SPI_CTRL);
+
+	return ret;
 }
 
 static int apple_spi_transfer_one_t8010(struct spi_controller *ctlr,
@@ -1025,7 +1138,9 @@ static int apple_spi_probe(struct platform_device *pdev)
 		ctlr->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
 	ctlr->prepare_message = apple_spi_prepare_message;
 	ctlr->set_cs = apple_spi_set_cs;
-	if (spi->hw->legacy_status)
+	if (spi->hw->pio_only)
+		ctlr->transfer_one = apple_spi_transfer_one_s8000;
+	else if (spi->hw->legacy_status)
 		ctlr->transfer_one = apple_spi_transfer_one_t8010;
 	else
 		ctlr->transfer_one = apple_spi_transfer_one;
@@ -1056,6 +1171,20 @@ static int apple_spi_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
+	/*
+	 * S8000: keep the controller powered rather than cycling its power
+	 * domain around every message; it is configured once at probe.
+	 */
+	if (spi->hw->pio_only) {
+		ret = pm_runtime_resume_and_get(&pdev->dev);
+		if (ret < 0)
+			return ret;
+		ret = devm_add_action_or_reset(&pdev->dev, apple_spi_pm_put,
+					       &pdev->dev);
+		if (ret)
+			return ret;
+	}
+
 	apple_spi_init(spi);
 
 	ret = devm_spi_register_controller(&pdev->dev, ctlr);
@@ -1069,7 +1198,7 @@ static int apple_spi_probe(struct platform_device *pdev)
 static const struct apple_spi_hw apple_spi_hw_s8000 = {
 	.legacy_status = true,
 	.pio_only = true,
-	.min_clk_div = 2,
+	.min_clk_div = 1,
 	.cfg_base = APPLE_SPI_CFG_S8000_BASE,
 };
 
