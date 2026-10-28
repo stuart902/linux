@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple T8010 SmartIO coprocessor driver
+ * Apple S8000/T8010 SmartIO coprocessor driver
  *
  * Copyright (C) 2026 Paul Praschl
  */
@@ -23,6 +23,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/refcount.h>
+#include <linux/reset.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/sio.h>
@@ -66,7 +67,7 @@
 #define APPLE_SIO_DMA_COMPLETE_TAGGED	BIT(7)
 #define APPLE_SIO_OP_ERROR		0x6a
 #define APPLE_SIO_OP_READY		0x6d
-#define APPLE_SIO_READY_PARAMETER	0x03
+#define APPLE_SIO_READY_PARAMETER	0x03	/* SMARTIO_PROTOCOL_VERSION */
 #define APPLE_SIO_RX_IRQ_INDEX		2
 #define APPLE_SIO_READY_TIMEOUT_MS	5000
 #define APPLE_SIO_TX_TIMEOUT_US		200000
@@ -802,16 +803,23 @@ static int apple_sio_start(struct apple_sio *sio, const char *firmware_name)
 	int ret;
 
 	control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
-	if (control & APPLE_SIO_CPU_RUN)
-		return dev_err_probe(sio->dev, -EBUSY,
-				     "SmartIO CPU is already running\n");
+	if (control & APPLE_SIO_CPU_RUN) {
+		/* Left running by the boot chain: reset it through the PMGR. */
+		ret = device_reset_optional(sio->dev);
+		control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
+		if (ret || (control & APPLE_SIO_CPU_RUN))
+			return dev_err_probe(sio->dev, ret ?: -EBUSY,
+					     "SmartIO CPU is already running\n");
+	}
 
-	ret = request_firmware(&firmware, firmware_name, sio->dev);
+	/* No user-helper fallback: a missing image must not stall the boot. */
+	ret = request_firmware_direct(&firmware, firmware_name, sio->dev);
 	if (ret)
 		return dev_err_probe(sio->dev, ret,
 				     "failed to load firmware %s\n",
 				     firmware_name);
 
+	/* iOS maps the image page-truncated; round up so all of it is mapped. */
 	size = ALIGN(firmware->size, SZ_4K);
 	buffer = dma_alloc_coherent(sio->dev, size, &dma, GFP_KERNEL);
 	if (!buffer) {
@@ -1062,6 +1070,7 @@ static void apple_sio_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_sio_of_match[] = {
+	{ .compatible = "apple,s8000-sio" },
 	{ .compatible = "apple,t8010-sio" },
 	{}
 };
@@ -1071,12 +1080,15 @@ static struct platform_driver apple_sio_driver = {
 	.driver = {
 		.name = "apple-sio",
 		.of_match_table = apple_sio_of_match,
+		/* Firmware boot waits up to 6 s: never hold up other probes. */
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe = apple_sio_probe,
 	.remove = apple_sio_remove,
 };
 module_platform_driver(apple_sio_driver);
 
+MODULE_FIRMWARE("apple/s8000-smartio.bin");
 MODULE_FIRMWARE("apple/t8010-smartio.bin");
-MODULE_DESCRIPTION("Apple T8010 SmartIO coprocessor driver");
+MODULE_DESCRIPTION("Apple S8000/T8010 SmartIO coprocessor driver");
 MODULE_LICENSE("Dual MIT/GPL");
