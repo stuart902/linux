@@ -1976,12 +1976,13 @@ static int bq27xxx_battery_current_and_status(
 		val_curr->intval = curr;
 
 	if (val_status) {
-		if (bq27xxx_battery_is_full(di, flags))
+		/* A full flag describes capacity, not whether the pack supplies power. */
+		if (curr < 0)
+			val_status->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		else if (bq27xxx_battery_is_full(di, flags))
 			val_status->intval = POWER_SUPPLY_STATUS_FULL;
 		else if (curr > 0)
 			val_status->intval = POWER_SUPPLY_STATUS_CHARGING;
-		else if (curr < 0)
-			val_status->intval = POWER_SUPPLY_STATUS_DISCHARGING;
 		else
 			val_status->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 	}
