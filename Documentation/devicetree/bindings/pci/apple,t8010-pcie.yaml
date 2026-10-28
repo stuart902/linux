@@ -144,7 +144,10 @@ patternProperties:
 
       apple,manual-availability-iommu:
         $ref: /schemas/types.yaml#/definitions/phandle-array
-        maxItems: 1
+        items:
+          - items:
+              - description: phandle of the DART
+              - description: stream ID
         description:
           DART and stream whose retained configuration must be reloaded while
           this root port is brought up. This models Apple's manual-availability

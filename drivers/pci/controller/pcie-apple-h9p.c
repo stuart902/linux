@@ -1867,15 +1867,10 @@ static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
 		{
 			struct of_phandle_args dart;
 
-			ret = of_parse_phandle_with_args(np,
-							 "apple,manual-availability-iommu",
-							 "#iommu-cells", 0, &dart);
+			ret = of_parse_phandle_with_fixed_args(np,
+							       "apple,manual-availability-iommu",
+							       1, 0, &dart);
 			if (!ret) {
-				if (dart.args_count != 1) {
-					of_node_put(dart.np);
-					ret = -EINVAL;
-					goto out_put_child;
-				}
 				pcie->manual_dart[port] = dart.np;
 				pcie->manual_dart_sid[port] = dart.args[0];
 			} else if (ret != -ENOENT) {
