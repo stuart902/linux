@@ -1292,7 +1292,6 @@ static const struct iommu_ops apple_dart_iommu_ops = {
 static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
-	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dart->dev);
 	const char *fault_name = NULL;
 	u32 error = readl(dart->regs + DART_S5L8960X_ERROR);
 	u32 error_code = FIELD_GET(DART_S5L8960X_ERROR_CODE, error);
@@ -1318,8 +1317,8 @@ static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
 
 	dev_err_ratelimited(
 		dart->dev,
-		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%llx",
-		error, stream_idx, error_code, fault_name, addr | cfg->dma_min);
+		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%x",
+		error, stream_idx, error_code, fault_name, addr);
 
 	writel(error, dart->regs + DART_S5L8960X_ERROR);
 	return IRQ_HANDLED;
