@@ -499,6 +499,10 @@ struct usb_composite_dev {
 	/* protects deactivations and delayed_status counts*/
 	spinlock_t			lock;
 
+	/* current allowed by the configuration state, and an Apple host grant */
+	unsigned int			vbus_draw_ma;
+	int				apple_extra_ma;
+
 	/* public: */
 	unsigned int			setup_pending:1;
 	unsigned int			os_desc_pending:1;
