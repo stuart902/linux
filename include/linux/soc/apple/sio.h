@@ -13,6 +13,37 @@ struct apple_sio_async;
 /* Request tags are allocated per endpoint in 1..APPLE_SIO_MAX_TAG. */
 #define APPLE_SIO_MAX_TAG		31
 
+/*
+ * Shim configuration of a DMA endpoint (op 5): the words of an Apple ADT
+ * "dma-channels" record after the endpoint number, as sent by
+ * AppleSmartIODMA::_configureDMA. DMA clients pass it through
+ * dma_slave_config.peripheral_config. A @limit of 0 means "derive it from
+ * the slave config's burst".
+ */
+struct apple_sio_dma_config {
+	u32 xfer;	/* transfer control, e.g. 0x21 16-bit, 0x22 32-bit (MCA) */
+	u32 timeout;
+	u32 fifo;	/* shim FIFO, bytes */
+	u32 trigger;	/* shim trigger level, bytes */
+	u32 limit;	/* client FIFO depth, bytes (setFIFODepth) */
+	u32 word5;	/* ADT word 5 */
+	u32 frame;	/* setFrameSize, 0 unless the client sets it */
+	u32 word7;	/* ADT word 6 */
+};
+
+/* An inclusive range of firmware endpoints exposed as DMA channels. */
+struct apple_sio_dma_range {
+	u8 first;
+	u8 last;
+};
+
+/* Platform data of the "apple-sio-dma" child device. */
+struct apple_sio_dma_pdata {
+	struct apple_sio *sio;
+	const struct apple_sio_dma_range *ranges;
+	unsigned int num_ranges;
+};
+
 typedef void (*apple_sio_async_callback_t)(void *data, int status,
 					   u64 response);
 typedef void (*apple_sio_notify_t)(void *data, u64 message);

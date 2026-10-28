@@ -22,6 +22,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/refcount.h>
 #include <linux/reset.h>
 #include <linux/sizes.h>
@@ -79,6 +80,11 @@
 #define APPLE_SIO_DESC1_SIZE		0x10400
 #define APPLE_SIO_DESC1_COUNT		0x1040
 #define APPLE_SIO_SETUP_COMMANDS	10
+
+struct apple_sio_hw {
+	const struct apple_sio_dma_range *dma_ranges;
+	unsigned int num_dma_ranges;
+};
 
 struct apple_sio_region {
 	void *buffer;
@@ -929,11 +935,17 @@ static int apple_sio_alloc_shared_regions(struct apple_sio *sio)
 static int apple_sio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct apple_sio_dma_pdata dma_pdata = {};
+	const struct apple_sio_hw *hw;
 	const char *firmware_name;
 	unsigned long setup_timeout;
 	struct apple_sio *sio;
 	int irq;
 	int ret;
+
+	hw = device_get_match_data(dev);
+	if (!hw)
+		return -ENODEV;
 
 	sio = devm_kzalloc(dev, sizeof(*sio), GFP_KERNEL);
 	if (!sio)
@@ -1026,9 +1038,13 @@ static int apple_sio_probe(struct platform_device *pdev)
 		goto out_stop;
 	}
 
+	dma_pdata.sio = sio;
+	dma_pdata.ranges = hw->dma_ranges;
+	dma_pdata.num_ranges = hw->num_dma_ranges;
 	sio->dma_pdev = platform_device_register_data(dev, "apple-sio-dma",
 						      PLATFORM_DEVID_AUTO,
-						      &sio, sizeof(sio));
+						      &dma_pdata,
+						      sizeof(dma_pdata));
 	if (IS_ERR(sio->dma_pdev)) {
 		ret = dev_err_probe(dev, PTR_ERR(sio->dma_pdev),
 				    "failed to register DMA child\n");
@@ -1069,9 +1085,31 @@ static void apple_sio_remove(struct platform_device *pdev)
 	xa_destroy(&sio->pending);
 }
 
+/* SPI0-3, MCA0-4 and UART0-8, transmit and receive (iOS 16.7.10 ADT) */
+static const struct apple_sio_dma_range apple_sio_s8000_dma_ranges[] = {
+	{ 0x14, 0x1b },
+	{ 0x28, 0x31 },
+	{ 0x3c, 0x4d },
+};
+
+static const struct apple_sio_hw apple_sio_s8000_hw = {
+	.dma_ranges = apple_sio_s8000_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_s8000_dma_ranges),
+};
+
+/* SPI3 transmit only: the one endpoint in use on T8010 (touch) so far. */
+static const struct apple_sio_dma_range apple_sio_t8010_dma_ranges[] = {
+	{ 0x1a, 0x1a },
+};
+
+static const struct apple_sio_hw apple_sio_t8010_hw = {
+	.dma_ranges = apple_sio_t8010_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_t8010_dma_ranges),
+};
+
 static const struct of_device_id apple_sio_of_match[] = {
-	{ .compatible = "apple,s8000-sio" },
-	{ .compatible = "apple,t8010-sio" },
+	{ .compatible = "apple,s8000-sio", .data = &apple_sio_s8000_hw },
+	{ .compatible = "apple,t8010-sio", .data = &apple_sio_t8010_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_sio_of_match);
