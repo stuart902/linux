@@ -879,6 +879,21 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	if (dart_domain->finalized)
 		goto done;
 
+	/*
+	 * S5L8960X DARTs see IOVAs relative to the window base: behind the A9
+	 * PCIe root complex, IOVA 0xbbffe000 of the window at 0x80000000
+	 * reaches the DART as 0x3bffe000. The tables are indexed the same way
+	 * by masking the base off below, which equals subtracting it only if
+	 * the base is aligned beyond the window size.
+	 */
+	if (dart->hw->type == DART_S5L8960X && cfg->dma_min &&
+	    cfg->dma_max - cfg->dma_min >= (cfg->dma_min & -cfg->dma_min)) {
+		dev_err(dart->dev, "DMA window %pad..%pad is not base-aligned\n",
+			&cfg->dma_min, &cfg->dma_max);
+		ret = -EINVAL;
+		goto done;
+	}
+
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
 		dart_domain->stream_maps[i].dart = cfg->stream_maps[i].dart;
 		for (j = 0; j < BITS_TO_LONGS(dart->num_streams); j++)
