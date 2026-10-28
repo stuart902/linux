@@ -8,6 +8,7 @@
  */
 
 #include "s800-0-3.dtsi"
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	twister_opp: opp-table {
@@ -60,7 +61,46 @@
 	};
 };
 
+&cpu0 {
+	#cooling-cells = <2>;
+};
+
+&cpu1 {
+	#cooling-cells = <2>;
+};
+
 &{/soc} {
+	/*
+	 * ADT disp0 ("adbe0,s8000"). The pipe reads through dart-disp0,
+	 * which iBoot leaves in bypass and which stays undescribed.
+	 */
+	disp0: display-controller@206200000 {
+		compatible = "apple,s8000-display-pipe";
+		reg = <0x2 0x06200000 0x0 0x100000>,
+		      <0x2 0x06400000 0x0 0x8000>,
+		      <0x2 0x06440000 0x0 0x8000>,
+		      <0x2 0x06480000 0x0 0x8000>,
+		      <0x2 0x064c0000 0x0 0x8000>,
+		      <0x2 0x06500000 0x0 0x1c>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 140 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 146 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_disp0>, <&ps_dp>;
+		status = "disabled";
+	};
+
+	/* ADT tempsensor,s8000 (AppleT700XTempSensor): SOC and TCC blocks */
+	s8003_thermal: thermal-sensor@20e0c0000 {
+		compatible = "apple,s8003-thermal";
+		reg = <0x2 0x0e0c0000 0x0 0x1000>,
+		      <0x2 0x02230000 0x0 0x1000>;
+		reg-names = "soc", "tcc";
+		#thermal-sensor-cells = <1>;
+	};
+
 	/*
 	 * error-reflector, fetch-config and diag-config are the ADT
 	 * dart-apcie0/1 values, which iOS programs at every DART init.
@@ -175,6 +215,113 @@
 			#address-cells = <3>;
 			#size-cells = <2>;
 			ranges;
+		};
+	};
+};
+
+/ {
+	/*
+	 * Trips are margins below the 100 C alarm iBoot programs, not iOS's
+	 * skin temperature policy.
+	 */
+	thermal-zones {
+		soc0-thermal {
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
+			thermal-sensors = <&s8003_thermal 0>;
+
+			trips {
+				soc0_passive: passive {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				hot {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				critical {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&soc0_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		soc1-thermal {
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
+			thermal-sensors = <&s8003_thermal 1>;
+
+			trips {
+				soc1_passive: passive {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				hot {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				critical {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&soc1_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		tcc2-thermal {
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
+			thermal-sensors = <&s8003_thermal 5>;
+
+			trips {
+				tcc2_passive: passive {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				hot {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				critical {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&tcc2_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
 		};
 	};
 };
