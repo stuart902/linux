@@ -1638,8 +1638,9 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 						     DMA_TO_DEVICE);
 	if (!msgbuf->tx_pktids)
 		goto fail;
+	/* Some firmware reads posted RX buffers, e.g. BCM4355C1 during association. */
 	msgbuf->rx_pktids = brcmf_msgbuf_init_pktids(NR_RX_PKTIDS,
-						     DMA_FROM_DEVICE);
+						     DMA_BIDIRECTIONAL);
 	if (!msgbuf->rx_pktids)
 		goto fail;
 
