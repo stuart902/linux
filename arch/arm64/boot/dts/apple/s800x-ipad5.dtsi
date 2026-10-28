@@ -159,6 +159,11 @@
 &i2c0 {
 	status = "okay";
 
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+
 	d2365_pmic: pmic@3c {
 		compatible = "apple,angel-pmic", "apple,i2c-pmic";
 		reg = <0x3c>;
@@ -174,14 +179,33 @@
 			gpio-controller;
 			#gpio-cells = <2>;
 			gpio-reserved-ranges = <1 9>, <11 2>, <15 9>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&pinctrl_ap 76 IRQ_TYPE_LEVEL_LOW>;
 		};
 
-		/*
-		 * The PMU event interrupt controller (event line AP GPIO 76,
-		 * active low) on pmu_gpio and the Lightning charger at 0x180,
-		 * with the Tristar at i2c0 0x1a, are described with the
-		 * shared D2365 event controller.
-		 */
+		tristar_charger: charger@180 {
+			compatible = "apple,j71t-tristar-charger", "apple,tristar-charger";
+			reg = <0x180 0x10>, <0xa00 0x04>, <0x4000 0x03>;
+			reg-names = "status", "control", "adc";
+			interrupt-parent = <&pmu_gpio>;
+			/*
+			 * The PMU line, ADC done, then the events the iPadOS
+			 * charger subscribes to.
+			 */
+			interrupts = <240 IRQ_TYPE_EDGE_RISING>,
+				     <176 IRQ_TYPE_EDGE_RISING>,
+				     <16 IRQ_TYPE_EDGE_RISING>,
+				     <40 IRQ_TYPE_EDGE_RISING>,
+				     <41 IRQ_TYPE_EDGE_RISING>,
+				     <42 IRQ_TYPE_EDGE_RISING>,
+				     <43 IRQ_TYPE_EDGE_RISING>,
+				     <72 IRQ_TYPE_EDGE_RISING>,
+				     <73 IRQ_TYPE_EDGE_RISING>,
+				     <77 IRQ_TYPE_EDGE_RISING>;
+			apple,tristar = <&tristar>;
+			input-current-limit-microamp = <2400000>;
+		};
 
 		rtc@500 {
 			compatible = "apple,angel-pmic-rtc", "apple,antigua-pmic-rtc";
@@ -316,6 +340,7 @@
 		/* N1 selects 83 ns; the controller rounds up to divider 6 */
 		spi-max-frequency = <12048192>;
 		interrupts-extended = <&pinctrl_ap 65 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl_ap 65 GPIO_ACTIVE_LOW>;
 		reset-gpios = <&pinctrl_ap 75 GPIO_ACTIVE_LOW>;
 		power-ldo-gpios = <&pinctrl_ap 73 GPIO_ACTIVE_HIGH>;
 		ana-supply = <&touch_analog>;
@@ -427,3 +452,8 @@
 };
 
 #endif /* S800X_IPAD5_PCIE */
+
+/* Tell the Lightning charger what the USB host allows. */
+&usbdev {
+	usb-psy-name = "lightning";
+};
