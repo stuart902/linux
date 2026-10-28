@@ -178,6 +178,8 @@
 
 #define S8003_PORT_LINKSTS		0x0088
 #define S8003_PORT_LINKSTS_UP		BIT(0)
+/* PME_Turn_Off request (0x31 sends it, AppleS800xPCIePort::disableGated) */
+#define S8003_PORT_PMETO		0x008c
 #define S8003_PORT_LINKPMGRSTS		0x0210
 #define S8003_PORT_LINKCDMSTS		0x0804
 #define S8003_PORT_LINKCDMSTS_LTSSM	GENMASK(14, 9)
@@ -2237,6 +2239,9 @@ static int apple_s8003_port_stop(struct apple_h9p_pcie *pcie,
 
 	writel(H9P_PORT_IRQMASK_PRE_LINK, pb + H9P_PORT_IRQMASK);
 	h9p_rmw(pb + H9P_PORT_LTSSMCTL, H9P_PORT_LTSSM_ENABLE, 0);
+	readl(pb + H9P_PORT_LTSSMCTL);
+	/* No PME_Turn_Off/L2 request may stay pending across the restart */
+	h9p_writel_flush(0, pb + S8003_PORT_PMETO);
 	writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
 
 	return apple_h9p_wait(pb + H9P_PORT_LTSSMCTL, H9P_PORT_LTSSM_ENABLE,
