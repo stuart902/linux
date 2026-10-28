@@ -373,6 +373,22 @@ config APPLE_D2365_CHARGER
 	  This driver can also be built as a module. If so, the module will be
 	  called apple_d2365_charger.
 
+config APPLE_TRISTAR_CHARGER
+	tristate "Apple Tristar Lightning charging"
+	depends on MFD_SIMPLE_MFD_I2C && I2C
+	help
+	  Say Y here to enable charging on Apple devices with a Tristar
+	  (CBTL1610) Lightning port controller, such as the iPad 5 and iPad 6.
+
+	  The driver identifies the attached source (Apple USB-A chargers by
+	  their BrickID, USB-C sources by their CC advertisement) and raises
+	  the PMIC input-current limit to what the source supports, up to the
+	  board maximum. Unidentified sources get 500 mA. Every source change
+	  drops the limit before the new source is identified.
+
+	  This driver can also be built as a module. If so, the module will be
+	  called apple_tristar_charger.
+
 config BATTERY_BQ27XXX_DT_UPDATES_NVM
 	bool "BQ27xxx support for update of NVM/flash data memory"
 	depends on BATTERY_BQ27XXX_I2C
