@@ -4,16 +4,17 @@
 $id: http://devicetree.org/schemas/pci/apple,t8010-pcie.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T7000 and T8010 PCIe host controller
+title: Apple S8003, T7000 and T8010 PCIe host controller
 
 maintainers:
   - Paul Praschl <praschlpaul@g-p.at>
 
 description: |
-  Apple A10/T8010 devices use the H9P PCIe root complex for internal
-  storage and Wi-Fi. It exposes one ECAM window shared by up to four root
-  ports, controller-specific PHY and port register windows, and a local MSI
-  block.
+  Apple A9/S8003 (TSMC) and A10/T8010 devices use the H8P/H9P PCIe root
+  complex for internal storage and Wi-Fi. It exposes one ECAM window shared
+  by up to four root ports, controller-specific PHY and port register
+  windows, and a local MSI block. Both SoCs share this register map but
+  need different power-up and link training sequences.
 
   The storage port also contains an NVMMU which translates the proprietary
   Apple ANS FlatDMA format. Unlike a general-purpose IOMMU, this block uses a
@@ -95,6 +96,7 @@ properties:
   compatible:
     oneOf:
       - enum:
+          - apple,s8003-pcie
           - apple,t7000-pcie
           - apple,t8010-pcie
       - items:
@@ -136,7 +138,17 @@ properties:
 
   power-domains:
     minItems: 1
-    maxItems: 3
+    maxItems: 7
+
+  power-domain-names:
+    items:
+      - const: core
+      - const: aux
+      - const: ref
+      - const: link0
+      - const: link1
+      - const: link2
+      - const: link3
 
   msi-parent: true
 
@@ -187,6 +199,14 @@ patternProperties:
         description:
           Software-observable CLKREQ# input. This is optional when the pad is
           pinmuxed directly to the PCIe controller instead.
+
+      num-lanes:
+        enum: [1, 2]
+        description:
+          Number of lanes of this root port. On S8003 the lane
+          configuration of the root complex follows from it. Port 0 is
+          always x2, port 2 is x2 only if it says so (port 3 is then
+          unusable), and the other ports are x1.
 
       max-link-speed:
         enum: [1, 2, 3]
@@ -262,6 +282,29 @@ required:
   - msi-parent
   - msi-ranges
   - '#interrupt-cells'
+
+if:
+  properties:
+    compatible:
+      contains:
+        const: apple,s8003-pcie
+then:
+  properties:
+    clocks: false
+    clock-names: false
+    power-domains:
+      minItems: 7
+    apple,preinit-phy-port-mask: false
+  required:
+    - power-domain-names
+else:
+  properties:
+    power-domains:
+      maxItems: 1
+    power-domain-names: false
+  required:
+    - clocks
+    - clock-names
 
 unevaluatedProperties: false
 
@@ -408,6 +451,75 @@ examples:
                 reg = <0x800 0x0 0x0 0x0 0x0>;
                 reset-gpios = <&pinctrl 179 GPIO_ACTIVE_LOW>;
                 max-link-speed = <1>;
+
+                #address-cells = <3>;
+                #size-cells = <2>;
+                ranges;
+            };
+        };
+    };
+
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        pcie1: pcie@610000000 {
+            compatible = "apple,s8003-pcie";
+            device_type = "pci";
+
+            reg = <0x6 0x10000000 0x0 0x1000000>,
+                  <0x6 0x00000000 0x0 0x8000>,
+                  <0x6 0x00008000 0x0 0x4000>,
+                  <0x6 0x0a000000 0x0 0x40000>,
+                  <0x6 0x01000000 0x0 0x4000>,
+                  <0x6 0x02000000 0x0 0x4000>,
+                  <0x6 0x03000000 0x0 0x4000>,
+                  <0x6 0x04000000 0x0 0x4000>,
+                  <0x6 0x01004000 0x0 0x4000>;
+            reg-names = "config", "rc", "phy", "phy-ip",
+                        "port0", "port1", "port2", "port3",
+                        "nvmmu";
+
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 244 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 247 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 250 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 253 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 246 IRQ_TYPE_EDGE_RISING>;
+            interrupt-names = "port0", "port1", "port2", "port3",
+                              "nvmmu";
+
+            msi-controller;
+            msi-parent = <&pcie1>;
+            msi-ranges = <&aic AIC_IRQ 256 IRQ_TYPE_EDGE_RISING 32>;
+            apple,msi-doorbell = <0xbffff000>;
+            apple,nvmmu-iova = <0xbc000000>;
+            apple,nvme-hmb = <&nvme_hmb>;
+
+            #address-cells = <3>;
+            #size-cells = <2>;
+            #interrupt-cells = <1>;
+            interrupt-controller;
+            bus-range = <0x00 0x0f>;
+            ranges = <0x03000000 0x0 0xc0000000
+                      0x7 0xc0000000 0x0 0x40000000>;
+
+            power-domains = <&ps_pcie>, <&ps_pcie_aux>, <&ps_pcie_ref>,
+                            <&ps_pcie_link0>, <&ps_pcie_link1>,
+                            <&ps_pcie_link2>, <&ps_pcie_link3>;
+            power-domain-names = "core", "aux", "ref", "link0", "link1",
+                                 "link2", "link3";
+
+            pci@0,0 {
+                device_type = "pci";
+                reg = <0x0 0x0 0x0 0x0 0x0>;
+                reset-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
+                num-lanes = <2>;
+                max-link-speed = <2>;
 
                 #address-cells = <3>;
                 #size-cells = <2>;
