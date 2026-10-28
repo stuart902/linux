@@ -61,6 +61,9 @@
 #define APPLE_SIO_MSG_PARAMETER		GENMASK_ULL(31, 24)
 #define APPLE_SIO_MSG_DATA		GENMASK_ULL(63, 32)
 
+#define APPLE_SIO_OP_DMA_ERROR		0x66
+#define APPLE_SIO_OP_DMA_COMPLETE	0x68
+#define APPLE_SIO_DMA_COMPLETE_TAGGED	BIT(7)
 #define APPLE_SIO_OP_ERROR		0x6a
 #define APPLE_SIO_OP_READY		0x6d
 #define APPLE_SIO_READY_PARAMETER	0x03
@@ -117,6 +120,11 @@ struct apple_sio {
 	spinlock_t tag_lock;
 	/* Bit n set: tag n is in use on that endpoint (bit 0 is never used). */
 	u32 tags[APPLE_SIO_MAX_ENDPOINTS];
+	/* Unmatched messages per endpoint; under the pending xarray lock. */
+	struct {
+		apple_sio_notify_t fn;
+		void *data;
+	} notify[APPLE_SIO_MAX_ENDPOINTS];
 	struct xarray pending;
 	struct apple_sio_region ep0_general;
 	struct apple_sio_region ep0_spi;
@@ -199,6 +207,21 @@ static void apple_sio_tag_free(struct apple_sio *sio, u8 endpoint, u8 tag)
 	spin_unlock_irqrestore(&sio->tag_lock, flags);
 }
 
+void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
+			  apple_sio_notify_t notify, void *data)
+{
+	unsigned long flags;
+
+	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS)
+		return;
+
+	xa_lock_irqsave(&sio->pending, flags);
+	sio->notify[endpoint].fn = notify;
+	sio->notify[endpoint].data = data;
+	xa_unlock_irqrestore(&sio->pending, flags);
+}
+EXPORT_SYMBOL_GPL(apple_sio_set_notify);
+
 void *apple_sio_desc0_alloc(struct apple_sio *sio, unsigned int slots,
 			    u32 *first_slot)
 {
@@ -266,13 +289,23 @@ static bool apple_sio_is_ready(u64 message)
 
 static void apple_sio_dispatch(struct apple_sio *sio, u64 message)
 {
-	struct apple_sio_async *request;
+	struct apple_sio_async *request = NULL;
+	apple_sio_notify_t notify = NULL;
+	void *notify_data = NULL;
 	unsigned long flags;
 	bool matched = false;
 	u8 endpoint = FIELD_GET(APPLE_SIO_MSG_ENDPOINT, message);
 	u8 tag = FIELD_GET(APPLE_SIO_MSG_TAG, message);
 	u8 opcode = FIELD_GET(APPLE_SIO_MSG_OPCODE, message);
+	u8 parameter = FIELD_GET(APPLE_SIO_MSG_PARAMETER, message);
 	unsigned long key = apple_sio_request_key(endpoint, tag);
+	/*
+	 * A DMA completion (0x68) refers to a command only with parameter
+	 * bit 7 set (AppleSmartIODMA::_asyncAction). Without it, it is the
+	 * channel-idle notification and its tag field is meaningless.
+	 */
+	bool tagged = opcode != APPLE_SIO_OP_DMA_COMPLETE ||
+		      (parameter & APPLE_SIO_DMA_COMPLETE_TAGGED);
 
 	if (apple_sio_is_ready(message)) {
 		if (!READ_ONCE(sio->running) && !READ_ONCE(sio->stopping)) {
@@ -284,19 +317,27 @@ static void apple_sio_dispatch(struct apple_sio *sio, u64 message)
 	}
 
 	xa_lock_irqsave(&sio->pending, flags);
-	request = xa_load(&sio->pending, key);
+	if (tagged)
+		request = xa_load(&sio->pending, key);
 	if (request && (opcode == request->expected_opcode ||
-			opcode == APPLE_SIO_OP_ERROR)) {
+			opcode == APPLE_SIO_OP_ERROR ||
+			opcode == APPLE_SIO_OP_DMA_ERROR)) {
 		__xa_erase(&sio->pending, key);
 		request->active = false;
 		request->response = message;
-		request->status = opcode == APPLE_SIO_OP_ERROR ? -EIO : 0;
+		request->status = opcode == request->expected_opcode ? 0 : -EIO;
 		matched = true;
+	} else if (endpoint < APPLE_SIO_MAX_ENDPOINTS) {
+		notify = sio->notify[endpoint].fn;
+		notify_data = sio->notify[endpoint].data;
 	}
 	xa_unlock_irqrestore(&sio->pending, flags);
 
 	if (!matched) {
+		/* Acks of asynchronous submits, idle notifications, ... */
 		sio->unmatched_count++;
+		if (notify)
+			notify(notify_data, message);
 		return;
 	}
 
@@ -645,6 +686,32 @@ int apple_sio_async_cancel(struct apple_sio_async *request)
 	return -EALREADY;
 }
 EXPORT_SYMBOL_GPL(apple_sio_async_cancel);
+
+void apple_sio_cancel_endpoint(struct apple_sio *sio, u8 endpoint)
+{
+	struct apple_sio_async *request;
+	LIST_HEAD(cancelled);
+	unsigned long index;
+	unsigned long flags;
+
+	xa_lock_irqsave(&sio->pending, flags);
+	xa_for_each(&sio->pending, index, request) {
+		if (request->endpoint != endpoint)
+			continue;
+		__xa_erase(&sio->pending, index);
+		request->active = false;
+		list_add_tail(&request->shutdown_node, &cancelled);
+	}
+	xa_unlock_irqrestore(&sio->pending, flags);
+
+	while (!list_empty(&cancelled)) {
+		request = list_first_entry(&cancelled, struct apple_sio_async,
+					   shutdown_node);
+		list_del_init(&request->shutdown_node);
+		apple_sio_async_finish(request, -ECANCELED, 0, true);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_sio_cancel_endpoint);
 
 int apple_sio_request(struct apple_sio *sio, u8 endpoint, u8 opcode,
 		      u8 parameter, u32 data, u8 expected_opcode,

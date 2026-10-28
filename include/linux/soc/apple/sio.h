@@ -15,6 +15,7 @@ struct apple_sio_async;
 
 typedef void (*apple_sio_async_callback_t)(void *data, int status,
 					   u64 response);
+typedef void (*apple_sio_notify_t)(void *data, u64 message);
 
 void *apple_sio_desc0_alloc(struct apple_sio *sio, unsigned int slots,
 			    u32 *first_slot);
@@ -37,5 +38,15 @@ void apple_sio_async_put(struct apple_sio_async *request);
 int apple_sio_request(struct apple_sio *sio, u8 endpoint, u8 opcode,
 		      u8 parameter, u32 data, u8 expected_opcode,
 		      unsigned long timeout, u64 *response);
+
+/* Fail every outstanding request on @endpoint with -ECANCELED. */
+void apple_sio_cancel_endpoint(struct apple_sio *sio, u8 endpoint);
+
+/*
+ * Pass messages on @endpoint that match no pending request to @notify.
+ * Called from the interrupt handler.
+ */
+void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
+			  apple_sio_notify_t notify, void *data);
 
 #endif
