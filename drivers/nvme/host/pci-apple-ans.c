@@ -233,14 +233,25 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
 	if (!ans)
 		return 0;
 
-	ret = nvme_pci_apple_ans_config(dev);
-	if (ret)
-		return ret;
-
 	core_mask = readl(dev->bar + APPLE_ANS_REG_CORE_MASK);
 	log_size = readl(dev->bar + APPLE_ANS_REG_LOG_SIZE);
 	hmb_size = readl(dev->bar + APPLE_ANS_REG_HMB_SIZE_REQ);
 	hmb_align = readl(dev->bar + APPLE_ANS_REG_HMB_ALIGN_REQ);
+
+	/*
+	 * Check what the controller needs from the boot loader before writing
+	 * anything to it: without a usable HMB, leave it as the loader left it.
+	 */
+	if (!ans->hmb_size) {
+		ret = nvme_pci_apple_ans_find_hmb(dev, hmb_size, hmb_align);
+		if (ret)
+			return dev_err_probe(dev->dev, ret,
+					     "no usable ANS host memory buffer\n");
+	}
+
+	ret = nvme_pci_apple_ans_config(dev);
+	if (ret)
+		return ret;
 
 	writel(0, dev->bar + NVME_REG_CC);
 	ret = readl_poll_timeout(dev->bar + NVME_REG_CSTS, csts,
@@ -248,12 +259,6 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
 				 1000, 2000000);
 	if (ret)
 		return ret;
-
-	if (!ans->hmb_size) {
-		ret = nvme_pci_apple_ans_find_hmb(dev, hmb_size, hmb_align);
-		if (ret)
-			return ret;
-	}
 
 	ret = nvme_pci_apple_ans_reset_dma(dev);
 	if (ret)
