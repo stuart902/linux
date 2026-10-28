@@ -442,6 +442,8 @@ struct apple_h9p_tunables {
 struct apple_h9p_nvmmu {
 	struct apple_h9p_pcie *pcie;
 	void __iomem *base;
+	/* Programmed: the ANS glue may map through it */
+	bool ready;
 	/* Serializes the invalidate FIFO wait and the invalidate write */
 	spinlock_t inv_lock;
 	/* With the invalidate FIFO: tags mapped since their last invalidate */
@@ -502,6 +504,8 @@ enum apple_h9p_port_result {
  * @port_tunables: port block tunables (S8003 only)
  * @nvmmu_init_busy: NVMMU TCB control bit that is set while its init runs
  * @nvmmu_inv_fifo: wait for the NVMMU invalidate FIFO before invalidating
+ *                  and before (re)initializing the NVMMU, in iOS's S8003 order
+ * @nvmmu_optional: an NVMMU that can't be set up only disables storage
  * @j172_bridge_quirk: replay J172 firmware's bridge transactions on port 3
  */
 struct apple_h9p_hw {
@@ -524,6 +528,7 @@ struct apple_h9p_hw {
 	struct apple_h9p_tunables port_tunables;
 	u32 nvmmu_init_busy;
 	bool nvmmu_inv_fifo;
+	bool nvmmu_optional;
 	bool j172_bridge_quirk;
 };
 
@@ -1413,7 +1418,7 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 	struct device_node *mem_np;
 	struct resource res;
 	resource_size_t size;
-	u32 iova;
+	u32 iova, val;
 	int irq;
 	int ret;
 
@@ -1481,15 +1486,39 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 		goto out_put_node;
 	}
 
-	h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
-	h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
-	h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
-	h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
 	spin_lock_init(&nvmmu->inv_lock);
+	if (pcie->hw->nvmmu_inv_fifo) {
+		/*
+		 * iOS's S8003 order: the invalidate FIFO drained, the old SART
+		 * aperture off before its address changes, the zeroed scratch
+		 * page and TCBs visible, then scratch page, TCB base, init, SART.
+		 */
+		ret = readl_poll_timeout(pcie->base_port[0] +
+					 S8003_PORT_NVMMU_INV_FIFO, val,
+					 val & S8003_PORT_NVMMU_INV_FIFO_EMPTY,
+					 10, S8003_NVMMU_INV_FIFO_TIMEOUT_US);
+		if (ret)
+			goto out_put_node;
+		h9p_writel_flush(0, nvmmu->base + H9P_NVMMU_SART_CTRL);
+		dma_wmb();
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
+	} else {
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
+	}
 	h9p_writel_flush(H9P_NVMMU_TCB_CTRL_INIT,
 			 nvmmu->base + H9P_NVMMU_TCB_CTRL);
 
@@ -1518,6 +1547,7 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 		goto out_put_node;
 	}
 
+	nvmmu->ready = true;
 	dev_dbg(dev, "storage-port NVMMU window %#x@%pa size %#x\n",
 		nvmmu->va_base, &res.start, nvmmu->size);
 
@@ -1606,7 +1636,7 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 		return -ENODEV;
 
 	nvmmu = &pcie->nvmmu;
-	if (!nvmmu->base || !nvmmu->tcb || !nvmmu->tcb_sgl)
+	if (!nvmmu->ready)
 		return -EOPNOTSUPP;
 
 	tcb = (u32 *)nvmmu->tcb + tag * H9P_NVMMU_TCB_DWORDS;
@@ -2776,6 +2806,17 @@ static int apple_h9p_pcie_init(struct pci_config_window *cfg)
 		msleep(pcie->hw->link_settle_ms);
 
 	ret = apple_h9p_setup_nvmmu(pcie);
+	if (ret && pcie->hw->nvmmu_optional) {
+		/*
+		 * Without the NVMMU only storage is lost: keep the other ports.
+		 * The storage port stays enumerated so that the others keep
+		 * their bus numbers; the ANS glue can't map through the NVMMU.
+		 */
+		dev_err(pcie->dev, "NVMMU setup failed (%d), storage disabled\n",
+			ret);
+		return 0;
+	}
+
 	return ret;
 }
 
@@ -3195,6 +3236,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 	/* AppleNVMeMMU on S8003 polls the init bit itself */
 	.nvmmu_init_busy = H9P_NVMMU_TCB_CTRL_INIT,
 	.nvmmu_inv_fifo = true,
+	.nvmmu_optional = true,
 	.no_port_irqs = true,
 };
 
