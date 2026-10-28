@@ -12,3 +12,11 @@
 	compatible = "apple,j72b", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 6 (Cellular)";
 };
+
+&wifi {
+	brcm,board-type = "apple,j72b";
+};
+
+&touchscreen {
+	firmware-name = "apple/j72b-fwstart.z2fw";
+};
