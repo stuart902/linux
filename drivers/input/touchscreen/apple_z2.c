@@ -218,6 +218,7 @@ struct apple_z2 {
 	unsigned long last_wake;
 	bool wake_valid;
 	bool ana_enabled;
+	bool irq_on;
 	struct clk *clk;
 	struct input_dev *input_dev;
 	struct completion boot_irq;
@@ -1884,6 +1885,26 @@ static void apple_z2_gen1_restore_irq_type(struct apple_z2 *z2)
 		z2->irq_type_changed = false;
 }
 
+/*
+ * The interrupt is requested disabled. Track whether it is enabled, so that
+ * a boot that failed with it disabled is not disabled a second time.
+ */
+static void apple_z2_irq_on(struct apple_z2 *z2)
+{
+	if (z2->irq_on)
+		return;
+	z2->irq_on = true;
+	enable_irq(z2->spidev->irq);
+}
+
+static void apple_z2_irq_off(struct apple_z2 *z2)
+{
+	if (!z2->irq_on)
+		return;
+	z2->irq_on = false;
+	disable_irq(z2->spidev->irq);
+}
+
 static irqreturn_t apple_z2_irq(int irq, void *data)
 {
 	struct apple_z2 *z2 = data;
@@ -2845,7 +2866,7 @@ static int apple_z2_n1_finish_boot(struct apple_z2 *z2)
 	if (error)
 		return error;
 
-	enable_irq(z2->spidev->irq);
+	apple_z2_irq_on(z2);
 	return 0;
 }
 
@@ -3001,7 +3022,7 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 
 	if (defer_irq_wait && z2->upload_irq_masked) {
 		z2->upload_irq_masked = false;
-		enable_irq(z2->spidev->irq);
+		apple_z2_irq_on(z2);
 	}
 
 	if (!defer_irq_wait)
@@ -3353,13 +3374,13 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			if (error)
 				return error;
 			if (apple_z2_uses_ipad_protocol(z2)) {
-				disable_irq(z2->spidev->irq);
+				apple_z2_irq_off(z2);
 				error = apple_z2_read_device_info_locked(z2);
 				/* J71b: stay masked until its first reports are read. */
 				if (apple_z2_is_j71b(z2))
 					z2->upload_irq_masked = true;
 				else
-					enable_irq(z2->spidev->irq);
+					apple_z2_irq_on(z2);
 				if (error)
 					return error;
 			}
@@ -3427,7 +3448,7 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 		error = apple_z2_gen1_set_level_irq(z2);
 	if (!error && apple_z2_is_j71b(z2) && z2->upload_irq_masked) {
 		z2->upload_irq_masked = false;
-		enable_irq(z2->spidev->irq);
+		apple_z2_irq_on(z2);
 	}
 	mutex_unlock(&z2->io_lock);
 	if (error)
@@ -3663,7 +3684,7 @@ static int apple_z2_boot(struct apple_z2 *z2)
 	}
 
 	reinit_completion(&z2->boot_irq);
-	enable_irq(z2->spidev->irq);
+	apple_z2_irq_on(z2);
 	irq_enabled = true;
 	if (apple_z2_is_j71b(z2)) {
 		/* J71b boots on reset release; a pulse would restart it. */
@@ -3701,7 +3722,7 @@ static int apple_z2_boot(struct apple_z2 *z2)
 	}
 
 	if (apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2)) {
-		disable_irq(z2->spidev->irq);
+		apple_z2_irq_off(z2);
 		z2->upload_irq_masked = true;
 	}
 
@@ -3715,10 +3736,10 @@ err_stop:
 	z2->booted = false;
 	if (z2->upload_irq_masked) {
 		z2->upload_irq_masked = false;
-		enable_irq(z2->spidev->irq);
+		apple_z2_irq_on(z2);
 	}
 	if (irq_enabled)
-		disable_irq(z2->spidev->irq);
+		apple_z2_irq_off(z2);
 	gpiod_set_value_cansleep(z2->reset_gpio, 1);
 	apple_z2_platform_power_off(z2);
 	apple_z2_reset_protocol(z2);
@@ -4019,7 +4040,7 @@ static int apple_z2_probe(struct spi_device *spi)
 
 static void apple_z2_stop(struct apple_z2 *z2)
 {
-	disable_irq(z2->spidev->irq);
+	apple_z2_irq_off(z2);
 	gpiod_direction_output(z2->reset_gpio, 1);
 	z2->booted = false;
 	apple_z2_platform_power_off(z2);
