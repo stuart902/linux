@@ -334,6 +334,8 @@ enum apple_h9p_port_result {
  * @has_nvmmu: the storage port has an NVMMU ("nvmmu" window and interrupt)
  * @port3_link_events: port 3's event interrupt is armed by @setup_port, and
  *	its link event re-enables the root complex
+ * @no_port_irqs: leave the per-port interrupts alone (iOS's T7000 code
+ *	doesn't use them)
  * @j172_bridge_quirk: replay J172 firmware's bridge transactions on port 3
  */
 struct apple_h9p_hw {
@@ -345,6 +347,7 @@ struct apple_h9p_hw {
 	bool has_phy;
 	bool has_nvmmu;
 	bool port3_link_events;
+	bool no_port_irqs;
 	bool j172_bridge_quirk;
 };
 
@@ -835,6 +838,9 @@ static int apple_h9p_pcie_request_port_irqs(struct apple_h9p_pcie *pcie)
 {
 	struct device *dev = pcie->dev;
 	unsigned int port;
+
+	if (pcie->hw->no_port_irqs)
+		return 0;
 
 	for (port = 0; port < H9P_NUM_PORTS; port++) {
 		struct apple_h9p_port_irq *port_irq = &pcie->port_irq[port];
@@ -2309,6 +2315,7 @@ static const struct apple_h9p_hw apple_h9p_hw_t7000 = {
 	.setup_port = apple_t7000_setup_port,
 	/* The only speed validated on T7001; J81's port 1 is Gen1-limited. */
 	.default_link_speed = H9P_LINK_SPEED_2_5GT,
+	.no_port_irqs = true,
 };
 
 static const struct apple_h9p_hw apple_h9p_hw_t8010 = {
