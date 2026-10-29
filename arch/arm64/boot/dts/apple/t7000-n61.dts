@@ -11,4 +11,13 @@
 / {
 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPhone 6";
+
+	aliases {
+		spi2 = &spi2;
+	};
+};
+
+&spi2 {
+	cs-gpios = <&pinctrl 185 GPIO_ACTIVE_LOW>;
+	status = "okay";
 };
