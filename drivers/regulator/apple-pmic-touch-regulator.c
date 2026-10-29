@@ -19,6 +19,17 @@ static const struct regulator_ops apple_pmic_touch_regulator_ops = {
 	.is_enabled = regulator_is_enabled_regmap,
 };
 
+static const struct regulator_desc apple_d2186_touch_core = {
+	.name = "d2186-touch-core",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x85,
+	.enable_mask = 0x02,
+	.enable_val = 0x02,
+	.disable_val = 0,
+};
+
 static const struct regulator_desc apple_adelyn_touch_core = {
 	.name = "adelyn-touch-core",
 	.ops = &apple_pmic_touch_regulator_ops,
@@ -72,6 +83,10 @@ static int apple_pmic_touch_regulator_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
+	{
+		.compatible = "apple,d2186-touch-core-regulator",
+		.data = &apple_d2186_touch_core,
+	},
 	{
 		.compatible = "apple,adelyn-touch-core-regulator",
 		.data = &apple_adelyn_touch_core,
