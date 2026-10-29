@@ -12,3 +12,7 @@
 	compatible = "apple,j81", "apple,t7001", "apple,arm-platform";
 	model = "Apple iPad Air 2 (Wi-Fi)";
 };
+
+&wifi0 {
+	brcm,board-type = "apple,rieslinga";
+};

@@ -10,6 +10,10 @@
 / {
 	chassis-type = "tablet";
 
+	aliases {
+		wifi0 = &wifi0;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -68,6 +72,20 @@
 
 		/* To be filled by loader */
 	};
+
+	battery_info: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <7340000>;
+	};
+
+	/* Wi-Fi REG_ON is D2207 GPIO 3. */
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&pmu_gpio 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <100000>;
+	};
 };
 
 &serial0 {
@@ -82,6 +100,14 @@
 		reg = <0x3c>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+
+		pmu_gpio: gpio {
+			compatible = "apple,d2207-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only Wi-Fi REG_ON (3) is used; the other lines stay as iBoot left them. */
+			gpio-reserved-ranges = <0 3>, <4 17>;
+		};
 
 		rtc@5c0 {
 			compatible = "apple,arabela-pmic-rtc", "apple,amber-pmic-rtc";
@@ -108,6 +134,49 @@
 					reg = <0x4 0x4>;
 				};
 			};
+		};
+	};
+};
+
+&serial5 {
+	pinctrl-0 = <&uart5_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		battery: fuel-gauge {
+			compatible = "ti,bq27545-hdq";
+			monitored-battery = <&battery_info>;
+		};
+	};
+};
+
+&pcie_dart1 {
+	status = "okay";
+};
+
+&pcie {
+	iommu-map = <0x100 &pcie_dart1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	status = "okay";
+
+	pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		reset-gpios = <&pinctrl 179 GPIO_ACTIVE_LOW>;
+		max-link-speed = <1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,43a3";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl 165 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
 		};
 	};
 };
