@@ -226,6 +226,8 @@ struct apple_dart {
 	int num_clks;
 
 	spinlock_t lock;
+	/* S5L8960X: the packed per-stream control register */
+	spinlock_t tcr_lock;
 
 	u32 ias;
 	u32 oas;
@@ -401,14 +403,23 @@ static u32 apple_dart_s5l8960x_read_tcr(struct apple_dart *dart, u32 sid)
 static void apple_dart_s5l8960x_write_tcr(struct apple_dart *dart, u32 sid, u32 val)
 {
 	u32 shift = sid * DART_S5L8960X_TCR_BITS_PER_STREAM;
+	unsigned long flags;
 	u32 tcr;
 
-	WARN_ON(sid >= DART_S5L8960X_MAX_STREAMS);
-	tcr = readl(dart->regs + dart->hw->tcr);
+	if (WARN_ON(sid >= DART_S5L8960X_MAX_STREAMS))
+		return;
 
+	/*
+	 * The four streams share this register, and streams of different
+	 * groups attach independently: serialize the read-modify-write. Some
+	 * callers hold dart->lock, so it takes a lock of its own.
+	 */
+	spin_lock_irqsave(&dart->tcr_lock, flags);
+	tcr = readl(dart->regs + dart->hw->tcr);
 	tcr &= ~(0xff << shift);
 	tcr |= (val & 0xff) << shift;
 	writel(tcr, dart->regs + dart->hw->tcr);
+	spin_unlock_irqrestore(&dart->tcr_lock, flags);
 }
 
 static u32 apple_dart_t8020_read_tcr(struct apple_dart *dart, u32 sid)
@@ -1660,6 +1671,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	spin_lock_init(&dart->lock);
+	spin_lock_init(&dart->tcr_lock);
 
 	dart->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(dart->regs))
