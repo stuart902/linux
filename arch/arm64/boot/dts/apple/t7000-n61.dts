@@ -11,4 +11,52 @@
 / {
 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPhone 6";
+
+	aliases {
+		spi2 = &spi2;
+		touchscreen0 = &touchscreen;
+	};
+};
+
+&spi2 {
+	cs-gpios = <&pinctrl 185 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,n61-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <500000>;
+		interrupts-extended = <&pinctrl 3 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pinctrl 2 GPIO_ACTIVE_LOW>;
+		ana-supply = <&touch_ana>;
+		core-supply = <&touch_core>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/n61-fwstart.z2fw";
+		touchscreen-size-x = <750>;
+		touchscreen-size-y = <1334>;
+		status = "okay";
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
+
+&i2c0 {
+	pmic@74 {
+		touch_core: regulator-touch-core {
+			compatible = "apple,d2186-touch-core-regulator";
+			regulator-name = "n61-touch-core";
+		};
+	};
+
+	display-pmu@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		touch_ana: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+			regulator-name = "n61-touch-ana";
+		};
+	};
 };
