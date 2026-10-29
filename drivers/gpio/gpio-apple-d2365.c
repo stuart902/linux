@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * GPIO and PMU event interrupt driver for Apple/Dialog PMICs used with the
- * A9 and A10 SoCs.
+ * A8X, A9 and A10 SoCs.
  *
  * The D2365 latches 240 PMU events in a read-to-clear block. Any unmasked
  * pending event pulls the PMU interrupt line to the AP low; reading the
@@ -31,6 +31,22 @@
 #include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
+
+/*
+ * D2207, as iOS AppleD2207PMU accesses it: the configuration byte of line n
+ * is 0x400 + n for lines 0-16 and 0x3e0 + 3 * n for lines 17-20
+ * (_index2GPIOAddress). Bits 7:5 are the mode; _setGPIODirection() writes
+ * mode 0 for output and mode 3 for input and keeps bits 4:0. Bit 1 is the
+ * output level: _setGPIOFunction() drives a line high with
+ * (old & 0x1d) | 0x02. Input levels are bit n % 8 of 0x63 + n / 8.
+ */
+#define D2207_GPIO_SPLIT		17
+#define D2207_GPIO_CFG_0_16	0x400
+#define D2207_GPIO_CFG_17_20	0x3e0
+#define D2207_GPIO_VALUE		BIT(1)
+#define D2207_GPIO_MODE_MASK		GENMASK(7, 5)
+#define D2207_GPIO_OUTPUT		0
+#define D2207_GPIO_INPUT		(3 << 5)
 
 #define D2365_GPIO_SPLIT		18
 #define D2365_GPIO_CFG_0_17	0x900
@@ -109,6 +125,14 @@ struct apple_pmic_gpio {
 	bool irq_held;
 	bool removing;
 };
+
+static unsigned int d2207_gpio_config_reg(unsigned int offset)
+{
+	if (offset < D2207_GPIO_SPLIT)
+		return D2207_GPIO_CFG_0_16 + offset;
+
+	return D2207_GPIO_CFG_17_20 + 3 * offset;
+}
 
 static unsigned int d2365_gpio_config_reg(unsigned int offset)
 {
@@ -683,6 +707,17 @@ static int apple_pmic_gpio_probe(struct platform_device *pdev)
 	return devm_gpiochip_add_data(dev, &gpio->chip, gpio);
 }
 
+static const struct apple_pmic_gpio_info d2207_gpio_info = {
+	.label = "d2207-pmic-gpio",
+	.ngpio = 21,
+	.input_base = 0x63,
+	.value_mask = D2207_GPIO_VALUE,
+	.direction_mask = D2207_GPIO_MODE_MASK,
+	.input_mode = D2207_GPIO_INPUT,
+	.output_mode = D2207_GPIO_OUTPUT,
+	.config_reg = d2207_gpio_config_reg,
+};
+
 static const struct apple_pmic_gpio_info d2333_gpio_info = {
 	.label = "d2333-pmic-gpio",
 	.ngpio = ARRAY_SIZE(d2333_gpio_config_regs),
@@ -716,6 +751,10 @@ static const struct apple_pmic_gpio_info d2365_gpio_info = {
 
 static const struct of_device_id d2365_gpio_of_match[] = {
 	{
+		.compatible = "apple,d2207-pmic-gpio",
+		.data = &d2207_gpio_info,
+	},
+	{
 		.compatible = "apple,d2333-pmic-gpio",
 		.data = &d2333_gpio_info,
 	},
@@ -737,5 +776,5 @@ static struct platform_driver d2365_gpio_driver = {
 };
 module_platform_driver(d2365_gpio_driver);
 
-MODULE_DESCRIPTION("Apple A9/A10 PMIC GPIO and event interrupt driver");
+MODULE_DESCRIPTION("Apple A8X/A9/A10 PMIC GPIO and event interrupt driver");
 MODULE_LICENSE("GPL");
