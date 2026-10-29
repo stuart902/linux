@@ -1999,6 +1999,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct pci_host_bridge *bridge;
 	struct apple_h9p_pcie *pcie;
+	u32 doorbell;
 	int ret;
 
 	bridge = devm_pci_alloc_host_bridge(dev, sizeof(*pcie));
@@ -2118,10 +2119,9 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 		pcie->pwrctrl_powered = true;
 	}
 
-	ret = of_property_read_u64(dev->of_node, "apple,msi-doorbell",
-				   &pcie->msi_doorbell);
-	if (ret)
-		pcie->msi_doorbell = H9P_DEFAULT_MSI_DOORBELL;
+	pcie->msi_doorbell = H9P_DEFAULT_MSI_DOORBELL;
+	if (!of_property_read_u32(dev->of_node, "apple,msi-doorbell", &doorbell))
+		pcie->msi_doorbell = doorbell;
 
 	ret = apple_h9p_pcie_setup_msi(pcie);
 	if (ret)
