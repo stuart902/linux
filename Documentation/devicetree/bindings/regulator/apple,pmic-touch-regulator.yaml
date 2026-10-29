@@ -10,7 +10,7 @@ maintainers:
   - Paul Praschl <praschlpaul@g-p.at>
 
 description:
-  Fixed touchscreen supply switches provided by the Adelyn and Chestnut
+  Fixed touchscreen supply switches provided by the D2186, Adelyn and Chestnut
   PMICs. The compatible identifies both the PMIC and the physical supply;
   register layout is an implementation detail of the regulator driver.
 
@@ -22,6 +22,7 @@ properties:
     enum:
       - apple,adelyn-touch-core-regulator
       - apple,chestnut-touch-hv-regulator
+      - apple,d2186-touch-core-regulator
 
 required:
   - compatible
