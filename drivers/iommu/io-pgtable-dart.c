@@ -218,6 +218,9 @@ static dart_iopte dart_prot_to_pte(struct dart_io_pgtable *data,
 {
 	dart_iopte pte = 0;
 
+	if (data->iop.cfg.quirks & IO_PGTABLE_QUIRK_NO_PERMS)
+		prot |= IOMMU_READ | IOMMU_WRITE;
+
 	if (data->iop.fmt == APPLE_DART) {
 		pte |= APPLE_DART1_PTE_PROT_SP_DIS;
 		if (!(prot & IOMMU_WRITE))
