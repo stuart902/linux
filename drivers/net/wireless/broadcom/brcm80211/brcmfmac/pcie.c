@@ -2050,12 +2050,29 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
 {
 	const struct pci_dev *pdev = devinfo->pdev;
 	struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
-	u32 coreid, base, words, idx, sromctl;
+	u32 coreid, base, words, idx, sromctl, otpsize;
+	bool optional = false;
 	u16 *otp;
 	struct brcmf_core *core;
 	int ret;
 
 	switch (devinfo->ci->chip) {
+	case BRCM_CC_4350_CHIP_ID:
+		/*
+		 * The 40 nm OTP holds (CC_CAP_OTPSIZE + 1) Kbit and is
+		 * shadowed in ChipCommon from 0x800; Apple's records start
+		 * at 0x8c0. The BCM4350 is used on non-Apple boards too,
+		 * whose OTP has no Apple record, so don't fail without one.
+		 */
+		otpsize = (devinfo->ci->cc_caps & CC_CAP_OTPSIZE) >>
+			  CC_CAP_OTPSIZE_SHIFT;
+		if (!otpsize)
+			return 0;
+		coreid = BCMA_CORE_CHIPCOMMON;
+		base = 0x8c0;
+		words = (otpsize + 1) * 1024 / 16 - (0x8c0 - 0x800) / 2;
+		optional = true;
+		break;
 	case BRCM_CC_4355_CHIP_ID:
 		coreid = BCMA_CORE_CHIPCOMMON;
 		base = 0x8c0;
@@ -2127,6 +2144,11 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
 
 	ret = brcmf_pcie_parse_otp(devinfo, (u8 *)otp, 2 * words);
 	kfree(otp);
+
+	if (ret && optional) {
+		brcmf_dbg(PCIE, "No Apple OTP record, using default firmware\n");
+		return 0;
+	}
 
 	return ret;
 }
