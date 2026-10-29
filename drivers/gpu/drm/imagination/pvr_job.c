@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_context.h"
 #include "pvr_device.h"
 #include "pvr_drv.h"
@@ -156,7 +157,9 @@ pvr_geom_job_fw_cmd_init(struct pvr_job *job,
 		return -EINVAL;
 
 	job->fw_ccb_cmd_type = ROGUE_FWIF_CCB_CMD_TYPE_GEOM;
-	err = pvr_fw_cmd_init(job->pvr_dev, job, &pvr_cmd_geom_stream,
+	err = pvr_fw_cmd_init(job->pvr_dev, job,
+			      pvr_device_is_apple(job->pvr_dev) ? &pvr_apple_cmd_geom_stream :
+								  &pvr_cmd_geom_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;
@@ -164,7 +167,8 @@ pvr_geom_job_fw_cmd_init(struct pvr_job *job,
 	cmd = job->cmd;
 	cmd->cmd_shared.cmn.frame_num = 0;
 	cmd->flags = convert_geom_flags(args->flags);
-	pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
+	if (job->hwrt->fw_obj)
+		pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
 	return 0;
 }
 
@@ -187,7 +191,9 @@ pvr_frag_job_fw_cmd_init(struct pvr_job *job,
 	job->fw_ccb_cmd_type = (args->flags & DRM_PVR_SUBMIT_JOB_FRAG_CMD_PARTIAL_RENDER) ?
 			       ROGUE_FWIF_CCB_CMD_TYPE_FRAG_PR :
 			       ROGUE_FWIF_CCB_CMD_TYPE_FRAG;
-	err = pvr_fw_cmd_init(job->pvr_dev, job, &pvr_cmd_frag_stream,
+	err = pvr_fw_cmd_init(job->pvr_dev, job,
+			      pvr_device_is_apple(job->pvr_dev) ? &pvr_apple_cmd_frag_stream :
+								  &pvr_cmd_frag_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;
@@ -195,7 +201,8 @@ pvr_frag_job_fw_cmd_init(struct pvr_job *job,
 	cmd = job->cmd;
 	cmd->cmd_shared.cmn.frame_num = 0;
 	cmd->flags = convert_frag_flags(args->flags);
-	pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
+	if (job->hwrt->fw_obj)
+		pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
 	return 0;
 }
 
@@ -346,8 +353,7 @@ prepare_job_syncs(struct pvr_file *pvr_file,
 		/* The geometry job writes the HWRT region headers, which are
 		 * then read by the fragment job.
 		 */
-		struct drm_gem_object *obj =
-			gem_from_pvr_gem(job_data->job->hwrt->fw_obj->gem);
+		struct drm_gem_object *obj = pvr_hwrt_data_resv_obj(job_data->job->hwrt);
 		enum dma_resv_usage usage =
 			dma_resv_usage_rw(job_data->job->type ==
 					  DRM_PVR_JOB_TYPE_GEOMETRY);
@@ -361,7 +367,15 @@ prepare_job_syncs(struct pvr_file *pvr_file,
 	}
 
 	/* We need to arm the job to get the job finished fence. */
+	if (pvr_device_is_apple(job_data->job->pvr_dev)) {
+		err = pvr_apple_job_add_deps(job_data->job);
+		if (err)
+			return err;
+	}
+
 	finished_fence = pvr_queue_job_arm(job_data->job);
+	if (pvr_device_is_apple(job_data->job->pvr_dev))
+		pvr_apple_job_armed(job_data->job, finished_fence);
 
 	err = pvr_sync_signal_array_update_fences(signal_array,
 						  job_data->sync_op_count,
@@ -531,30 +545,26 @@ push_jobs(struct pvr_job_data *job_data, u32 job_count)
 }
 
 static int
-prepare_fw_obj_resv(struct drm_exec *exec, struct pvr_fw_object *fw_obj)
-{
-	return drm_exec_prepare_obj(exec, gem_from_pvr_gem(fw_obj->gem), 1);
-}
-
-static int
 jobs_lock_all_objs(struct drm_exec *exec, struct pvr_job_data *job_data,
 		   u32 job_count)
 {
 	for (u32 i = 0; i < job_count; i++) {
 		struct pvr_job *job = job_data[i].job;
 
-		/* Grab a lock on a the context, to guard against
-		 * concurrent submission to the same queue.
-		 */
-		int err = drm_exec_lock_obj(exec,
-					    gem_from_pvr_gem(job->ctx->fw_obj->gem));
+		int err;
 
-		if (err)
-			return err;
+		/* Grab a lock on a the context, to guard against
+		 * concurrent submission to the same queue. Apple contexts have
+		 * no firmware object; their queue's scheduler entity orders jobs.
+		 */
+		if (job->ctx->fw_obj) {
+			err = drm_exec_lock_obj(exec, gem_from_pvr_gem(job->ctx->fw_obj->gem));
+			if (err)
+				return err;
+		}
 
 		if (job->hwrt) {
-			err = prepare_fw_obj_resv(exec,
-						  job->hwrt->fw_obj);
+			err = drm_exec_prepare_obj(exec, pvr_hwrt_data_resv_obj(job->hwrt), 1);
 			if (err)
 				return err;
 		}
@@ -584,7 +594,7 @@ update_job_resvs(struct pvr_job *job)
 	if (job->hwrt) {
 		enum dma_resv_usage usage = job->type == DRM_PVR_JOB_TYPE_GEOMETRY ?
 					    DMA_RESV_USAGE_WRITE : DMA_RESV_USAGE_READ;
-		struct drm_gem_object *obj = gem_from_pvr_gem(job->hwrt->fw_obj->gem);
+		struct drm_gem_object *obj = pvr_hwrt_data_resv_obj(job->hwrt);
 
 		dma_resv_add_fence(obj->resv, &job->base.s_fence->finished, usage);
 	}

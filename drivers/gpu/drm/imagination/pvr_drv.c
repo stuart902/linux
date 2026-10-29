@@ -3,6 +3,7 @@
 
 #include "pvr_context.h"
 #include "pvr_debugfs.h"
+#include "pvr_apple.h"
 #include "pvr_device.h"
 #include "pvr_drv.h"
 #include "pvr_free_list.h"
@@ -1469,6 +1470,9 @@ static void pvr_remove(struct platform_device *plat_dev)
 	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
 	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
 
+	if (pvr_device_is_apple(pvr_dev))
+		pvr_apple_quiesce(pvr_dev);
+
 	WARN_ON(!xa_empty(&pvr_dev->job_ids));
 	WARN_ON(!xa_empty(&pvr_dev->free_list_ids));
 
@@ -1492,7 +1496,20 @@ static const struct pvr_device_data pvr_device_data_pwrseq = {
 	.pwr_ops = &pvr_power_sequence_ops_pwrseq,
 };
 
+#if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
+static const struct pvr_device_data pvr_device_data_apple = {
+	.pwr_ops = &pvr_power_sequence_ops_apple,
+	.apple_fw = true,
+};
+#endif
+
 static const struct of_device_id dt_match[] = {
+#if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
+	{
+		.compatible = "apple,t8010-gpu",
+		.data = &pvr_device_data_apple,
+	},
+#endif
 	{
 		.compatible = "thead,th1520-gpu",
 		.data = &pvr_device_data_pwrseq,

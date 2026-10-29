@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_device_info.h"
 #include "pvr_rogue_fwif_client.h"
 #include "pvr_rogue_fwif_stream.h"
@@ -348,4 +349,101 @@ const struct pvr_stream_cmd_defs pvr_static_compute_context_state_stream = {
 	.ext_nr_headers = 0,
 
 	.dest_size = sizeof(struct rogue_fwif_cdm_registers_cswitch),
+};
+
+/*
+ * Apple A10: the Rogue geometry and fragment commands, followed by an
+ * extension carrying the GFX firmware's registers they do not cover.
+ */
+static const struct pvr_stream_def pvr_apple_geom_regs_stream[] = {
+	PVR_STREAM_DEF(pvr_apple_cmd_geom, apple.pds_ctrl, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_geom, apple.ctx_state_base),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_geom, apple.vdm_ctx_store_task),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_geom, apple.vdm_ctx_resume_task),
+	PVR_STREAM_DEF(pvr_apple_cmd_geom, apple.vdm_ctx_state, 64),
+	PVR_STREAM_DEF(pvr_apple_cmd_geom, apple.vdm_call_stack, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_geom, apple.pds_state),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_geom, apple.cluster),
+	PVR_STREAM_DEF(pvr_apple_cmd_geom, apple.r_c78, 32),
+};
+
+static const struct pvr_stream_ext_def pvr_apple_geom_ext_streams[] = {
+	{
+		.stream = pvr_apple_geom_regs_stream,
+		.stream_len = ARRAY_SIZE(pvr_apple_geom_regs_stream),
+		.header_mask = PVR_STREAM_EXTHDR_GEOM_APPLE_REGS,
+	},
+};
+
+static const struct pvr_stream_ext_header pvr_apple_geom_ext_headers[] = {
+	[PVR_STREAM_EXTHDR_TYPE_GEOM0] = {
+		.ext_streams = cmd_geom_ext_streams_0,
+		.ext_streams_num = ARRAY_SIZE(cmd_geom_ext_streams_0),
+		.valid_mask = PVR_STREAM_EXTHDR_GEOM0_VALID,
+	},
+	[PVR_STREAM_EXTHDR_TYPE_GEOM_APPLE] = {
+		.ext_streams = pvr_apple_geom_ext_streams,
+		.ext_streams_num = ARRAY_SIZE(pvr_apple_geom_ext_streams),
+		.valid_mask = PVR_STREAM_EXTHDR_GEOM_APPLE_VALID,
+	},
+};
+
+const struct pvr_stream_cmd_defs pvr_apple_cmd_geom_stream = {
+	.type = PVR_STREAM_TYPE_GEOM,
+
+	.main_stream = rogue_fwif_cmd_geom_stream,
+	.main_stream_len = ARRAY_SIZE(rogue_fwif_cmd_geom_stream),
+
+	.ext_nr_headers = ARRAY_SIZE(pvr_apple_geom_ext_headers),
+	.ext_headers = pvr_apple_geom_ext_headers,
+
+	.dest_size = sizeof(struct pvr_apple_cmd_geom),
+};
+
+static const struct pvr_stream_def pvr_apple_frag_regs_stream[] = {
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.isp_sample_pos, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_frag, apple.pds_bgnd),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_frag, apple.cluster0),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_frag, apple.cluster1),
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.r_fd0, 64),
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.event_pixel_pds_code, 32),
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.isp_rgn, 32),
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.r_6d0, 32),
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.r_3e00, 32),
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.r_fd8, 32),
+	PVR_STREAM_DEF(pvr_apple_cmd_frag, apple.r_4070, 32),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_cmd_frag, apple.line),
+};
+
+static const struct pvr_stream_ext_def pvr_apple_frag_ext_streams[] = {
+	{
+		.stream = pvr_apple_frag_regs_stream,
+		.stream_len = ARRAY_SIZE(pvr_apple_frag_regs_stream),
+		.header_mask = PVR_STREAM_EXTHDR_FRAG_APPLE_REGS,
+	},
+};
+
+static const struct pvr_stream_ext_header pvr_apple_frag_ext_headers[] = {
+	[PVR_STREAM_EXTHDR_TYPE_FRAG0] = {
+		.ext_streams = cmd_frag_ext_streams_0,
+		.ext_streams_num = ARRAY_SIZE(cmd_frag_ext_streams_0),
+		.valid_mask = PVR_STREAM_EXTHDR_FRAG0_VALID,
+	},
+	[PVR_STREAM_EXTHDR_TYPE_FRAG_APPLE] = {
+		.ext_streams = pvr_apple_frag_ext_streams,
+		.ext_streams_num = ARRAY_SIZE(pvr_apple_frag_ext_streams),
+		.valid_mask = PVR_STREAM_EXTHDR_FRAG_APPLE_VALID,
+	},
+};
+
+const struct pvr_stream_cmd_defs pvr_apple_cmd_frag_stream = {
+	.type = PVR_STREAM_TYPE_FRAG,
+
+	.main_stream = rogue_fwif_cmd_frag_stream,
+	.main_stream_len = ARRAY_SIZE(rogue_fwif_cmd_frag_stream),
+
+	.ext_nr_headers = ARRAY_SIZE(pvr_apple_frag_ext_headers),
+	.ext_headers = pvr_apple_frag_ext_headers,
+
+	.dest_size = sizeof(struct pvr_apple_cmd_frag),
 };

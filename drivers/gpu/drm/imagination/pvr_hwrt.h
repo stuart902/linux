@@ -49,6 +49,12 @@ struct pvr_hwrt_data {
 
 	/** @hwrt_dataset: Back pointer to owning HWRT dataset. */
 	struct pvr_hwrt_dataset *hwrt_dataset;
+
+	/**
+	 * @sync_obj: Object whose reservation orders the geometry and fragment
+	 * jobs on this HWRT data where there is no @fw_obj (Apple firmware).
+	 */
+	struct pvr_gem_object *sync_obj;
 };
 
 /**
@@ -76,6 +82,8 @@ struct pvr_hwrt_dataset {
 	/** @max_rts: Maximum render targets for this HWRT data set. */
 	u16 max_rts;
 };
+
+struct drm_gem_object *pvr_hwrt_data_resv_obj(struct pvr_hwrt_data *hwrt_data);
 
 struct pvr_hwrt_dataset *
 pvr_hwrt_dataset_create(struct pvr_file *pvr_file,

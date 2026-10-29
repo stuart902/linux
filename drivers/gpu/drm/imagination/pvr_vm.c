@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_vm.h"
 
 #include "pvr_device.h"
@@ -49,6 +50,9 @@ struct pvr_vm_context {
 
 	/** @lock: Global lock on this VM. */
 	struct mutex lock;
+
+	/** @is_userspace_context: Mappings must lie within the userspace heaps. */
+	bool is_userspace_context;
 
 	/**
 	 * @fw_mem_ctx_obj: Firmware object representing firmware memory
@@ -231,10 +235,10 @@ static int
 pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
 			struct pvr_vm_context *vm_ctx,
 			struct pvr_gem_object *pvr_obj, u64 offset,
-			u64 device_addr, u64 size)
+			u64 device_addr, u64 size, bool reserved)
 {
 	struct drm_gem_object *obj = gem_from_pvr_gem(pvr_obj);
-	const bool is_user = vm_ctx != vm_ctx->pvr_dev->kernel_vm_ctx;
+	const bool is_user = vm_ctx->is_userspace_context;
 	const u64 pvr_obj_size = pvr_gem_object_size(pvr_obj);
 	struct sg_table *sgt;
 	u64 offset_plus_size;
@@ -243,7 +247,7 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
 	if (check_add_overflow(offset, size, &offset_plus_size))
 		return -EINVAL;
 
-	if (is_user &&
+	if (is_user && !reserved &&
 	    !pvr_find_heap_containing(vm_ctx->pvr_dev, device_addr, size)) {
 		return -EINVAL;
 	}
@@ -570,13 +574,15 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 		return ERR_PTR(-ENOMEM);
 
 	vm_ctx->pvr_dev = pvr_dev;
+	vm_ctx->is_userspace_context = is_userspace_context;
 
 	vm_ctx->mmu_ctx = pvr_mmu_context_create(pvr_dev);
 	err = PTR_ERR_OR_ZERO(vm_ctx->mmu_ctx);
 	if (err)
 		goto err_free;
 
-	if (is_userspace_context) {
+	/* Apple's firmware has no IMG memory-context object (see pvr_apple.c). */
+	if (is_userspace_context && !pvr_device_is_apple(pvr_dev)) {
 		err = pvr_fw_object_create(pvr_dev, sizeof(struct rogue_fwif_fwmemcontext),
 					   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 					   fw_mem_context_init, vm_ctx, &vm_ctx->fw_mem_ctx_obj);
@@ -593,6 +599,14 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 
 	mutex_init(&vm_ctx->lock);
 	kref_init(&vm_ctx->ref_count);
+
+	if (is_userspace_context && pvr_device_is_apple(pvr_dev)) {
+		err = pvr_apple_vm_init(pvr_dev, vm_ctx);
+		if (err) {
+			pvr_vm_context_put(vm_ctx);
+			return ERR_PTR(err);
+		}
+	}
 
 	return vm_ctx;
 
@@ -617,6 +631,10 @@ pvr_vm_context_release(struct kref *ref_count)
 {
 	struct pvr_vm_context *vm_ctx =
 		container_of(ref_count, struct pvr_vm_context, ref_count);
+
+	/* Apple: GPU context 0 must not keep running on these page tables. */
+	if (pvr_device_is_apple(vm_ctx->pvr_dev))
+		pvr_apple_vm_fini(vm_ctx->pvr_dev, vm_ctx);
 
 	if (vm_ctx->fw_mem_ctx_obj)
 		pvr_fw_object_destroy(vm_ctx->fw_mem_ctx_obj);
@@ -723,9 +741,9 @@ pvr_vm_lock_extra(struct drm_gpuvm_exec *vm_exec)
  *    destroy the mapping (returned from pvr_vm_gpuva_map or
  *    pvr_vm_gpuva_remap).
  */
-int
-pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
-	   u64 pvr_obj_offset, u64 device_addr, u64 size)
+static int
+__pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+	     u64 pvr_obj_offset, u64 device_addr, u64 size, bool reserved)
 {
 	struct pvr_vm_bind_op bind_op = {0};
 	struct drm_gpuvm_exec vm_exec = {
@@ -740,7 +758,7 @@ pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
 
 	int err = pvr_vm_bind_op_map_init(&bind_op, vm_ctx, pvr_obj,
 					  pvr_obj_offset, device_addr,
-					  size);
+					  size, reserved);
 
 	if (err)
 		return err;
@@ -761,6 +779,31 @@ err_cleanup:
 	pvr_vm_bind_op_fini(&bind_op);
 
 	return err;
+}
+
+int
+pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+	   u64 pvr_obj_offset, u64 device_addr, u64 size)
+{
+	return __pvr_vm_map(vm_ctx, pvr_obj, pvr_obj_offset, device_addr, size, false);
+}
+
+/**
+ * pvr_vm_map_reserved() - Map a driver-owned object outside the userspace heaps
+ * @vm_ctx: Target VM context.
+ * @pvr_obj: Target PowerVR memory object.
+ * @device_addr: Virtual device address at the start of the mapping.
+ * @size: Size of the mapping.
+ *
+ * Like pvr_vm_map() at object offset 0, without requiring a userspace
+ * context's mapping to lie within a heap. For addresses the firmware or the
+ * driver's own GPU programs use in every VM.
+ */
+int
+pvr_vm_map_reserved(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+		    u64 device_addr, u64 size)
+{
+	return __pvr_vm_map(vm_ctx, pvr_obj, 0, device_addr, size, true);
 }
 
 /**
@@ -908,6 +951,40 @@ pvr_vm_unmap_all(struct pvr_vm_context *vm_ctx)
 	mutex_unlock(&vm_ctx->lock);
 }
 
+/* Apple: the same heaps below the GPU's 38-bit data address limit */
+static const struct drm_pvr_heap pvr_apple_heaps[] = {
+	[DRM_PVR_HEAP_GENERAL] = {
+		.base = PVR_APPLE_GENERAL_HEAP_BASE,
+		.size = ROGUE_GENERAL_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_PDS_CODE_DATA] = {
+		.base = PVR_APPLE_PDSCODEDATA_HEAP_BASE,
+		.size = ROGUE_PDSCODEDATA_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_USC_CODE] = {
+		.base = PVR_APPLE_USCCODE_HEAP_BASE,
+		.size = ROGUE_USCCODE_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_RGNHDR] = {
+		.base = PVR_APPLE_RGNHDR_HEAP_BASE,
+		.size = ROGUE_RGNHDR_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_VIS_TEST] = {
+		.base = PVR_APPLE_VISTEST_HEAP_BASE,
+		.size = ROGUE_VISTEST_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_TRANSFER_FRAG] = {
+		.base = PVR_APPLE_TRANSFER_FRAG_HEAP_BASE,
+		.size = ROGUE_TRANSFER_FRAG_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+};
+
 /* Static data areas are determined by firmware. */
 static const struct drm_pvr_static_data_area static_data_areas[] = {
 	{
@@ -987,6 +1064,13 @@ static const struct drm_pvr_heap pvr_heaps[] = {
 	},
 };
 
+static_assert(ARRAY_SIZE(pvr_apple_heaps) == ARRAY_SIZE(pvr_heaps));
+
+static const struct drm_pvr_heap *pvr_device_heaps(const struct pvr_device *pvr_dev)
+{
+	return pvr_device_is_apple(pvr_dev) ? pvr_apple_heaps : pvr_heaps;
+}
+
 int
 pvr_static_data_areas_get(const struct pvr_device *pvr_dev,
 			  struct drm_pvr_ioctl_dev_query_args *args)
@@ -1055,7 +1139,7 @@ pvr_heap_info_get(const struct pvr_device *pvr_dev,
 	/* Region header heap is only present if BRN63142 is present. */
 	dest = query.heaps.array;
 	for (size_t i = 0; i < query.heaps.count; i++) {
-		struct drm_pvr_heap heap = pvr_heaps[i];
+		struct drm_pvr_heap heap = pvr_device_heaps(pvr_dev)[i];
 
 		if (i == DRM_PVR_HEAP_RGNHDR && !PVR_HAS_QUIRK(pvr_dev, 63142))
 			heap.size = 0;
@@ -1126,8 +1210,8 @@ pvr_find_heap_containing(struct pvr_device *pvr_dev, u64 start, u64 size)
 			continue;
 		}
 
-		if (pvr_heap_contains_range(&pvr_heaps[heap_id], start, end))
-			return &pvr_heaps[heap_id];
+		if (pvr_heap_contains_range(&pvr_device_heaps(pvr_dev)[heap_id], start, end))
+			return &pvr_device_heaps(pvr_dev)[heap_id];
 	}
 
 	return NULL;

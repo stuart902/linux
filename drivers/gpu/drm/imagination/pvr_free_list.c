@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_free_list.h"
 #include "pvr_gem.h"
 #include "pvr_hwrt.h"
@@ -316,10 +317,17 @@ pvr_free_list_grow(struct pvr_free_list *free_list, u32 num_pages)
 	free_list_node->num_pages = num_pages;
 	free_list_node->free_list = free_list;
 
-	free_list_node->mem_obj = pvr_gem_object_create(pvr_dev,
-							num_pages <<
-							ROGUE_BIF_PM_PHYSICAL_PAGE_ALIGNSHIFT,
-							PVR_BO_FW_FLAGS_DEVICE_CACHED);
+	/* Apple: the pages all free lists share, if they are enough */
+	free_list_node->mem_obj = ERR_PTR(-E2BIG);
+	if (pvr_device_is_apple(pvr_dev))
+		free_list_node->mem_obj =
+			pvr_apple_pm_pages(pvr_dev, (size_t)num_pages <<
+						    ROGUE_BIF_PM_PHYSICAL_PAGE_ALIGNSHIFT);
+	if (PTR_ERR_OR_ZERO(free_list_node->mem_obj) == -E2BIG)
+		free_list_node->mem_obj = pvr_gem_object_create(pvr_dev,
+								num_pages <<
+								ROGUE_BIF_PM_PHYSICAL_PAGE_ALIGNSHIFT,
+								PVR_BO_FW_FLAGS_DEVICE_CACHED);
 	if (IS_ERR(free_list_node->mem_obj)) {
 		err = PTR_ERR(free_list_node->mem_obj);
 		goto err_free;
@@ -438,9 +446,15 @@ pvr_free_list_create(struct pvr_file *pvr_file,
 	if (err)
 		goto err_destroy_kernel_structure;
 
-	err = free_list_create_fw_structure(pvr_file, args, free_list);
-	if (err < 0)
-		goto err_free_fw_id;
+	/*
+	 * Apple's firmware has no free-list object; each geometry job hands it
+	 * the stack (pvr_apple.c).
+	 */
+	if (!pvr_device_is_apple(pvr_file->pvr_dev)) {
+		err = free_list_create_fw_structure(pvr_file, args, free_list);
+		if (err < 0)
+			goto err_free_fw_id;
+	}
 
 	err = pvr_free_list_grow(free_list, args->initial_num_pages);
 	if (err < 0)
@@ -449,9 +463,10 @@ pvr_free_list_create(struct pvr_file *pvr_file,
 	return free_list;
 
 err_fw_struct_cleanup:
-	WARN_ON(pvr_fw_structure_cleanup(free_list->pvr_dev,
-					 ROGUE_FWIF_CLEANUP_FREELIST,
-					 free_list->fw_obj, 0));
+	if (free_list->fw_obj)
+		WARN_ON(pvr_fw_structure_cleanup(free_list->pvr_dev,
+						 ROGUE_FWIF_CLEANUP_FREELIST,
+						 free_list->fw_obj, 0));
 
 err_free_fw_id:
 	xa_erase(&free_list->pvr_dev->free_list_ids, free_list->fw_id);
@@ -476,9 +491,9 @@ pvr_free_list_release(struct kref *ref_count)
 
 	xa_erase(&free_list->pvr_dev->free_list_ids, free_list->fw_id);
 
-	err = pvr_fw_structure_cleanup(free_list->pvr_dev,
-				       ROGUE_FWIF_CLEANUP_FREELIST,
-				       free_list->fw_obj, 0);
+	err = free_list->fw_obj ? pvr_fw_structure_cleanup(free_list->pvr_dev,
+							   ROGUE_FWIF_CLEANUP_FREELIST,
+							   free_list->fw_obj, 0) : 0;
 	if (err == -EBUSY) {
 		/* Flush the FWCCB to process any HWR or freelist reconstruction
 		 * request that might keep the freelist busy, and try again.
@@ -502,7 +517,8 @@ pvr_free_list_release(struct kref *ref_count)
 	/* clang-format on */
 
 	free_list_destroy_kernel_structure(free_list);
-	free_list_destroy_fw_structure(free_list);
+	if (free_list->fw_obj)
+		free_list_destroy_fw_structure(free_list);
 	mutex_destroy(&free_list->lock);
 	kfree(free_list);
 }

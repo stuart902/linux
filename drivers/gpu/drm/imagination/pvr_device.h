@@ -68,7 +68,12 @@ struct pvr_fw_version {
  */
 struct pvr_device_data {
 	const struct pvr_power_sequence_ops *pwr_ops;
+
+	/** @apple_fw: GPU driven by Apple's GFX firmware (see pvr_apple.c). */
+	bool apple_fw;
 };
+
+struct pvr_apple;
 
 /**
  * struct pvr_device - powervr-specific wrapper for &struct drm_device
@@ -113,6 +118,9 @@ struct pvr_device {
 
 	/** @device_data: Pointer to platform-specific data. */
 	const struct pvr_device_data *device_data;
+
+	/** @apple: Apple firmware state, if @device_data->apple_fw. */
+	struct pvr_apple *apple;
 
 	/** @regs_resource: Resource representing device control registers. */
 	struct resource *regs_resource;
@@ -785,6 +793,12 @@ static __always_inline void
 pvr_fw_irq_clear(struct pvr_device *pvr_dev)
 {
 	pvr_dev->fw_dev.defs->irq_clear(pvr_dev);
+}
+
+static inline bool
+pvr_device_is_apple(const struct pvr_device *pvr_dev)
+{
+	return IS_ENABLED(CONFIG_DRM_POWERVR_APPLE) && pvr_dev->device_data->apple_fw;
 }
 
 #endif /* PVR_DEVICE_H */
