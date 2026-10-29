@@ -18,6 +18,10 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	aliases {
+		gpu = &gpu;	/* the bootloader fills its OPP table */
+	};
+
 	clkref: clock-ref {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -147,6 +151,16 @@
 			status = "disabled"; /* Not available on N112 */
 		};
 #endif
+	};
+
+	/*
+	 * The GPU's performance states. The bootloader (m1n1) fills one entry
+	 * per powered state from the Apple device tree's sgx node: opp-hz,
+	 * opp-microvolt and opp-level, the state number the GPU's power
+	 * controller takes. The table stays empty without it.
+	 */
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
 	};
 
 	soc {
@@ -306,6 +320,32 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
+		};
+
+		gpu: gpu@201000000 {
+			compatible = "apple,t8010-gpu";
+			reg = <0x2 0x01000000 0x0 0x100000>,
+			      <0x2 0x01d00000 0x0 0x5000>,
+			      <0x2 0x01d20000 0x0 0x4000>;
+			reg-names = "rgx", "fender", "iop";
+			mboxes = <&gpu_mbox>;
+			power-domains = <&ps_gfx>;
+			operating-points-v2 = <&gpu_opp>;
+			firmware-name = "apple/gfx-t8010.bin";
+		};
+
+		gpu_mbox: mbox@201d24000 {
+			compatible = "apple,t8010-a7iop-mailbox";
+			reg = <0x2 0x01d24000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 189 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 190 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 191 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 192 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_gfx>;
 		};
 
 		sio: dma-controller@20ae00000 {
