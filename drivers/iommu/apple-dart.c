@@ -283,6 +283,11 @@ struct apple_dart_hw {
 	u32 ttbr_addr_field_shift;
 	u32 ttbr_shift;
 	int ttbr_count;
+
+	/* S5L8960X family: write the error reflector before any other access */
+	bool early_error_reflector;
+	/* S5L8960X family: map leaves without no-read/no-write bits */
+	bool no_perms;
 };
 
 /*
@@ -641,6 +646,9 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	u32 config;
 	struct apple_dart_stream_map stream_map;
 	int i;
+
+	if (dart->hw->early_error_reflector)
+		apple_dart_s5l8960x_set_reflector(dart);
 
 	config = readl(dart->regs + dart->hw->lock);
 	if (config & dart->hw->lock_bit) {
@@ -1049,6 +1057,8 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	};
 	if (dart->hw->type == DART_S5L8960X)
 		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_APPLE_DART_S5L8960X;
+	if (dart->hw->no_perms)
+		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_NO_PERMS;
 
 	dart_domain->pgtbl_ops = alloc_io_pgtable_ops(dart->hw->fmt, &pgtbl_cfg,
 						      &dart_domain->domain);
@@ -1821,6 +1831,51 @@ static const struct apple_dart_hw apple_dart_hw_s5l8960x = {
 	.ttbr_count = 4,
 };
 
+static const struct apple_dart_hw apple_dart_hw_t7000 = {
+	.type = DART_S5L8960X,
+	.irq_handler = apple_dart_s5l8960x_irq,
+	.invalidate_tlb = apple_dart_s5l8960x_hw_invalidate_tlb,
+	.read_tcr = apple_dart_s5l8960x_read_tcr,
+	.write_tcr = apple_dart_s5l8960x_write_tcr,
+	.oas = 36,
+	.fmt = APPLE_DART,
+	.max_sid_count = DART_S5L8960X_MAX_STREAMS,
+
+	.enable_streams = 0,
+	.lock = 0,
+	.lock_bit = 0,
+
+	.error = DART_S5L8960X_ERROR,
+
+	.tcr = DART_S5L8960X_TCR,
+	.tcr_enabled = DART_T8020_TCR_TRANSLATE_ENABLE,
+	.tcr_disabled = 0,
+	.tcr_bypass = 0,
+
+	.ttbr = DART_S5L8960X_TTBR,
+	.ttbr_valid = DART_T8020_TTBR_VALID,
+	.ttbr_addr_field_shift = DART_T8020_TTBR_ADDR_FIELD_SHIFT,
+	.ttbr_shift = DART_T8020_TTBR_SHIFT,
+	.ttbr_count = 4,
+
+	/*
+	 * iOS 8.1 (AppleS5L8960XDART::_dartRecoverFromPowerdown,
+	 * 0xffffff80026c5d40 in the J81 kernelcache) writes the error
+	 * reflector before it reads or writes anything else.
+	 */
+	.early_error_reflector = true,
+	/*
+	 * Leaf protection bits. iOS's AppleS5L8960XDART writes A8X leaves as
+	 * (pfn << 12) | 3, without the no-read (bit 8) and no-write (bit 7)
+	 * bits, and the J81 PCIe DART was brought up with such leaves. Linux
+	 * keeps the bits by default (RX buffers are mapped bidirectionally in
+	 * brcmfmac for this reason). Whether this DART enforces them hasn't
+	 * been tested: if device DMA faults with them, set this to true to map
+	 * every page read/write as iOS does.
+	 */
+	.no_perms = false,
+};
+
 static const struct apple_dart_hw apple_dart_hw_t8103 = {
 	.type = DART_T8020,
 	.irq_handler = apple_dart_t8020_irq,
@@ -1974,6 +2029,7 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dar
 
 static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,s5l8960x-dart", .data = &apple_dart_hw_s5l8960x },
+	{ .compatible = "apple,t7000-dart", .data = &apple_dart_hw_t7000 },
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
