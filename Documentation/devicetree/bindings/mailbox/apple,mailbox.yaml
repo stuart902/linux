@@ -52,6 +52,13 @@ properties:
               - apple,t6000-m3-mailbox
           - const: apple,m3-mailbox-v2
 
+      - description:
+          The A7 IOP mailbox (AppleA7IOP) is an older variant found on the
+          A10, used for example by the GPU and always-on coprocessors. Each
+          message is a single 64-bit word with the endpoint in its top byte.
+        items:
+          - const: apple,t8010-a7iop-mailbox
+
   reg:
     maxItems: 1
 
