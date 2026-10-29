@@ -6531,6 +6531,19 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		cfg80211_connect_done(ndev, &conn_params, GFP_KERNEL);
 		brcmf_dbg(CONN, "Report connect result - connection %s\n",
 			  completed ? "succeeded" : "failed");
+
+		/*
+		 * With the firmware supplicant, the connection completes only
+		 * after its 4-way handshake (brcmf_is_linkup()), so the port is
+		 * authorized now. Userspace waits for this indication.
+		 */
+		if (completed &&
+		    (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK ||
+		     profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE)) {
+			cfg80211_port_authorized(ndev, profile->bssid, NULL, 0,
+						 GFP_KERNEL);
+			brcmf_dbg(CONN, "Report port authorized\n");
+		}
 	}
 	brcmf_dbg(TRACE, "Exit\n");
 	return 0;
