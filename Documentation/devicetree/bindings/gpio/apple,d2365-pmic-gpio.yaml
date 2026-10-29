@@ -4,15 +4,16 @@
 $id: http://devicetree.org/schemas/gpio/apple,d2365-pmic-gpio.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple A9/A10 PMIC GPIO and event interrupt controller
+title: Apple A8/A9/A10 PMIC GPIO and event interrupt controller
 
 maintainers:
   - Paul Praschl <praschlpaul@g-p.at>
 
 description: |
-  The Dialog D2333 and D2365 PMICs used in Apple A9 and A10 devices provide
-  21 and 24 GPIOs respectively. The controller is accessed through the regmap
-  exported by the parent Apple I2C PMIC device.
+  The Dialog D2207 PMIC used with the Apple A8X and the D2333 and D2365
+  PMICs used in Apple A9 and A10 devices provide 21, 21 and 24 GPIOs
+  respectively. The controller is accessed through the regmap exported by the
+  parent Apple I2C PMIC device.
 
   The D2365 also latches 240 PMU events (charger, ADC, GPIO edges and
   others) in one read-to-clear block and signals them on a single active-low
@@ -32,6 +33,7 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,d2207-pmic-gpio
       - apple,d2333-pmic-gpio
       - apple,d2365-pmic-gpio
 
@@ -64,7 +66,9 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,d2333-pmic-gpio
+          enum:
+            - apple,d2207-pmic-gpio
+            - apple,d2333-pmic-gpio
     then:
       properties:
         interrupt-controller: false
