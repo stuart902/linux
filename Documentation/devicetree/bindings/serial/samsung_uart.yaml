@@ -32,6 +32,12 @@ properties:
           - const: apple,t8010-uart
           - const: apple,s5l-uart
       - items:
+          - enum:
+              - apple,s8000-uart
+              - apple,t7000-uart
+          - const: apple,t8010-uart
+          - const: apple,s5l-uart
+      - items:
           - const: samsung,exynos2200-uart
           - const: google,gs101-uart
       - items:
