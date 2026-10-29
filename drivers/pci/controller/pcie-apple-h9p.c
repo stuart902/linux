@@ -276,6 +276,10 @@ enum apple_h9p_port_result {
  * @setup_common: root complex bring-up, once, before any port
  * @setup_port: power up one root port and train its link
  * @has_clocks: the controller takes "aux" and "ref" clocks
+ * @has_phy: the controller has "phy" and "phy-ip" register windows
+ * @has_nvmmu: the storage port has an NVMMU ("nvmmu" window and interrupt)
+ * @port3_link_events: port 3's event interrupt is armed by @setup_port, and
+ *	its link event re-enables the root complex
  * @j172_bridge_quirk: replay J172 firmware's bridge transactions on port 3
  */
 struct apple_h9p_hw {
@@ -283,6 +287,9 @@ struct apple_h9p_hw {
 	int (*setup_port)(struct apple_h9p_pcie *pcie, unsigned int port,
 			  enum apple_h9p_port_result *result);
 	bool has_clocks;
+	bool has_phy;
+	bool has_nvmmu;
+	bool port3_link_events;
 	bool j172_bridge_quirk;
 };
 
@@ -727,7 +734,8 @@ static irqreturn_t apple_h9p_port_irq(int irq, void *data)
 	if (!status)
 		return IRQ_NONE;
 
-	if (port_irq->index == 3 && (status & H9P_PORT_LINK_EVENT))
+	if (pcie->hw->port3_link_events && port_irq->index == 3 &&
+	    (status & H9P_PORT_LINK_EVENT))
 		writel(1, pcie->base_rc + H9P_RC_PORT_CTL1(0));
 
 	writel(status, base + H9P_PORT_IRQSTAT);
@@ -775,6 +783,7 @@ static int apple_h9p_pcie_request_port_irqs(struct apple_h9p_pcie *pcie)
 
 	for (port = 0; port < H9P_NUM_PORTS; port++) {
 		struct apple_h9p_port_irq *port_irq = &pcie->port_irq[port];
+		bool armed_later;
 		char name[8];
 		int irq, ret;
 
@@ -786,17 +795,18 @@ static int apple_h9p_pcie_request_port_irqs(struct apple_h9p_pcie *pcie)
 		if (irq < 0)
 			return irq;
 
+		armed_later = pcie->hw->port3_link_events && port == 3;
 		port_irq->pcie = pcie;
 		port_irq->index = port;
 		port_irq->irq = irq;
 		ret = devm_request_irq(dev, irq, apple_h9p_port_irq,
-				       port == 3 ? IRQF_NO_AUTOEN : 0,
+				       armed_later ? IRQF_NO_AUTOEN : 0,
 				       dev_name(dev), port_irq);
 		if (ret)
 			return dev_err_probe(dev, ret,
 					     "failed to request port %u IRQ\n",
 					     port);
-		port_irq->enabled = port != 3;
+		port_irq->enabled = !armed_later;
 	}
 
 	return 0;
@@ -1796,14 +1806,17 @@ static int apple_h9p_pcie_map_resources(struct platform_device *pdev,
 	if (IS_ERR(pcie->base_rc))
 		return PTR_ERR(pcie->base_rc);
 
-	pcie->base_phy = devm_platform_ioremap_resource_byname(pdev, "phy");
-	if (IS_ERR(pcie->base_phy))
-		return PTR_ERR(pcie->base_phy);
+	if (pcie->hw->has_phy) {
+		pcie->base_phy =
+			devm_platform_ioremap_resource_byname(pdev, "phy");
+		if (IS_ERR(pcie->base_phy))
+			return PTR_ERR(pcie->base_phy);
 
-	pcie->base_phy_ip =
-		devm_platform_ioremap_resource_byname(pdev, "phy-ip");
-	if (IS_ERR(pcie->base_phy_ip))
-		return PTR_ERR(pcie->base_phy_ip);
+		pcie->base_phy_ip =
+			devm_platform_ioremap_resource_byname(pdev, "phy-ip");
+		if (IS_ERR(pcie->base_phy_ip))
+			return PTR_ERR(pcie->base_phy_ip);
+	}
 
 	for (i = 0; i < H9P_NUM_PORTS; i++) {
 		char name[8];
@@ -1818,10 +1831,12 @@ static int apple_h9p_pcie_map_resources(struct platform_device *pdev,
 			return PTR_ERR(pcie->base_port[i]);
 	}
 
-	pcie->nvmmu.base =
-		devm_platform_ioremap_resource_byname(pdev, "nvmmu");
-	if (IS_ERR(pcie->nvmmu.base))
-		return PTR_ERR(pcie->nvmmu.base);
+	if (pcie->hw->has_nvmmu) {
+		pcie->nvmmu.base =
+			devm_platform_ioremap_resource_byname(pdev, "nvmmu");
+		if (IS_ERR(pcie->nvmmu.base))
+			return PTR_ERR(pcie->nvmmu.base);
+	}
 
 	return 0;
 }
@@ -1850,6 +1865,8 @@ static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
 	if (ret && ret != -EINVAL)
 		return ret;
 	if (pcie->preinit_phy_ports & ~GENMASK(H9P_NUM_PORTS - 1, 0))
+		return -EINVAL;
+	if (pcie->preinit_phy_ports && !pcie->hw->has_phy)
 		return -EINVAL;
 
 	for_each_available_child_of_node(dev->of_node, np) {
@@ -2120,12 +2137,18 @@ static const struct apple_h9p_hw apple_h9p_hw_t8010 = {
 	.setup_common = apple_t8010_setup_common,
 	.setup_port = apple_t8010_setup_port,
 	.has_clocks = true,
+	.has_phy = true,
+	.has_nvmmu = true,
+	.port3_link_events = true,
 };
 
 static const struct apple_h9p_hw apple_h9p_hw_j172 = {
 	.setup_common = apple_t8010_setup_common,
 	.setup_port = apple_t8010_setup_port,
 	.has_clocks = true,
+	.has_phy = true,
+	.has_nvmmu = true,
+	.port3_link_events = true,
 	.j172_bridge_quirk = true,
 };
 
