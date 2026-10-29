@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * PCIe host bridge driver for Apple H9P/T8010 SoCs.
+ * PCIe host bridge driver for Apple H8P/H9P (S8003/T8010) and A8/A8X (T7000)
+ * SoCs.
  *
  * The controller exposes an ECAM-compatible root complex after the SoC-specific
  * power, clock and PHY sequence has brought a port out of reset. The hardware
@@ -39,6 +40,7 @@
 #include <linux/pm_domain.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
 #include <linux/apple-dart.h>
 #include <linux/apple-ans.h>
@@ -110,6 +112,7 @@
 #define H9P_PHY_IP_PORT_CLEAR0		0x20330
 #define H9P_PHY_IP_PORT_CLEAR1		0x20340
 #define H9P_PHY_IP_PORT_CLEAR2		0x20350
+#define S8003_PHY_IP_PORT_GEN2_CTL	0x10188
 
 #define H9P_PORT_LTSSMCTL		0x0080
 #define H9P_PORT_LTSSM_ENABLE		BIT(0)
@@ -119,8 +122,9 @@
 #define H9P_PORT_IRQMASK_PRE_LINK	0xff002fff
 #define H9P_PORT_IRQSTAT_PRE_LINK	0x00ffd000
 #define H9P_PORT_IRQMASK_LINK_UP	0xff002f0f
-#define H9P_PORT_PWRCTL		0x0124
-#define H9P_PORT_PWRCTL_INIT		0x31
+/* MSI control: enable | log2(vectors per port) << 4 (AppleS800xPCIePort) */
+#define H9P_PORT_MSICTL			0x0124
+#define H9P_PORT_MSICTL_INIT		(1 | ilog2(H9P_MSI_PER_PORT) << 4)
 #define H9P_PORT_MSIVECBASE		0x0128
 #define H9P_PORT_ENABLE		0x0140
 #define H9P_PORT_ENABLE_APPLE		BIT(31)
@@ -139,9 +143,81 @@
 #define H9P_J172_QUIRK_PREFIX_SETTLE_MAX_US	7000
 
 #define H9P_LINK_SPEED_2_5GT		1
+#define H9P_LINK_SPEED_5GT		2
 #define H9P_LINK_SPEED_8GT		3
 
+/*
+ * S8003 (A9, TSMC). The register map is T8010's, but iOS
+ * (AppleS800xPCIe/AppleS8003PCIe in the iPad6,11 iOS 16.7.10 kernelcache,
+ * omarchy-ipad5 docs/pcie/kernelcache-notes.md and a9-vs-a10.md) drives it
+ * differently: another common status register, other per-port root complex
+ * registers, link status at port+0x88 and the PHY lanes indexed per physical
+ * lane rather than per port.
+ */
+#define S8003_RC_LANE_CFG		0x0004	/* INIT | lane configuration */
+#define S8003_RC_LANE_CFG_X2_X1_X1_X1	1
+#define S8003_RC_LANE_CFG_X2_X1_X2	3
+#define S8003_RC_NVME_MODE0		0x0014
+#define S8003_RC_NVME_MODE1		0x0024
+#define S8003_RC_STAT			0x002c
+#define S8003_RC_STAT_COMMON_READY	BIT(0)
+#define S8003_RC_STAT_PORT_READY	BIT(4)
+#define S8003_RC_COMMON_DONE		0x0038
+#define S8003_RC_PORT_CTL(port)		(0x0100 + (port) * H9P_RC_PORT_STRIDE)
+#define S8003_RC_PORT_CTL_ENABLE	BIT(0)
+#define S8003_RC_PORT_CTL_RESET		BIT(8)
+#define S8003_RC_PORT_PWR(port)		(0x0114 + (port) * H9P_RC_PORT_STRIDE)
+#define S8003_RC_PORT_PWR_ON		BIT(0)
+#define S8003_RC_PORT_PWR_REFCLK_NOGATE	BIT(8)
+#define S8003_RC_PORT_REFCLK(port)	(0x0124 + (port) * H9P_RC_PORT_STRIDE)
+#define S8003_RC_PORT_REFCLK_ON		BIT(0)
+#define S8003_RC_PORT_READY(port)	(0x012c + (port) * H9P_RC_PORT_STRIDE)
+#define S8003_RC_PORT_READY_DONE	BIT(0)
+/* Written for every port regardless of speed: link-state counter control */
+#define S8003_RC_PORT_LSCNT(port)	(0x4020 + (port) * 0x0040)
+#define S8003_RC_PORT_LSCNT_ENABLE	3
+
+#define S8003_PORT_LINKSTS		0x0088
+#define S8003_PORT_LINKSTS_UP		BIT(0)
+/* PME_Turn_Off request (0x31 sends it, AppleS800xPCIePort::disableGated) */
+#define S8003_PORT_PMETO		0x008c
+#define S8003_PORT_LINKPMGRSTS		0x0210
+#define S8003_PORT_LINKCDMSTS		0x0804
+#define S8003_PORT_LINKCDMSTS_LTSSM	GENMASK(14, 9)
+#define S8003_LTSSM_L0			0x11
+
+/* ADT perst-to-refclk-delay-us and pci-bridge t-refclk-to-perst (j71t) */
+#define S8003_PERST_TO_REFCLK_US	60
+#define S8003_REFCLK_TO_PERST_US	100
+#define S8003_PERST_HOLD_MS		100
+#define S8003_POWER_OFF_SETTLE_US	10000
+#define S8003_LINK_UP_TIMEOUT_US	500000
+#define S8003_L0_TIMEOUT_US		100000
+#define S8003_READY_TIMEOUT_US		250000
+/* Link attempts per power-up of the port, as in the validated bring-up */
+#define S8003_PORT_LINK_TRIES		2
+/* Endpoint power cycles of a port with a pci-pwrctrl endpoint (Wi-Fi) */
+#define S8003_ENDPOINT_POWER_CYCLES	2
+#define S8003_ENDPOINT_OFF_MS		100
+#define S8003_ENDPOINT_SETTLE_MS	100
+#define S8003_PORT_OFF_HOLD_MS		100
+/* Waiting for the endpoints' power control drivers: 60 x 500 ms */
+#define S8003_LATE_PORT_RETRY_MS	500
+#define S8003_LATE_PORT_TRIES		60
+
+/*
+ * NVMMU invalidate FIFO status, in the port 0 block (iBoot sets the live ADT
+ * nvme-mmu0 invalidate-fifo-workaround = 1 on j71t). iOS (AppleNVMeMMU,
+ * 0xfffffff005eebc9c) waits up to 20 ms for it to drain before every
+ * invalidate and never reads the invalidate register back.
+ */
+#define S8003_PORT_NVMMU_INV_FIFO	0x022c
+#define S8003_PORT_NVMMU_INV_FIFO_EMPTY	BIT(0)
+#define S8003_NVMMU_INV_FIFO_TIMEOUT_US	20000
+
 #define H9P_NVMMU_TCB_CTRL		0x0004
+#define H9P_NVMMU_TCB_CTRL_INIT		BIT(16)
+#define T8010_NVMMU_TCB_CTRL_INIT_BUSY	BIT(4)
 #define H9P_NVMMU_TCB_BASE_LO		0x0008
 #define H9P_NVMMU_TCB_BASE_HI		0x000c
 #define H9P_NVMMU_TCB_TABLE_LO		0x0010
@@ -157,10 +233,54 @@
 #define H9P_NVMMU_FLATDMA_BASE		0x40000000ULL
 #define H9P_NVMMU_FLATDMA_STRIDE	SZ_8M
 #define H9P_NVMMU_SART_ALIGNMENT	SZ_1M
+/*
+ * TCB layout: dword 0 direction, 1 page count, 2 first page, 4-5 page list.
+ * The direction is the controller's view: READ when it reads memory (an NVMe
+ * write), WRITE when it writes memory (an NVMe read).
+ */
+#define H9P_NVMMU_TCB_FLAGS		0
+#define H9P_NVMMU_TCB_NPAGES		1
+#define H9P_NVMMU_TCB_PAGE0		2
+#define H9P_NVMMU_TCB_SGL		4
 #define H9P_NVMMU_TCB_READ		0x100
 #define H9P_NVMMU_TCB_WRITE		0x200
 
 #define H9P_DEFAULT_MSI_DOORBELL	0xbffff000ULL
+
+/*
+ * A8/A8X (T7000) root complex. The shared "rc" window holds one 0x80-byte
+ * block per port starting at 0x100 and one link register per port at 0x820;
+ * the "portN" windows are the same block as on T8010. Offsets, values and
+ * delays are those of iOS 8.1's _enablePortHardware() and enableGated()
+ * and of the J81 ADT's apcie tunables; bits without a decoded meaning
+ * are named after their register.
+ */
+#define T7000_RC_PORT_REFCLK(port)	(0x0100 + (port) * H9P_RC_PORT_STRIDE)
+#define T7000_RC_PORT_REFCLK_EN		BIT(0)
+#define T7000_RC_PORT_REFCLK_AUXCLK_AUTO_DIS	BIT(20)
+#define T7000_RC_PORT_RESET(port)	(0x0108 + (port) * H9P_RC_PORT_STRIDE)
+#define T7000_RC_PORT_RESET_ASSERT	BIT(0)
+#define T7000_RC_PORT_RESET_BIT8	BIT(8)
+#define T7000_RC_PORT_CTL_10C(port)	(0x010c + (port) * H9P_RC_PORT_STRIDE)
+#define T7000_RC_PORT_CTL_10C_BIT0	BIT(0)
+#define T7000_RC_PORT_LINK_EN(port)	(0x0118 + (port) * H9P_RC_PORT_STRIDE)
+#define T7000_RC_PORT_LINK_EN_BIT	BIT(0)
+#define T7000_RC_PORT_LINK_CTL(port)	(0x0820 + (port) * 0x0040)
+#define T7000_RC_PORT_LINK_CTL_INIT	3
+
+/*
+ * Gate for the dbi-overrides, in the root port's config space. Offset and bit
+ * match DesignWare's MISC_CONTROL_1 DBI_RO_WR_EN.
+ */
+#define T7000_CFG_DBI_RO_WR		0x08bc
+#define T7000_CFG_DBI_RO_WR_EN		BIT(0)
+
+#define T7000_PORT_CTL_114		0x0114
+#define T7000_PORT_IRQMASK_INIT		0xff70afff
+#define T7000_PORT_IRQSTAT_INIT		0x008f5000
+
+#define T7000_LINK_ACTIVE_POLL_US	5000
+#define T7000_LINK_ACTIVE_TIMEOUT_US	1000000
 
 struct apple_h9p_pcie;
 
@@ -229,9 +349,105 @@ static const struct apple_h9p_tunable h9p_port_tunables[] = {
 	{ 0x0140, 0x0073ffff, 0x00704c4b },
 };
 
+/*
+ * Serialized per root port as dbi-overrides, relative to the root port's
+ * config space; written with the DBI read-only write enable set.
+ */
+static const struct apple_h9p_tunable t7000_dbi_overrides[] = {
+	{ 0x0024, 0x00000001, 0x00000001 },
+	{ 0x007c, 0x00000400, 0x00000000 },
+	{ 0x0b44, 0x00000003, 0x00000002 },
+};
+
+/* Serialized per root port as apcie-config-tunables. */
+static const struct apple_h9p_tunable t7000_port_tunables[] = {
+	{ 0x0090, 0x000000ff, 0x00000028 },
+	{ 0x0130, 0x00000003, 0x00000003 },
+	{ 0x0134, 0x00000001, 0x00000001 },
+};
+
+/*
+ * S8003 tunables, which iBoot puts in the live ADT; copied from the j71t
+ * live ADT (iOS 16.7.10 iBoot), where both bridges carry the same values.
+ * apcie-phy-tunables and apcie-common-tunables apply after the common init,
+ * in that order.
+ */
+static const struct apple_h9p_tunable s8003_phy_tunables[] = {
+	{ 0x0098, 0x0000000f, 0x00000000 },
+	{ 0x0154, 0x00f8ff00, 0x00000000 },
+	{ 0x0000, 0x0000318c, 0x00002108 },
+	{ 0x0004, 0x0000318c, 0x00002108 },
+};
+
+static const struct apple_h9p_tunable s8003_rc_common_tunables[] = {
+	{ 0x0008, 0x7f7f7f7f, 0x00000000 },
+	{ 0x000c, 0x00073f3f, 0x00043f00 },
+	{ 0x0010, 0x00000700, 0x00000000 },
+	{ 0x0018, 0x00ffffff, 0x000c0960 },
+	{ 0x001c, 0x00001fff, 0x0000092c },
+	{ 0x0028, 0xffffffff, 0x02001000 },
+	{ 0x0030, 0x000000ff, 0x00000009 },
+	{ 0x0100, 0x31100010, 0x01000010 },
+	{ 0x0104, 0x00000011, 0x00000001 },
+	{ 0x0108, 0x00000007, 0x00000000 },
+	{ 0x010c, 0x00073f3f, 0x00043f00 },
+	{ 0x0110, 0x0333003f, 0x0111000f },
+	{ 0x0120, 0x000000ff, 0x00000040 },
+	{ 0x0128, 0x0000007f, 0x0000003e },
+	{ 0x0130, 0x00000707, 0x00000000 },
+	{ 0x0134, 0x00073f3f, 0x00043f00 },
+	{ 0x0180, 0x31100010, 0x01000000 },
+	{ 0x0190, 0x0333003f, 0x0111000f },
+	{ 0x01a0, 0x000000ff, 0x00000040 },
+	{ 0x01a8, 0x0000007f, 0x0000003e },
+	{ 0x01b0, 0x00000707, 0x00000000 },
+	{ 0x01b4, 0x00073f3f, 0x00043f00 },
+	{ 0x0200, 0x31100010, 0x01000000 },
+	{ 0x0210, 0x0333003f, 0x0111000f },
+	{ 0x0220, 0x000000ff, 0x00000040 },
+	{ 0x0228, 0x0000007f, 0x0000003e },
+	{ 0x0230, 0x00000707, 0x00000000 },
+	{ 0x0234, 0x00073f3f, 0x00043f00 },
+	{ 0x0280, 0x31100010, 0x01000000 },
+	{ 0x0290, 0x0333003f, 0x0111000f },
+	{ 0x02a0, 0x000000ff, 0x00000040 },
+	{ 0x02a8, 0x0000007f, 0x0000003e },
+	{ 0x02b0, 0x00000707, 0x00000000 },
+	{ 0x02b4, 0x00073f3f, 0x00043f00 },
+};
+
+/* Per root port, pcie-rc-tunables (root port configuration space) */
+static const struct apple_h9p_tunable s8003_config_tunables[] = {
+	{ 0x0098, 0x0000000f, 0x00000000 },
+	{ 0x0154, 0x00f8ff00, 0x00000000 },
+};
+
+/* Per root port, apcie-config-tunables (port block) */
+static const struct apple_h9p_tunable s8003_port_tunables[] = {
+	{ 0x0090, 0x000000ff, 0x00000028 },
+	{ 0x0130, 0x00000005, 0x00000005 },
+	{ 0x0134, 0x00000001, 0x00000001 },
+	{ 0x0138, 0x00007f7f, 0x00000000 },
+	{ 0x013c, 0x00000003, 0x00000002 },
+	{ 0x0140, 0x0073ffff, 0x00704c4b },
+};
+
+struct apple_h9p_tunables {
+	const struct apple_h9p_tunable *regs;
+	unsigned int count;
+};
+
+#define H9P_TUNABLES(table)	{ .regs = (table), .count = ARRAY_SIZE(table) }
+
 struct apple_h9p_nvmmu {
 	struct apple_h9p_pcie *pcie;
 	void __iomem *base;
+	/* Programmed: the ANS glue may map through it */
+	bool ready;
+	/* Serializes the invalidate FIFO wait and the invalidate write */
+	spinlock_t inv_lock;
+	/* With the invalidate FIFO: tags mapped since their last invalidate */
+	DECLARE_BITMAP(mapped, APPLE_ANS_NVMMU_MAX_REQS);
 	u64 pa_base;
 	u32 va_base;
 	u32 size;
@@ -255,11 +471,73 @@ struct apple_h9p_port_irq {
 
 struct apple_h9p_j172_bridge_quirk_state;
 
+enum apple_h9p_port_result {
+	APPLE_H9P_PORT_READY,
+	APPLE_H9P_PORT_LINK_FAILED,
+	APPLE_H9P_PORT_DISABLED,
+};
+
+/*
+ * SoC (and, for J172, board) differences.
+ *
+ * @parse: SoC-specific device tree parsing, after the root ports (optional)
+ * @setup_common: root complex bring-up, once, before any port (optional)
+ * @setup_port: power up one root port and train its link
+ * @setup_ports: bring up all root ports, replacing the generic loop around
+ *               @setup_port (optional)
+ * @default_link_speed: target link speed of a root port without
+ *	max-link-speed (used by T7000)
+ * @has_clocks: the controller takes "aux" and "ref" clocks
+ * @has_phy: the controller has "phy" and "phy-ip" register windows
+ * @has_nvmmu: the storage port has an NVMMU ("nvmmu" window and interrupt)
+ * @port3_link_events: port 3's event interrupt is armed by @setup_port, and
+ *	its link event re-enables the root complex
+ * @no_port_irqs: leave the per-port interrupts alone (iOS's T7000 and S8003
+ *	code doesn't use them)
+ * @nvme_mode_ports: ports carrying the ANS NVMe endpoint, for which the root
+ *                   complex is switched into NVMe mode before they power up
+ * @link_settle_ms: delay between link training and the first configuration
+ *                  request below the root ports (required with @setup_ports)
+ * @phy_tunables: "phy" block tunables (S8003 only, T8010 has none)
+ * @common_tunables: root complex tunables (S8003 only; see T8010's code)
+ * @config_tunables: root port configuration space tunables (S8003 only)
+ * @port_tunables: port block tunables (S8003 only)
+ * @nvmmu_init_busy: NVMMU TCB control bit that is set while its init runs
+ * @nvmmu_inv_fifo: wait for the NVMMU invalidate FIFO before invalidating
+ *                  and before (re)initializing the NVMMU, in iOS's S8003 order
+ * @nvmmu_optional: an NVMMU that can't be set up only disables storage
+ * @j172_bridge_quirk: replay J172 firmware's bridge transactions on port 3
+ */
+struct apple_h9p_hw {
+	int (*parse)(struct apple_h9p_pcie *pcie);
+	int (*setup_common)(struct apple_h9p_pcie *pcie);
+	int (*setup_port)(struct apple_h9p_pcie *pcie, unsigned int port,
+			  enum apple_h9p_port_result *result);
+	int (*setup_ports)(struct apple_h9p_pcie *pcie);
+	u8 default_link_speed;
+	bool has_clocks;
+	bool has_phy;
+	bool has_nvmmu;
+	bool port3_link_events;
+	bool no_port_irqs;
+	u32 nvme_mode_ports;
+	unsigned int link_settle_ms;
+	struct apple_h9p_tunables phy_tunables;
+	struct apple_h9p_tunables common_tunables;
+	struct apple_h9p_tunables config_tunables;
+	struct apple_h9p_tunables port_tunables;
+	u32 nvmmu_init_busy;
+	bool nvmmu_inv_fifo;
+	bool nvmmu_optional;
+	bool j172_bridge_quirk;
+};
+
 struct apple_h9p_pcie {
 	struct device *dev;
 	struct platform_device *pdev;
 	struct pci_host_bridge *bridge;
 	struct pci_config_window *cfgwin;
+	const struct apple_h9p_hw *hw;
 	struct apple_h9p_j172_bridge_quirk_state *j172_quirk_state;
 
 	void __iomem *base_config;
@@ -287,8 +565,12 @@ struct apple_h9p_pcie {
 	u32 deferred_power_ports;
 	u32 inherited_perst_ports;
 	u32 inherited_perst_pending;
+	u32 lane_cfg;
 	bool pwrctrl_powered;
-	bool j172_bridge_quirk;
+	/* S8003: ports waiting for their endpoint's power control */
+	u32 late_ports;
+	unsigned int late_tries;
+	struct delayed_work late_work;
 
 	struct apple_h9p_nvmmu nvmmu;
 
@@ -313,12 +595,6 @@ struct apple_h9p_j172_bridge_quirk_state {
 	u32 nvme[H9P_J172_QUIRK_CFG_DWORDS];
 	u32 rc_port_ctl1;
 	bool nvme_valid;
-};
-
-enum apple_h9p_port_result {
-	APPLE_H9P_PORT_READY,
-	APPLE_H9P_PORT_LINK_FAILED,
-	APPLE_H9P_PORT_DISABLED,
 };
 
 static inline void h9p_rmw(void __iomem *addr, u32 clear, u32 set)
@@ -352,6 +628,12 @@ static void apple_h9p_apply_tunables(void __iomem *base,
 
 		writel((value & ~tunables[i].mask) | tunables[i].value, addr);
 	}
+}
+
+static void apple_h9p_apply_tunable_set(void __iomem *base,
+					const struct apple_h9p_tunables *set)
+{
+	apple_h9p_apply_tunables(base, set->regs, set->count);
 }
 
 static void apple_h9p_save_bridge_header(void __iomem *config, u32 *header)
@@ -702,7 +984,8 @@ static irqreturn_t apple_h9p_port_irq(int irq, void *data)
 	if (!status)
 		return IRQ_NONE;
 
-	if (port_irq->index == 3 && (status & H9P_PORT_LINK_EVENT))
+	if (pcie->hw->port3_link_events && port_irq->index == 3 &&
+	    (status & H9P_PORT_LINK_EVENT))
 		writel(1, pcie->base_rc + H9P_RC_PORT_CTL1(0));
 
 	writel(status, base + H9P_PORT_IRQSTAT);
@@ -748,8 +1031,12 @@ static int apple_h9p_pcie_request_port_irqs(struct apple_h9p_pcie *pcie)
 	struct device *dev = pcie->dev;
 	unsigned int port;
 
+	if (pcie->hw->no_port_irqs)
+		return 0;
+
 	for (port = 0; port < H9P_NUM_PORTS; port++) {
 		struct apple_h9p_port_irq *port_irq = &pcie->port_irq[port];
+		bool armed_later;
 		char name[8];
 		int irq, ret;
 
@@ -761,17 +1048,18 @@ static int apple_h9p_pcie_request_port_irqs(struct apple_h9p_pcie *pcie)
 		if (irq < 0)
 			return irq;
 
+		armed_later = pcie->hw->port3_link_events && port == 3;
 		port_irq->pcie = pcie;
 		port_irq->index = port;
 		port_irq->irq = irq;
 		ret = devm_request_irq(dev, irq, apple_h9p_port_irq,
-				       port == 3 ? IRQF_NO_AUTOEN : 0,
+				       armed_later ? IRQF_NO_AUTOEN : 0,
 				       dev_name(dev), port_irq);
 		if (ret)
 			return dev_err_probe(dev, ret,
 					     "failed to request port %u IRQ\n",
 					     port);
-		port_irq->enabled = port != 3;
+		port_irq->enabled = !armed_later;
 	}
 
 	return 0;
@@ -1130,7 +1418,7 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 	struct device_node *mem_np;
 	struct resource res;
 	resource_size_t size;
-	u32 iova;
+	u32 iova, val;
 	int irq;
 	int ret;
 
@@ -1198,18 +1486,44 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 		goto out_put_node;
 	}
 
-	h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
-	h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
-	h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
-	h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
-			 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
-	h9p_writel_flush(0x10000, nvmmu->base + H9P_NVMMU_TCB_CTRL);
+	spin_lock_init(&nvmmu->inv_lock);
+	if (pcie->hw->nvmmu_inv_fifo) {
+		/*
+		 * iOS's S8003 order: the invalidate FIFO drained, the old SART
+		 * aperture off before its address changes, the zeroed scratch
+		 * page and TCBs visible, then scratch page, TCB base, init, SART.
+		 */
+		ret = readl_poll_timeout(pcie->base_port[0] +
+					 S8003_PORT_NVMMU_INV_FIFO, val,
+					 val & S8003_PORT_NVMMU_INV_FIFO_EMPTY,
+					 10, S8003_NVMMU_INV_FIFO_TIMEOUT_US);
+		if (ret)
+			goto out_put_node;
+		h9p_writel_flush(0, nvmmu->base + H9P_NVMMU_SART_CTRL);
+		dma_wmb();
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
+	} else {
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
+	}
+	h9p_writel_flush(H9P_NVMMU_TCB_CTRL_INIT,
+			 nvmmu->base + H9P_NVMMU_TCB_CTRL);
 
-	ret = apple_h9p_wait(nvmmu->base + H9P_NVMMU_TCB_CTRL, 0x10, 0, 0,
-			     250000);
+	ret = apple_h9p_wait(nvmmu->base + H9P_NVMMU_TCB_CTRL,
+			     pcie->hw->nvmmu_init_busy, 0, 0, 250000);
 	if (ret)
 		goto out_put_node;
 
@@ -1233,6 +1547,7 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 		goto out_put_node;
 	}
 
+	nvmmu->ready = true;
 	dev_dbg(dev, "storage-port NVMMU window %#x@%pa size %#x\n",
 		nvmmu->va_base, &res.start, nvmmu->size);
 
@@ -1241,9 +1556,52 @@ out_put_node:
 	return ret;
 }
 
+static int apple_h9p_nvmmu_invalidate(struct apple_h9p_pcie *pcie,
+				      unsigned int tag)
+{
+	struct apple_h9p_nvmmu *nvmmu = &pcie->nvmmu;
+	unsigned long flags;
+	u32 val;
+	int ret;
+
+	if (!pcie->hw->nvmmu_inv_fifo) {
+		h9p_writel_flush(tag, nvmmu->base + H9P_NVMMU_TCB_CTRL);
+		return 0;
+	}
+
+	/* Tags not mapped since their last invalidate aren't cached */
+	if (!test_bit(tag, nvmmu->mapped))
+		return 0;
+
+	spin_lock_irqsave(&nvmmu->inv_lock, flags);
+	ret = readl_poll_timeout_atomic(pcie->base_port[0] +
+					S8003_PORT_NVMMU_INV_FIFO, val,
+					val & S8003_PORT_NVMMU_INV_FIFO_EMPTY,
+					1, S8003_NVMMU_INV_FIFO_TIMEOUT_US);
+	if (!ret)
+		writel(tag, nvmmu->base + H9P_NVMMU_TCB_CTRL);
+	spin_unlock_irqrestore(&nvmmu->inv_lock, flags);
+
+	if (ret) {
+		dev_err_ratelimited(pcie->dev,
+				    "NVMMU invalidate FIFO not empty (%#x), tag %u\n",
+				    val, tag);
+		return ret;
+	}
+
+	clear_bit(tag, nvmmu->mapped);
+	return 0;
+}
+
+/*
+ * Program TCBs the way iOS (AppleNVMeMMU) does: exactly one direction per
+ * TCB, since iOS rejects in-out transfers, and the page count written last
+ * when mapping and first when retiring, because a non-zero count is what
+ * makes the TCB valid to the NVMMU.
+ */
 int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 			const u64 *pages, unsigned int npages,
-			dma_addr_t *iova)
+			bool to_memory, dma_addr_t *iova)
 {
 	struct apple_h9p_nvmmu *nvmmu;
 	struct apple_h9p_pcie *pcie;
@@ -1278,36 +1636,40 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 		return -ENODEV;
 
 	nvmmu = &pcie->nvmmu;
-	if (!nvmmu->base || !nvmmu->tcb || !nvmmu->tcb_sgl)
+	if (!nvmmu->ready)
 		return -EOPNOTSUPP;
 
 	tcb = (u32 *)nvmmu->tcb + tag * H9P_NVMMU_TCB_DWORDS;
 	sgl = (u32 *)nvmmu->tcb_sgl + tag * H9P_NVMMU_SGL_WORDS;
+
+	WRITE_ONCE(tcb[H9P_NVMMU_TCB_NPAGES], 0);
+	dma_wmb();
 	memset(tcb, 0, H9P_NVMMU_TCB_BYTES);
-	memset(sgl, 0, H9P_NVMMU_SGL_WORDS * sizeof(*sgl));
 
-	if (npages) {
-		tcb[0] = H9P_NVMMU_TCB_READ | H9P_NVMMU_TCB_WRITE;
-		tcb[1] = npages;
-		tcb[2] = pages[0] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
-		for (i = 0; i < npages; i++)
-			sgl[i] = pages[i] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
-
-		sgl_dma = nvmmu->tcb_sgl_dma +
-			  tag * H9P_NVMMU_SGL_WORDS * sizeof(*sgl);
-		memcpy(&tcb[4], &sgl_dma, sizeof(sgl_dma));
-		if (iova)
-			*iova = H9P_NVMMU_FLATDMA_BASE +
-				tag * H9P_NVMMU_FLATDMA_STRIDE;
-	} else {
+	if (!npages) {
 		dma_wmb();
-		h9p_writel_flush(tag, nvmmu->base + H9P_NVMMU_TCB_CTRL);
 		if (iova)
 			*iova = 0;
-		return 0;
+		return apple_h9p_nvmmu_invalidate(pcie, tag);
 	}
 
+	memset(sgl, 0, H9P_NVMMU_SGL_WORDS * sizeof(*sgl));
+	for (i = 0; i < npages; i++)
+		sgl[i] = pages[i] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
+
+	tcb[H9P_NVMMU_TCB_FLAGS] = to_memory ? H9P_NVMMU_TCB_WRITE :
+					       H9P_NVMMU_TCB_READ;
+	tcb[H9P_NVMMU_TCB_PAGE0] = pages[0] >> ilog2(APPLE_ANS_NVMMU_PAGE_SIZE);
+	sgl_dma = nvmmu->tcb_sgl_dma + tag * H9P_NVMMU_SGL_WORDS * sizeof(*sgl);
+	memcpy(&tcb[H9P_NVMMU_TCB_SGL], &sgl_dma, sizeof(sgl_dma));
+
 	dma_wmb();
+	WRITE_ONCE(tcb[H9P_NVMMU_TCB_NPAGES], npages);
+	dma_wmb();
+	set_bit(tag, nvmmu->mapped);
+
+	if (iova)
+		*iova = H9P_NVMMU_FLATDMA_BASE + tag * H9P_NVMMU_FLATDMA_STRIDE;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_ans_nvmmu_map);
@@ -1453,8 +1815,8 @@ static void apple_h9p_program_phy_port(struct apple_h9p_pcie *pcie,
 	       H9P_PHY_IP_PORT(phy_lane, H9P_PHY_IP_PORT_CLEAR2));
 }
 
-static int apple_h9p_setup_port(struct apple_h9p_pcie *pcie, unsigned int port,
-				enum apple_h9p_port_result *result)
+static int apple_t8010_setup_port(struct apple_h9p_pcie *pcie, unsigned int port,
+				  enum apple_h9p_port_result *result)
 {
 	struct device *dev = pcie->dev;
 	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
@@ -1544,12 +1906,12 @@ static int apple_h9p_setup_port(struct apple_h9p_pcie *pcie, unsigned int port,
 
 	h9p_rmw(pcie->base_port[port] + H9P_PORT_ENABLE, 0,
 		H9P_PORT_ENABLE_APPLE);
-	writel(H9P_PORT_PWRCTL_INIT, pcie->base_port[port] + H9P_PORT_PWRCTL);
+	writel(H9P_PORT_MSICTL_INIT, pcie->base_port[port] + H9P_PORT_MSICTL);
 	writel(port * 0x10001 * H9P_MSI_PER_PORT,
 	       pcie->base_port[port] + H9P_PORT_MSIVECBASE);
 
 	if (port == 3) {
-		if (pcie->j172_bridge_quirk)
+		if (pcie->hw->j172_bridge_quirk)
 			apple_h9p_run_j172_bridge_quirk(pcie, cap);
 		h9p_rmww(config + cap + PCI_EXP_LNKCTL, 0,
 			 PCI_EXP_LNKCTL_LBMIE | PCI_EXP_LNKCTL_LABIE);
@@ -1613,7 +1975,7 @@ disable_port:
 	return 0;
 }
 
-static int apple_h9p_setup_common(struct apple_h9p_pcie *pcie)
+static int apple_t8010_setup_common(struct apple_h9p_pcie *pcie)
 {
 	int ret;
 
@@ -1652,6 +2014,704 @@ static int apple_h9p_setup_common(struct apple_h9p_pcie *pcie)
 	return 0;
 }
 
+/* Read-modify-write every entry, as iOS does, even when it already matches. */
+static void apple_t7000_write_tunables(void __iomem *base,
+				       const struct apple_h9p_tunable *tunables,
+				       unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		void __iomem *addr = base + tunables[i].offset;
+
+		h9p_writel_flush((readl(addr) & ~tunables[i].mask) |
+				 tunables[i].value, addr);
+	}
+}
+
+static void apple_t7000_enable_rc_port(struct apple_h9p_pcie *pcie,
+				       unsigned int port)
+{
+	void __iomem *rc = pcie->base_rc;
+
+	h9p_rmw(rc + T7000_RC_PORT_LINK_EN(port), T7000_RC_PORT_LINK_EN_BIT, 0);
+	h9p_rmw(rc + T7000_RC_PORT_RESET(port), 0, T7000_RC_PORT_RESET_ASSERT);
+	usleep_range(10, 20);
+	h9p_rmw(rc + T7000_RC_PORT_CTL_10C(port), T7000_RC_PORT_CTL_10C_BIT0, 0);
+	h9p_rmw(rc + T7000_RC_PORT_REFCLK(port), 0, T7000_RC_PORT_REFCLK_EN);
+	h9p_rmw(rc + T7000_RC_PORT_REFCLK(port), 0,
+		T7000_RC_PORT_REFCLK_AUXCLK_AUTO_DIS);
+	/* iOS waits t-refclk-to-perst (100 us) after enabling the refclk. */
+	usleep_range(100, 200);
+	h9p_rmw(rc + T7000_RC_PORT_LINK_EN(port), 0, T7000_RC_PORT_LINK_EN_BIT);
+	h9p_rmw(rc + T7000_RC_PORT_RESET(port), T7000_RC_PORT_RESET_BIT8, 0);
+	writel(T7000_RC_PORT_LINK_CTL_INIT, rc + T7000_RC_PORT_LINK_CTL(port));
+	/* enableGated() repeats the last _enablePortHardware() write. */
+	writel(T7000_RC_PORT_LINK_CTL_INIT, rc + T7000_RC_PORT_LINK_CTL(port));
+}
+
+static int apple_t7000_setup_port(struct apple_h9p_pcie *pcie, unsigned int port,
+				  enum apple_h9p_port_result *result)
+{
+	struct device *dev = pcie->dev;
+	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
+	void __iomem *base = pcie->base_port[port];
+	u32 speed, dbi;
+	u16 lnksta;
+	u64 cap;
+	int ret;
+
+	*result = APPLE_H9P_PORT_READY;
+
+	ret = gpiod_direction_output(pcie->perst[port], 1);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to assert port %u PERST#\n", port);
+
+	apple_t7000_enable_rc_port(pcie, port);
+
+	/* iOS applies the port's maximum-link-speed to Link Control 2. */
+	cap = apple_h9p_read_pci_cap(pcie, port << 3, PCI_CAP_ID_EXP);
+	if (cap) {
+		pcie->pcie_cap[port] = cap;
+		speed = pcie->max_link_speed[port] ?:
+			pcie->hw->default_link_speed;
+		if (readl(config + cap + PCI_EXP_LNKCAP2) & BIT(speed))
+			h9p_rmww(config + cap + PCI_EXP_LNKCTL2,
+				 PCI_EXP_LNKCTL2_TLS, speed);
+	}
+
+	dbi = readl(config + T7000_CFG_DBI_RO_WR);
+	writel(dbi | T7000_CFG_DBI_RO_WR_EN, config + T7000_CFG_DBI_RO_WR);
+	apple_t7000_write_tunables(config, t7000_dbi_overrides,
+				   ARRAY_SIZE(t7000_dbi_overrides));
+	h9p_writel_flush(dbi, config + T7000_CFG_DBI_RO_WR);
+
+	apple_t7000_write_tunables(base, t7000_port_tunables,
+				   ARRAY_SIZE(t7000_port_tunables));
+
+	/* enableGated()'s tail: port events, then the port's MSI slice. */
+	h9p_writel_flush(0, base + T7000_PORT_CTL_114);
+	h9p_writel_flush(T7000_PORT_IRQMASK_INIT, base + H9P_PORT_IRQMASK);
+	h9p_writel_flush(T7000_PORT_IRQSTAT_INIT, base + H9P_PORT_IRQSTAT);
+	/* MSI enable with 2^3 vectors. */
+	h9p_writel_flush(H9P_PORT_MSICTL_INIT, base + H9P_PORT_MSICTL);
+	h9p_writel_flush(port * 0x10001 * H9P_MSI_PER_PORT,
+			 base + H9P_PORT_MSIVECBASE);
+
+	ret = gpiod_direction_output(pcie->perst[port], 0);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to deassert port %u PERST#\n", port);
+	msleep(PCIE_RESET_CONFIG_WAIT_MS);
+
+	h9p_rmw(base + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
+
+	/*
+	 * The port window has no decoded link-state register, so wait for the
+	 * root port's Data Link Layer Link Active bit. If the port cannot
+	 * report it, leave the result to enumeration.
+	 */
+	if (!cap ||
+	    !(readl(config + cap + PCI_EXP_LNKCAP) & PCI_EXP_LNKCAP_DLLLARC))
+		return 0;
+
+	ret = readw_poll_timeout(config + cap + PCI_EXP_LNKSTA, lnksta,
+				 lnksta & PCI_EXP_LNKSTA_DLLLA,
+				 T7000_LINK_ACTIVE_POLL_US,
+				 T7000_LINK_ACTIVE_TIMEOUT_US);
+	if (ret) {
+		dev_warn(dev, "port %u link did not become active (lnksta=%#x)\n",
+			 port, lnksta);
+		*result = APPLE_H9P_PORT_LINK_FAILED;
+	}
+
+	return 0;
+}
+
+/* lane configuration 1: x2 x1 x1 x1; 3: x2 x1 x2, port 3 unusable */
+static const u8 apple_s8003_lane_start[H9P_NUM_PORTS] = { 0, 2, 3, 4 };
+
+static u32 apple_s8003_lanes(struct apple_h9p_pcie *pcie, unsigned int port)
+{
+	unsigned int width = 1;
+
+	if (port == 0 ||
+	    (port == 2 && pcie->lane_cfg == S8003_RC_LANE_CFG_X2_X1_X2))
+		width = 2;
+
+	return GENMASK(width - 1, 0) << apple_s8003_lane_start[port];
+}
+
+/*
+ * iOS (AppleS8003PCIe setLaneCfg) only accepts lane configurations 1 and 3:
+ * port 0 is always x2, port 2 is x2 in configuration 3. Derive it from the
+ * root ports' num-lanes, including ports that are disabled.
+ */
+static int apple_s8003_parse(struct apple_h9p_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	struct device_node *np;
+	u32 reg, port, lanes;
+	int ret;
+
+	pcie->lane_cfg = S8003_RC_LANE_CFG_X2_X1_X1_X1;
+
+	for_each_child_of_node(dev->of_node, np) {
+		if (!of_node_name_eq(np, "pci"))
+			continue;
+
+		ret = of_property_read_u32_index(np, "reg", 0, &reg);
+		if (ret)
+			goto err_put;
+		port = reg >> 11;
+		if (port >= H9P_NUM_PORTS) {
+			ret = -EINVAL;
+			goto err_put;
+		}
+
+		ret = of_property_read_u32(np, "num-lanes", &lanes);
+		if (ret == -EINVAL)
+			continue;
+		if (ret)
+			goto err_put;
+
+		if (port == 2 && lanes == 2) {
+			pcie->lane_cfg = S8003_RC_LANE_CFG_X2_X1_X2;
+		} else if (lanes != (port == 0 ? 2 : 1)) {
+			ret = -EINVAL;
+			goto err_put;
+		}
+	}
+
+	if (pcie->lane_cfg == S8003_RC_LANE_CFG_X2_X1_X2 &&
+	    (pcie->enabled_ports & BIT(3)))
+		return dev_err_probe(dev, -EINVAL,
+				     "port 3 is unusable with port 2 at x2\n");
+
+	return 0;
+
+err_put:
+	dev_err_probe(dev, ret, "%pOF: invalid lane configuration\n", np);
+	of_node_put(np);
+	return ret;
+}
+
+/* AppleS8003PCIe common init (initCommon) */
+static int apple_s8003_setup_common(struct apple_h9p_pcie *pcie)
+{
+	int ret;
+
+	writel(H9P_RC_COMMON_CTL_INIT | pcie->lane_cfg,
+	       pcie->base_rc + S8003_RC_LANE_CFG);
+
+	ret = apple_h9p_wait(pcie->base_rc + S8003_RC_STAT,
+			     S8003_RC_STAT_COMMON_READY,
+			     S8003_RC_STAT_COMMON_READY,
+			     S8003_RC_STAT_COMMON_READY, S8003_READY_TIMEOUT_US);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret, "common init timeout\n");
+
+	writel(1, pcie->base_rc + S8003_RC_COMMON_DONE);
+
+	/* iOS: apcie-phy-tunables, then apcie-common-tunables */
+	apple_h9p_apply_tunable_set(pcie->base_phy, &pcie->hw->phy_tunables);
+	apple_h9p_apply_tunable_set(pcie->base_rc,
+				    &pcie->hw->common_tunables);
+	return 0;
+}
+
+/* NVMe mode of the root complex, set before the storage port powers up */
+static void apple_s8003_set_nvme_mode(struct apple_h9p_pcie *pcie)
+{
+	writel(1, pcie->base_rc + S8003_RC_NVME_MODE0);
+	usleep_range(100, 200);
+	h9p_writel_flush(1, pcie->base_rc + S8003_RC_NVME_MODE1);
+}
+
+/*
+ * AppleS800xPCIePort::enablePortHardware: port power, root complex ready,
+ * port enable and ready, release the port's reset, then the reference clock.
+ * Nothing touches the port block before this succeeded.
+ */
+static int apple_s8003_port_power_on(struct apple_h9p_pcie *pcie,
+				     unsigned int port)
+{
+	void __iomem *rc = pcie->base_rc;
+	u32 val;
+	int ret;
+
+	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
+	/* Keep the reference clock running: no CLKREQ# gating */
+	h9p_rmw(rc + S8003_RC_PORT_PWR(port), 0,
+		S8003_RC_PORT_PWR_ON | S8003_RC_PORT_PWR_REFCLK_NOGATE);
+	ret = apple_h9p_wait(rc + S8003_RC_STAT, S8003_RC_STAT_PORT_READY,
+			     S8003_RC_STAT_PORT_READY, S8003_RC_STAT_PORT_READY,
+			     S8003_READY_TIMEOUT_US);
+	if (ret)
+		return ret;
+	fsleep(100);
+
+	h9p_rmw(rc + S8003_RC_PORT_CTL(port), 0, S8003_RC_PORT_CTL_ENABLE);
+	ret = readl_poll_timeout(rc + S8003_RC_PORT_READY(port), val,
+				 val & S8003_RC_PORT_READY_DONE, 10,
+				 S8003_READY_TIMEOUT_US);
+	if (ret)
+		return ret;
+	h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_RESET, 0);
+
+	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), 0, S8003_RC_PORT_REFCLK_ON);
+	readl(rc + S8003_RC_PORT_REFCLK(port));
+	fsleep(S8003_REFCLK_TO_PERST_US);
+
+	return 0;
+}
+
+/* iOS port power-down: reference clock off, then port power and enable */
+static void apple_s8003_port_off(struct apple_h9p_pcie *pcie,
+				 unsigned int port)
+{
+	void __iomem *rc = pcie->base_rc;
+
+	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
+	fsleep(S8003_PERST_TO_REFCLK_US);
+	h9p_rmw(rc + S8003_RC_PORT_PWR(port), S8003_RC_PORT_PWR_ON, 0);
+	h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_ENABLE, 0);
+}
+
+/* Stop a link training state machine left running by the boot loader */
+static int apple_s8003_port_stop(struct apple_h9p_pcie *pcie,
+				 unsigned int port)
+{
+	void __iomem *pb = pcie->base_port[port];
+
+	writel(H9P_PORT_IRQMASK_PRE_LINK, pb + H9P_PORT_IRQMASK);
+	h9p_rmw(pb + H9P_PORT_LTSSMCTL, H9P_PORT_LTSSM_ENABLE, 0);
+	readl(pb + H9P_PORT_LTSSMCTL);
+	/* No PME_Turn_Off/L2 request may stay pending across the restart */
+	h9p_writel_flush(0, pb + S8003_PORT_PMETO);
+	writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
+
+	return apple_h9p_wait(pb + H9P_PORT_LTSSMCTL, H9P_PORT_LTSSM_ENABLE,
+			      0, 0, S8003_READY_TIMEOUT_US);
+}
+
+/*
+ * The storage port: a full off/on cycle from whatever iBoot left behind (it
+ * read the kernel over this link), with the root complex in NVMe mode before
+ * the port powers up again.
+ */
+static int apple_s8003_power_cycle_port(struct apple_h9p_pcie *pcie,
+					unsigned int port)
+{
+	void __iomem *rc = pcie->base_rc;
+	int ret;
+
+	if ((readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE) &&
+	    (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON)) {
+		ret = apple_s8003_port_stop(pcie, port);
+		if (ret)
+			return ret;
+	}
+
+	apple_s8003_port_off(pcie, port);
+	usleep_range(S8003_POWER_OFF_SETTLE_US, S8003_POWER_OFF_SETTLE_US + 1000);
+	ret = apple_h9p_wait(rc + S8003_RC_PORT_CTL(port),
+			     S8003_RC_PORT_CTL_ENABLE, 0, 0,
+			     S8003_READY_TIMEOUT_US);
+	if (ret)
+		return ret;
+
+	if (pcie->hw->nvme_mode_ports & BIT(port))
+		apple_s8003_set_nvme_mode(pcie);
+
+	ret = apple_s8003_port_power_on(pcie, port);
+	if (ret)
+		return ret;
+
+	return apple_s8003_port_stop(pcie, port);
+}
+
+/*
+ * The other ports (Wi-Fi): power the port, stop it, power it off, 1 ms, and
+ * power it on again. This is the only sequence that has run on the Wi-Fi
+ * port; whether the storage port's sequence works there as well is open.
+ */
+static int apple_s8003_restart_port(struct apple_h9p_pcie *pcie,
+				    unsigned int port)
+{
+	int ret;
+
+	if (pcie->hw->nvme_mode_ports & BIT(port))
+		apple_s8003_set_nvme_mode(pcie);
+	ret = apple_s8003_port_power_on(pcie, port);
+	if (ret)
+		return ret;
+	apple_s8003_port_stop(pcie, port);
+	apple_s8003_port_off(pcie, port);
+	usleep_range(1000, 2000);
+
+	if (pcie->hw->nvme_mode_ports & BIT(port))
+		apple_s8003_set_nvme_mode(pcie);
+	ret = apple_s8003_port_power_on(pcie, port);
+	if (ret)
+		return ret;
+	apple_s8003_port_stop(pcie, port);
+
+	return 0;
+}
+
+/* AppleS8003PCIe PHY lane init: per physical lane, speed dependent */
+static void apple_s8003_program_phy_lanes(struct apple_h9p_pcie *pcie,
+					  u32 lane_mask, u32 speed)
+{
+	void __iomem *pip = pcie->base_phy_ip;
+	unsigned long lanes = lane_mask;
+	unsigned int lane;
+
+	h9p_rmw(pip + H9P_PHY_IP_EQ_COMMON0, 0, 0x4000);
+	h9p_rmw(pip + H9P_PHY_IP_EQ_COMMON1, 0, 0x4000);
+	h9p_rmw(pip + H9P_PHY_IP_EQ_TIME0, 0xfff, 100);
+	h9p_rmw(pip + H9P_PHY_IP_EQ_TIME1, 0xfff, 25);
+
+	for_each_set_bit(lane, &lanes, BITS_PER_LONG) {
+		void __iomem *b = pip + lane * H9P_PHY_IP_PORT_STRIDE;
+
+		h9p_rmw(b + H9P_PHY_IP_PORT_EQ_CTL, 0, 0x4000);
+		writel(0, b + H9P_PHY_IP_PORT_IDLE);
+		h9p_rmw(b + H9P_PHY_IP_PORT_EQ_PRESET, 0xfff, 0x600);
+		writel(0x3105, b + H9P_PHY_IP_PORT_RX_CTL0);
+		h9p_rmw(b + H9P_PHY_IP_PORT_RX_CTL1, 0xff, 0x9f);
+		h9p_rmw(b + H9P_PHY_IP_PORT_RX_CTL2, 0xff, 0x01);
+		if (speed == H9P_LINK_SPEED_5GT)
+			writel(0x100, b + S8003_PHY_IP_PORT_GEN2_CTL);
+		if (speed <= H9P_LINK_SPEED_5GT)
+			h9p_rmw(b + H9P_PHY_IP_PORT_RX_CTL3, 0x1f, 0x0a);
+		writel(169, b + H9P_PHY_IP_PORT_TIMER0);
+		writel(169, b + H9P_PHY_IP_PORT_TIMER1);
+		writel(333, b + H9P_PHY_IP_PORT_TIMER2);
+		writel(333, b + H9P_PHY_IP_PORT_TIMER3);
+		writel(0, b + H9P_PHY_IP_PORT_CLEAR0);
+		writel(0, b + H9P_PHY_IP_PORT_CLEAR1);
+		writel(0, b + H9P_PHY_IP_PORT_CLEAR2);
+	}
+}
+
+static int apple_s8003_wait_link(struct apple_h9p_pcie *pcie,
+				 unsigned int port, u32 *ltssm)
+{
+	void __iomem *pb = pcie->base_port[port];
+	u32 val;
+	int ret;
+
+	ret = readl_poll_timeout(pb + S8003_PORT_LINKSTS, val,
+				 val & S8003_PORT_LINKSTS_UP, 100,
+				 S8003_LINK_UP_TIMEOUT_US);
+	if (!ret)
+		/* Link up is reported during the Gen2 recovery: wait for L0 */
+		ret = readl_poll_timeout(pb + S8003_PORT_LINKCDMSTS, val,
+					 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
+						   val) == S8003_LTSSM_L0,
+					 100, S8003_L0_TIMEOUT_US);
+	*ltssm = FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
+			   readl(pb + S8003_PORT_LINKCDMSTS));
+	if (!ret && !(readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP))
+		ret = -ENOLINK;
+
+	return ret;
+}
+
+/*
+ * AppleEmbeddedPCIEPort::enableGated and AppleS800xPCIePort's link setup,
+ * after the port is powered and stopped: link counters, speed limit, port
+ * block setup and MSI, PERST# release after 100 ms with a stable reference
+ * clock, PHY lanes, then link training.
+ */
+static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
+				  unsigned int port)
+{
+	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
+	void __iomem *pb = pcie->base_port[port];
+	struct device *dev = pcie->dev;
+	u32 lanes = apple_s8003_lanes(pcie, port);
+	u32 speed = pcie->max_link_speed[port] ?: H9P_LINK_SPEED_2_5GT;
+	u32 val, lnkcap2;
+	u64 cap;
+	int ret;
+
+	writel(S8003_RC_PORT_LSCNT_ENABLE,
+	       pcie->base_rc + S8003_RC_PORT_LSCNT(port));
+	val = readl(pb + S8003_PORT_LINKPMGRSTS);
+	if (val)
+		writel(val, pb + S8003_PORT_LINKPMGRSTS);
+
+	cap = apple_h9p_read_pci_cap(pcie, port << 3, PCI_CAP_ID_EXP);
+	if (!cap)
+		return -ENODEV;
+	pcie->pcie_cap[port] = cap;
+
+	/* iOS setMaximumLinkSpeed: the root port's target speed, within LNKCAP2 */
+	lnkcap2 = FIELD_GET(PCI_EXP_LNKCAP2_SLS, readl(config + cap +
+						      PCI_EXP_LNKCAP2));
+	while (speed > H9P_LINK_SPEED_2_5GT && !(lnkcap2 & BIT(speed - 1)))
+		speed--;
+	h9p_rmww(config + cap + PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_ASPMC |
+		 PCI_EXP_LNKCTL_LD | PCI_EXP_LNKCTL_RL, 0);
+	h9p_rmww(config + cap + PCI_EXP_LNKCTL2, PCI_EXP_LNKCTL2_TLS |
+		 PCI_EXP_LNKCTL2_ENTER_COMP, speed);
+
+	/* iOS: pcie-rc-tunables, then apcie-config-tunables */
+	apple_h9p_apply_tunable_set(config, &pcie->hw->config_tunables);
+	apple_h9p_apply_tunable_set(pb, &pcie->hw->port_tunables);
+
+	writel(H9P_PORT_IRQMASK_PRE_LINK, pb + H9P_PORT_IRQMASK);
+	writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
+	h9p_rmw(pb + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
+	writel(H9P_PORT_MSICTL_INIT, pb + H9P_PORT_MSICTL);
+	writel(port * 0x10001 * H9P_MSI_PER_PORT, pb + H9P_PORT_MSIVECBASE);
+
+	msleep(S8003_PERST_HOLD_MS);
+	ret = gpiod_direction_output(pcie->perst[port], 0);
+	if (ret)
+		return ret;
+
+	ret = apple_h9p_wait(pcie->base_phy + H9P_PHY_PORTMASK, lanes, lanes,
+			     lanes, S8003_READY_TIMEOUT_US);
+	if (ret) {
+		dev_warn(dev, "port %u PHY lanes %#x not ready (%#x)\n", port,
+			 lanes, readl(pcie->base_phy + H9P_PHY_PORTMASK));
+		return ret;
+	}
+
+	apple_s8003_program_phy_lanes(pcie, lanes, speed);
+
+	writel(H9P_PORT_IRQMASK_LINK_UP, pb + H9P_PORT_IRQMASK);
+	h9p_rmw(pb + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
+
+	ret = apple_s8003_wait_link(pcie, port, &val);
+	if (ret)
+		dev_warn(dev, "port %u link did not reach L0 (LTSSM %#x)\n",
+			 port, val);
+
+	return ret;
+}
+
+/* Power the port up as validated for its kind, and train its link once */
+static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+				       unsigned int port)
+{
+	int ret;
+
+	ret = gpiod_direction_output(pcie->perst[port], 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * Deliberately per port: the storage port takes the full power cycle
+	 * validated on it, the other ports the restart sequence that is the
+	 * only one validated on the Wi-Fi port.
+	 */
+	if (pcie->hw->nvme_mode_ports & BIT(port))
+		ret = apple_s8003_power_cycle_port(pcie, port);
+	else
+		ret = apple_s8003_restart_port(pcie, port);
+	if (!ret)
+		ret = apple_s8003_start_link(pcie, port);
+	if (ret)
+		gpiod_direction_output(pcie->perst[port], 1);
+
+	return ret;
+}
+
+static int apple_s8003_setup_port_tries(struct apple_h9p_pcie *pcie,
+					unsigned int port)
+{
+	unsigned int try;
+	int ret;
+
+	for (try = 0; try < S8003_PORT_LINK_TRIES; try++) {
+		ret = apple_s8003_setup_port_once(pcie, port);
+		if (ret != -ETIMEDOUT)
+			break;
+		if (try + 1 < S8003_PORT_LINK_TRIES)
+			dev_warn(pcie->dev, "port %u: no link, retrying\n", port);
+	}
+
+	return ret;
+}
+
+/*
+ * The storage port: if its link doesn't come up, take the port down
+ * completely, hold it off for 100 ms and run the full bring-up once more.
+ */
+static int apple_s8003_setup_storage_port(struct apple_h9p_pcie *pcie,
+					  unsigned int port)
+{
+	void __iomem *rc = pcie->base_rc;
+	int ret;
+
+	ret = apple_s8003_setup_port_tries(pcie, port);
+	if (ret != -ETIMEDOUT && ret != -ENOLINK)
+		return ret;
+
+	dev_warn(pcie->dev, "port %u: no link (%d), power cycling the port\n",
+		 port, ret);
+	if ((readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE) &&
+	    (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON)) {
+		ret = apple_s8003_port_stop(pcie, port);
+		if (ret)
+			return ret;
+	}
+	apple_s8003_port_off(pcie, port);
+	if ((readl(rc + S8003_RC_PORT_CTL(port)) |
+	     readl(rc + S8003_RC_PORT_PWR(port)) |
+	     readl(rc + S8003_RC_PORT_REFCLK(port))) & BIT(0))
+		return -EIO;
+	msleep(S8003_PORT_OFF_HOLD_MS);
+
+	return apple_s8003_setup_port_once(pcie, port);
+}
+
+/*
+ * A port whose endpoint is powered through pci-pwrctrl (Wi-Fi): power the
+ * endpoint, give it time to settle and train the link; if that fails, power
+ * the endpoint off and try once more. -EPROBE_DEFER: the endpoint's power
+ * control isn't there yet.
+ */
+static int apple_s8003_setup_endpoint_port(struct apple_h9p_pcie *pcie,
+					   unsigned int port)
+{
+	struct device *dev = pcie->dev;
+	unsigned int cycle;
+	int ret = 0;
+
+	for (cycle = 0; cycle < S8003_ENDPOINT_POWER_CYCLES; cycle++) {
+		gpiod_direction_output(pcie->perst[port], 1);
+		if (pcie->pwrctrl_powered) {
+			pci_pwrctrl_power_off_devices(dev);
+			pcie->pwrctrl_powered = false;
+			msleep(S8003_ENDPOINT_OFF_MS);
+		}
+
+		ret = pci_pwrctrl_power_on_devices(dev);
+		if (ret)
+			return ret;
+		pcie->pwrctrl_powered = true;
+		msleep(S8003_ENDPOINT_SETTLE_MS);
+
+		ret = apple_s8003_setup_port_tries(pcie, port);
+		if (!ret)
+			return 0;
+	}
+
+	gpiod_direction_output(pcie->perst[port], 1);
+	pci_pwrctrl_power_off_devices(dev);
+	pcie->pwrctrl_powered = false;
+	return ret;
+}
+
+/*
+ * Storage first, and independent of every other port: the endpoint ports
+ * are powered and trained only after it, and wait for their power control
+ * without holding up the host. The iommu-map routes bus 1 to the storage
+ * port's DART and bus 2 to the next one; with the storage port down, the
+ * enumeration would give the next port bus 1 and so the storage DART. Leave
+ * the other ports off in that case.
+ */
+static int apple_s8003_setup_ports(struct apple_h9p_pcie *pcie)
+{
+	u32 storage = pcie->enabled_ports & pcie->hw->nvme_mode_ports;
+	u32 others = pcie->enabled_ports & ~storage;
+	unsigned long ports = storage;
+	unsigned int port;
+	int ret;
+
+	for_each_set_bit(port, &ports, H9P_NUM_PORTS) {
+		ret = apple_s8003_setup_storage_port(pcie, port);
+		if (ret) {
+			dev_warn(pcie->dev, "disabling port %u: %d\n", port, ret);
+			pcie->enabled_ports &= ~BIT(port);
+		}
+	}
+
+	pcie->enabled_ports &= ~others;
+	if (!others)
+		return 0;
+	if (storage & ~pcie->enabled_ports) {
+		dev_warn(pcie->dev,
+			 "storage port down, leaving ports %#x off to keep their bus numbers\n",
+			 others);
+		return 0;
+	}
+
+	ports = others;
+	for_each_set_bit(port, &ports, H9P_NUM_PORTS) {
+		ret = apple_s8003_setup_endpoint_port(pcie, port);
+		if (ret == -EPROBE_DEFER)
+			pcie->late_ports |= BIT(port);
+		else if (ret)
+			dev_warn(pcie->dev, "disabling port %u: %d\n", port, ret);
+		else
+			pcie->enabled_ports |= BIT(port);
+	}
+
+	return 0;
+}
+
+static void apple_s8003_late_ports_work(struct work_struct *work)
+{
+	struct apple_h9p_pcie *pcie = container_of(to_delayed_work(work),
+						   struct apple_h9p_pcie,
+						   late_work);
+	unsigned long pending = pcie->late_ports;
+	bool rescan = false, retry = false;
+	unsigned int port;
+	int ret;
+
+	for_each_set_bit(port, &pending, H9P_NUM_PORTS) {
+		ret = apple_s8003_setup_endpoint_port(pcie, port);
+		if (ret == -EPROBE_DEFER) {
+			retry = true;
+			continue;
+		}
+
+		pcie->late_ports &= ~BIT(port);
+		if (ret) {
+			dev_warn(pcie->dev, "disabling port %u: %d\n", port, ret);
+			continue;
+		}
+		WRITE_ONCE(pcie->enabled_ports, pcie->enabled_ports | BIT(port));
+		rescan = true;
+	}
+
+	if (rescan) {
+		/* PCIe r6.0 sec 6.6.1: 100 ms after link-up before configuration */
+		msleep(pcie->hw->link_settle_ms);
+		pci_lock_rescan_remove();
+		pci_rescan_bus(pcie->bridge->bus);
+		pci_unlock_rescan_remove();
+	}
+
+	if (!retry)
+		return;
+	if (++pcie->late_tries < S8003_LATE_PORT_TRIES) {
+		schedule_delayed_work(&pcie->late_work,
+				      msecs_to_jiffies(S8003_LATE_PORT_RETRY_MS));
+		return;
+	}
+
+	dev_warn(pcie->dev, "ports %#x: endpoint power control never ready\n",
+		 pcie->late_ports);
+	pcie->late_ports = 0;
+}
+
+static void apple_h9p_pcie_cancel_late_ports(void *data)
+{
+	struct apple_h9p_pcie *pcie = data;
+
+	cancel_delayed_work_sync(&pcie->late_work);
+}
+
 static int apple_h9p_prepare_phy_ports(struct apple_h9p_pcie *pcie)
 {
 	unsigned int port;
@@ -1680,7 +2740,7 @@ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
 		if (!(pcie->enabled_ports & BIT(port)))
 			continue;
 
-		ret = apple_h9p_setup_port(pcie, port, &result);
+		ret = pcie->hw->setup_port(pcie, port, &result);
 		if (ret)
 			return ret;
 
@@ -1713,7 +2773,7 @@ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
 					     port);
 		pcie->pwrctrl_powered = true;
 
-		ret = apple_h9p_setup_port(pcie, port, &result);
+		ret = pcie->hw->setup_port(pcie, port, &result);
 		if (ret)
 			return ret;
 		if (result == APPLE_H9P_PORT_DISABLED)
@@ -1734,11 +2794,29 @@ static int apple_h9p_pcie_init(struct pci_config_window *cfg)
 	pcie->cfgwin = cfg;
 	pcie->base_config = cfg->win;
 
-	ret = apple_h9p_setup_ports(pcie);
+	if (pcie->hw->setup_ports)
+		ret = pcie->hw->setup_ports(pcie);
+	else
+		ret = apple_h9p_setup_ports(pcie);
 	if (ret)
 		return ret;
 
+	/* PCIe r6.0 sec 6.6.1: 100 ms after link-up before configuration */
+	if (pcie->hw->link_settle_ms && pcie->enabled_ports)
+		msleep(pcie->hw->link_settle_ms);
+
 	ret = apple_h9p_setup_nvmmu(pcie);
+	if (ret && pcie->hw->nvmmu_optional) {
+		/*
+		 * Without the NVMMU only storage is lost: keep the other ports.
+		 * The storage port stays enumerated so that the others keep
+		 * their bus numbers; the ANS glue can't map through the NVMMU.
+		 */
+		dev_err(pcie->dev, "NVMMU setup failed (%d), storage disabled\n",
+			ret);
+		return 0;
+	}
+
 	return ret;
 }
 
@@ -1761,14 +2839,17 @@ static int apple_h9p_pcie_map_resources(struct platform_device *pdev,
 	if (IS_ERR(pcie->base_rc))
 		return PTR_ERR(pcie->base_rc);
 
-	pcie->base_phy = devm_platform_ioremap_resource_byname(pdev, "phy");
-	if (IS_ERR(pcie->base_phy))
-		return PTR_ERR(pcie->base_phy);
+	if (pcie->hw->has_phy) {
+		pcie->base_phy =
+			devm_platform_ioremap_resource_byname(pdev, "phy");
+		if (IS_ERR(pcie->base_phy))
+			return PTR_ERR(pcie->base_phy);
 
-	pcie->base_phy_ip =
-		devm_platform_ioremap_resource_byname(pdev, "phy-ip");
-	if (IS_ERR(pcie->base_phy_ip))
-		return PTR_ERR(pcie->base_phy_ip);
+		pcie->base_phy_ip =
+			devm_platform_ioremap_resource_byname(pdev, "phy-ip");
+		if (IS_ERR(pcie->base_phy_ip))
+			return PTR_ERR(pcie->base_phy_ip);
+	}
 
 	for (i = 0; i < H9P_NUM_PORTS; i++) {
 		char name[8];
@@ -1783,10 +2864,12 @@ static int apple_h9p_pcie_map_resources(struct platform_device *pdev,
 			return PTR_ERR(pcie->base_port[i]);
 	}
 
-	pcie->nvmmu.base =
-		devm_platform_ioremap_resource_byname(pdev, "nvmmu");
-	if (IS_ERR(pcie->nvmmu.base))
-		return PTR_ERR(pcie->nvmmu.base);
+	if (pcie->hw->has_nvmmu) {
+		pcie->nvmmu.base =
+			devm_platform_ioremap_resource_byname(pdev, "nvmmu");
+		if (IS_ERR(pcie->nvmmu.base))
+			return PTR_ERR(pcie->nvmmu.base);
+	}
 
 	return 0;
 }
@@ -1815,6 +2898,8 @@ static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
 	if (ret && ret != -EINVAL)
 		return ret;
 	if (pcie->preinit_phy_ports & ~GENMASK(H9P_NUM_PORTS - 1, 0))
+		return -EINVAL;
+	if (pcie->preinit_phy_ports && !pcie->hw->has_phy)
 		return -EINVAL;
 
 	for_each_available_child_of_node(dev->of_node, np) {
@@ -1867,15 +2952,10 @@ static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
 		{
 			struct of_phandle_args dart;
 
-			ret = of_parse_phandle_with_args(np,
-							 "apple,manual-availability-iommu",
-							 "#iommu-cells", 0, &dart);
+			ret = of_parse_phandle_with_fixed_args(np,
+							       "apple,manual-availability-iommu",
+							       1, 0, &dart);
 			if (!ret) {
-				if (dart.args_count != 1) {
-					of_node_put(dart.np);
-					ret = -EINVAL;
-					goto out_put_child;
-				}
 				pcie->manual_dart[port] = dart.np;
 				pcie->manual_dart_sid[port] = dart.args[0];
 			} else if (ret != -ENOENT) {
@@ -1950,9 +3030,9 @@ static void apple_h9p_pcie_pwrctrl_cleanup(void *data)
 static int apple_h9p_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	const bool *j172_bridge_quirk;
 	struct pci_host_bridge *bridge;
 	struct apple_h9p_pcie *pcie;
+	u32 doorbell;
 	int ret;
 
 	bridge = devm_pci_alloc_host_bridge(dev, sizeof(*pcie));
@@ -1964,10 +3044,10 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	pcie->pdev = pdev;
 	pcie->bridge = bridge;
 	spin_lock_init(&pcie->used_msi_lock);
-	j172_bridge_quirk = of_device_get_match_data(dev);
-	pcie->j172_bridge_quirk =
-		j172_bridge_quirk && *j172_bridge_quirk;
-	if (pcie->j172_bridge_quirk) {
+	pcie->hw = of_device_get_match_data(dev);
+	if (!pcie->hw)
+		return -ENODEV;
+	if (pcie->hw->j172_bridge_quirk) {
 		pcie->j172_quirk_state =
 			devm_kzalloc(dev, sizeof(*pcie->j172_quirk_state),
 				     GFP_KERNEL);
@@ -1978,6 +3058,12 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	ret = apple_h9p_pcie_parse_ports(pcie);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to parse root ports\n");
+
+	if (pcie->hw->parse) {
+		ret = pcie->hw->parse(pcie);
+		if (ret)
+			return ret;
+	}
 
 	ret = apple_h9p_pcie_map_resources(pdev, pcie);
 	if (ret)
@@ -1993,20 +3079,30 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = pci_pwrctrl_devices_ready(dev);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "waiting for PCI power controls\n");
+	/*
+	 * With late endpoint power, the storage port must not wait for the
+	 * other endpoints' power controls: they are powered after it.
+	 */
+	if (!pcie->hw->setup_ports) {
+		ret = pci_pwrctrl_devices_ready(dev);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "waiting for PCI power controls\n");
+	}
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
 
-	pcie->clks[0].id = "aux";
-	pcie->clks[1].id = "ref";
-	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(pcie->clks), pcie->clks);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to get clocks\n");
+	if (pcie->hw->has_clocks) {
+		pcie->clks[0].id = "aux";
+		pcie->clks[1].id = "ref";
+		ret = devm_clk_bulk_get(dev, ARRAY_SIZE(pcie->clks),
+					pcie->clks);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to get clocks\n");
+	}
 
 	ret = apple_h9p_pcie_attach_genpd(pcie);
 	if (ret)
@@ -2015,7 +3111,8 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	while (pcie->clks_enabled < ARRAY_SIZE(pcie->clks)) {
+	while (pcie->hw->has_clocks &&
+	       pcie->clks_enabled < ARRAY_SIZE(pcie->clks)) {
 		struct clk *clock =
 			pcie->clks[pcie->clks_enabled].clk;
 		const char *clock_name =
@@ -2050,15 +3147,17 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = apple_h9p_setup_common(pcie);
-	if (ret)
-		return ret;
+	if (pcie->hw->setup_common) {
+		ret = pcie->hw->setup_common(pcie);
+		if (ret)
+			return ret;
+	}
 
 	ret = apple_h9p_prepare_phy_ports(pcie);
 	if (ret)
 		return ret;
 
-	if (!pcie->deferred_power_ports) {
+	if (!pcie->deferred_power_ports && !pcie->hw->setup_ports) {
 		ret = pci_pwrctrl_power_on_devices(dev);
 		if (ret) {
 			return dev_err_probe(dev, ret,
@@ -2067,10 +3166,9 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 		pcie->pwrctrl_powered = true;
 	}
 
-	ret = of_property_read_u64(dev->of_node, "apple,msi-doorbell",
-				   &pcie->msi_doorbell);
-	if (ret)
-		pcie->msi_doorbell = H9P_DEFAULT_MSI_DOORBELL;
+	pcie->msi_doorbell = H9P_DEFAULT_MSI_DOORBELL;
+	if (!of_property_read_u32(dev->of_node, "apple,msi-doorbell", &doorbell))
+		pcie->msi_doorbell = doorbell;
 
 	ret = apple_h9p_pcie_setup_msi(pcie);
 	if (ret)
@@ -2079,17 +3177,74 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	return pci_host_common_init(pdev, bridge, &apple_h9p_pcie_ecam_ops);
+	INIT_DELAYED_WORK(&pcie->late_work, apple_s8003_late_ports_work);
+	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_cancel_late_ports,
+				       pcie);
+	if (ret)
+		return ret;
+
+	ret = pci_host_common_init(pdev, bridge, &apple_h9p_pcie_ecam_ops);
+	if (ret)
+		return ret;
+
+	if (pcie->late_ports)
+		schedule_delayed_work(&pcie->late_work,
+				      msecs_to_jiffies(S8003_LATE_PORT_RETRY_MS));
+	return 0;
 }
 
-static const bool apple_h9p_j172_bridge_quirk = true;
+static const struct apple_h9p_hw apple_h9p_hw_t7000 = {
+	.setup_port = apple_t7000_setup_port,
+	/* The only speed validated on T7001; J81's port 1 is Gen1-limited. */
+	.default_link_speed = H9P_LINK_SPEED_2_5GT,
+	.no_port_irqs = true,
+};
+
+static const struct apple_h9p_hw apple_h9p_hw_t8010 = {
+	.setup_common = apple_t8010_setup_common,
+	.setup_port = apple_t8010_setup_port,
+	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
+	.has_clocks = true,
+	.has_phy = true,
+	.has_nvmmu = true,
+	.port3_link_events = true,
+};
+
+static const struct apple_h9p_hw apple_h9p_hw_j172 = {
+	.setup_common = apple_t8010_setup_common,
+	.setup_port = apple_t8010_setup_port,
+	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
+	.has_clocks = true,
+	.has_phy = true,
+	.has_nvmmu = true,
+	.port3_link_events = true,
+	.j172_bridge_quirk = true,
+};
+
+static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
+	.parse = apple_s8003_parse,
+	.setup_common = apple_s8003_setup_common,
+	.setup_ports = apple_s8003_setup_ports,
+	.nvme_mode_ports = BIT(0),
+	.link_settle_ms = 100,
+	.has_phy = true,
+	.has_nvmmu = true,
+	.phy_tunables = H9P_TUNABLES(s8003_phy_tunables),
+	.common_tunables = H9P_TUNABLES(s8003_rc_common_tunables),
+	.config_tunables = H9P_TUNABLES(s8003_config_tunables),
+	.port_tunables = H9P_TUNABLES(s8003_port_tunables),
+	/* AppleNVMeMMU on S8003 polls the init bit itself */
+	.nvmmu_init_busy = H9P_NVMMU_TCB_CTRL_INIT,
+	.nvmmu_inv_fifo = true,
+	.nvmmu_optional = true,
+	.no_port_irqs = true,
+};
 
 static const struct of_device_id apple_h9p_pcie_of_match[] = {
-	{
-		.compatible = "apple,j172-pcie",
-		.data = &apple_h9p_j172_bridge_quirk,
-	},
-	{ .compatible = "apple,t8010-pcie" },
+	{ .compatible = "apple,s8003-pcie", .data = &apple_h9p_hw_s8003 },
+	{ .compatible = "apple,j172-pcie", .data = &apple_h9p_hw_j172 },
+	{ .compatible = "apple,t8010-pcie", .data = &apple_h9p_hw_t8010 },
+	{ .compatible = "apple,t7000-pcie", .data = &apple_h9p_hw_t7000 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_h9p_pcie_of_match);
@@ -2104,5 +3259,5 @@ static struct platform_driver apple_h9p_pcie_driver = {
 };
 module_platform_driver(apple_h9p_pcie_driver);
 
-MODULE_DESCRIPTION("Apple H9P/T8010 PCIe host bridge driver");
+MODULE_DESCRIPTION("Apple H8P/H9P (S8003/T8010) and T7000 PCIe host bridge driver");
 MODULE_LICENSE("GPL");

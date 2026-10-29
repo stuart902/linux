@@ -1504,12 +1504,67 @@ static inline bool nvme_poll_cq(struct nvme_queue *nvmeq,
 	return found;
 }
 
+/*
+ * Apple ANS signals its admin and I/O completion queues through one MSI
+ * (NVME_QUIRK_SINGLE_VECTOR), and nvme-pci registers one action per queue on
+ * it. A completion that reaches one CQ after that queue's action has run,
+ * while another action is still acknowledging its own CQ, is not signalled
+ * again: the controller sends no further MSI while a CQ on the vector still
+ * holds a completion, and every later command waits for its timeout. So every
+ * invocation services all CQs on the vector, until a full pass finds nothing.
+ * The actions of one IRQ never run concurrently, so this needs no more locking
+ * than a single CQ. Threaded handlers can run concurrently and keep the
+ * per-queue behaviour.
+ */
+static bool nvme_apple_ans_shared_vector(struct nvme_dev *dev)
+{
+	return dev->dma_ops == &nvme_pci_apple_ans_ops &&
+	       (dev->ctrl.quirks & NVME_QUIRK_SINGLE_VECTOR) &&
+	       !use_threaded_interrupts;
+}
+
+static bool nvme_apple_ans_vector_queue(struct nvme_queue *nvmeq, u16 vector)
+{
+	return test_bit(NVMEQ_ENABLED, &nvmeq->flags) &&
+	       !test_bit(NVMEQ_POLLED, &nvmeq->flags) &&
+	       nvmeq->cq_vector == vector;
+}
+
+/* Hard IRQ context only */
+static bool nvme_apple_ans_irq_vector(struct nvme_dev *dev, u16 vector,
+				      struct io_comp_batch *iob)
+{
+	bool found = false, more;
+	unsigned int i;
+
+	do {
+		more = false;
+		for (i = 0; i < dev->ctrl.queue_count; i++) {
+			struct nvme_queue *nvmeq = &dev->queues[i];
+
+			if (nvme_apple_ans_vector_queue(nvmeq, vector) &&
+			    nvme_poll_cq(nvmeq, nvmeq->qid ? iob : NULL))
+				more = true;
+		}
+		found |= more;
+	} while (more);
+
+	return found;
+}
+
 static irqreturn_t nvme_irq(int irq, void *data)
 {
 	struct nvme_queue *nvmeq = data;
+	struct nvme_dev *dev = nvmeq->dev;
 	DEFINE_IO_COMP_BATCH(iob);
+	bool found;
 
-	if (nvme_poll_cq(nvmeq, &iob)) {
+	if (nvme_apple_ans_shared_vector(dev))
+		found = nvme_apple_ans_irq_vector(dev, nvmeq->cq_vector, &iob);
+	else
+		found = nvme_poll_cq(nvmeq, &iob);
+
+	if (found) {
 		if (!rq_list_empty(&iob.req_list))
 			nvme_pci_complete_batch(&iob);
 		return IRQ_HANDLED;
@@ -1542,6 +1597,38 @@ static void nvme_poll_irqdisable(struct nvme_queue *nvmeq)
 	spin_lock(&nvmeq->cq_poll_lock);
 	nvme_poll_cq(nvmeq, NULL);
 	spin_unlock(&nvmeq->cq_poll_lock);
+	enable_irq(irq);
+}
+
+/*
+ * nvme_poll_irqdisable() for the shared Apple ANS vector: draining only the
+ * timed-out queue can't restart a vector while another CQ on it still holds a
+ * completion, so drain all of them.
+ */
+static void nvme_apple_ans_poll_vector_irqdisable(struct nvme_queue *nvmeq)
+{
+	struct nvme_dev *dev = nvmeq->dev;
+	int irq = pci_irq_vector(to_pci_dev(dev->dev), nvmeq->cq_vector);
+	unsigned int i;
+	bool more;
+
+	WARN_ON_ONCE(test_bit(NVMEQ_POLLED, &nvmeq->flags));
+
+	disable_irq(irq);
+	do {
+		more = false;
+		for (i = 0; i < dev->ctrl.queue_count; i++) {
+			struct nvme_queue *q = &dev->queues[i];
+
+			if (!nvme_apple_ans_vector_queue(q, nvmeq->cq_vector))
+				continue;
+
+			spin_lock(&q->cq_poll_lock);
+			if (nvme_poll_cq(q, NULL))
+				more = true;
+			spin_unlock(&q->cq_poll_lock);
+		}
+	} while (more);
 	enable_irq(irq);
 }
 
@@ -1793,6 +1880,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req)
 	 */
 	if (test_bit(NVMEQ_POLLED, &nvmeq->flags))
 		nvme_poll(req->mq_hctx, NULL);
+	else if (nvme_apple_ans_shared_vector(dev))
+		nvme_apple_ans_poll_vector_irqdisable(nvmeq);
 	else
 		nvme_poll_irqdisable(nvmeq);
 
@@ -3087,7 +3176,8 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	if (pci_enable_device_mem(pdev))
 		return result;
 
-	pci_set_master(pdev);
+	if (!dev->late_bus_master)
+		pci_set_master(pdev);
 
 	if (readl(dev->bar + NVME_REG_CSTS) == -1) {
 		dev_dbg(dev->ctrl.device, "reading CSTS register failed\n");
@@ -3152,6 +3242,9 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 		if (result)
 			goto free_irq;
 	}
+
+	if (dev->late_bus_master)
+		pci_set_master(pdev);
 
 	nvme_map_cmb(dev);
 
@@ -3306,6 +3399,15 @@ static void nvme_reset_work(struct work_struct *work)
 	result = nvme_pci_enable(dev);
 	if (result)
 		goto out_unlock;
+	if (!dev->ctrl.admin_q) {
+		/* First enable, deferred from nvme_probe() (Apple ANS) */
+		result = nvme_alloc_admin_tag_set(&dev->ctrl,
+						  &dev->admin_tagset,
+						  &nvme_mq_admin_ops,
+						  sizeof(struct nvme_iod));
+		if (result)
+			goto out_unlock;
+	}
 	nvme_unquiesce_admin_queue(&dev->ctrl);
 	mutex_unlock(&dev->shutdown_lock);
 
@@ -3394,13 +3496,23 @@ static void nvme_reset_work(struct work_struct *work)
 
 static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
 {
-	*val = readl(to_nvme_dev(ctrl)->bar + off);
+	struct nvme_dev *dev = to_nvme_dev(ctrl);
+
+	if (off == NVME_REG_CSTS && dev->dma_ops && dev->dma_ops->read_csts)
+		return dev->dma_ops->read_csts(dev, val);
+
+	*val = readl(dev->bar + off);
 	return 0;
 }
 
 static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
 {
-	writel(val, to_nvme_dev(ctrl)->bar + off);
+	struct nvme_dev *dev = to_nvme_dev(ctrl);
+
+	if (off == NVME_REG_CC && dev->dma_ops && dev->dma_ops->write_cc)
+		return dev->dma_ops->write_cc(dev, val);
+
+	writel(val, dev->bar + off);
 	return 0;
 }
 
@@ -3611,9 +3723,11 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 		quirks |= qentry->enabled_quirks;
 		quirks &= ~qentry->disabled_quirks;
 	}
-	if (pdev->vendor == PCI_VENDOR_ID_APPLE &&
-	    pdev->device == PCI_DEVICE_ID_APPLE_ANS_NVME)
+	if (nvme_pci_apple_ans_match(pdev)) {
 		dev->dma_ops = &nvme_pci_apple_ans_ops;
+		/* One MSI and shared tags, as for 106b:2002 */
+		quirks |= NVME_QUIRK_SINGLE_VECTOR | NVME_QUIRK_SHARED_TAGS;
+	}
 	if (dev->dma_ops) {
 		ret = dev->dma_ops->init(dev, node);
 		if (ret)
@@ -3678,6 +3792,24 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_dev_unmap;
 
 	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
+
+	/*
+	 * Apple ANS: do the first enable from reset_work, as nvme-pci did before
+	 * it became synchronous. The probe runs in the async domain that
+	 * kernel_init() waits for before it starts /init, and an ANS bring-up
+	 * that hangs or waits out CAP.TO (minutes) would otherwise keep
+	 * userspace from starting and reporting the failure.
+	 */
+	if (dev->dma_ops == &nvme_pci_apple_ans_ops) {
+		if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_RESETTING)) {
+			result = -EBUSY;
+			goto out_release_iod_mempool;
+		}
+		pci_set_drvdata(pdev, dev);
+		queue_work(nvme_reset_wq, &dev->ctrl.reset_work);
+		nvme_put_ctrl(&dev->ctrl);
+		return 0;
+	}
 
 	result = nvme_pci_enable(dev);
 	if (result)

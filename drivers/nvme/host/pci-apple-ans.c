@@ -11,10 +11,12 @@
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/mempool.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/pci.h>
+#include <linux/pci_regs.h>
 
 #include "pci-internal.h"
 
@@ -29,11 +31,14 @@
 #define APPLE_ANS_REG_HMB_SIZE		0x1818
 #define APPLE_ANS_REG_CORE_MASK		0x1824
 #define APPLE_ANS_REG_LOG_SIZE		0x1828
-#define APPLE_ANS_PCI_CFG_17C		0x17c
-#define APPLE_ANS_PCI_CFG_17C_VALUE	0x10081008
-#define APPLE_ANS_PCI_CFG_188		0x188
-#define APPLE_ANS_PCI_CFG_188_VALUE	0x40550000
-#define APPLE_ANS_PCI_CFG_18C		0x18c
+/*
+ * S3E configuration space: the LTR maximum latencies (Apple device tree
+ * "pci-max-latency") and the L1 PM substates control 1 ("pci-l1pm-control"
+ * with its enable bits cleared), which differs per SoC.
+ */
+#define APPLE_ANS_LTR_MAX_LATENCY	0x10081008
+#define APPLE_ANS_L1SS_CTL1_S8003	0x40440000
+#define APPLE_ANS_L1SS_CTL1_T8010	0x40550000
 #define APPLE_ANS_NVME_MAX_SECTORS \
 	(APPLE_ANS_NVMMU_MAX_PAGES * APPLE_ANS_NVMMU_PAGE_SIZE >> SECTOR_SHIFT)
 
@@ -41,7 +46,44 @@ struct apple_ans_nvme_req {
 	u64 pages[APPLE_ANS_NVMMU_MAX_PAGES];
 };
 
+/*
+ * Per-SoC host data.
+ *
+ * @l1ss_ctl1: L1 PM substates control 1 of the controller
+ * @enable_settle_ms: time between setting CC.EN and the first CSTS read
+ * @rdy_timeout_ms: give up on a CSTS.RDY transition after this long, rather
+ *                  than after CAP.TO (0: CAP.TO only)
+ * @late_bus_master: let the controller master the bus only after the
+ *                   preinit has stopped it and reset the NVMMU slots
+ */
+struct apple_ans_host {
+	u32 l1ss_ctl1;
+	unsigned int enable_settle_ms;
+	unsigned int rdy_timeout_ms;
+	bool late_bus_master;
+};
+
+static const struct apple_ans_host apple_ans_host_s8003 = {
+	.l1ss_ctl1 = APPLE_ANS_L1SS_CTL1_S8003,
+	/*
+	 * The validated A9 bring-up reads CSTS only 100 ms after CC.EN, and
+	 * gives up on RDY after 5 s instead of CAP.TO (minutes).
+	 */
+	.enable_settle_ms = 100,
+	.rdy_timeout_ms = 5000,
+	.late_bus_master = true,
+};
+
+static const struct apple_ans_host apple_ans_host_t8010 = {
+	.l1ss_ctl1 = APPLE_ANS_L1SS_CTL1_T8010,
+};
+
 struct apple_ans_nvme {
+	const struct apple_ans_host *host;
+	/* Last CC written through the register hook, and when */
+	u32 cc;
+	unsigned long cc_jiffies;
+	bool cc_written;
 	dma_addr_t hmb_dma;
 	u32 hmb_size;
 	struct apple_ans_nvme_req req[APPLE_ANS_NVMMU_MAX_REQS];
@@ -56,14 +98,56 @@ static struct apple_ans_nvme *nvme_pci_apple_ans(struct nvme_dev *dev)
 	return dev->dma_data;
 }
 
+static const struct of_device_id nvme_pci_apple_ans_hosts[] = {
+	{ .compatible = "apple,s8003-pcie", .data = &apple_ans_host_s8003 },
+	{ .compatible = "apple,t8010-pcie", .data = &apple_ans_host_t8010 },
+	{ }
+};
+
+static struct device_node *nvme_pci_apple_ans_host_np(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+
+	if (!bridge)
+		return NULL;
+	if (bridge->dev.parent && bridge->dev.parent->of_node)
+		return bridge->dev.parent->of_node;
+	return bridge->dev.of_node;
+}
+
+static const struct of_device_id *
+nvme_pci_apple_ans_host_match(struct pci_dev *pdev)
+{
+	struct device_node *np = nvme_pci_apple_ans_host_np(pdev);
+
+	return np ? of_match_node(nvme_pci_apple_ans_hosts, np) : NULL;
+}
+
+/*
+ * The ANS storage controller behind an H8P/H9P root complex needs this glue.
+ * Select it by the host bridge rather than by the device ID alone.
+ */
+bool nvme_pci_apple_ans_match(struct pci_dev *pdev)
+{
+	return pdev->vendor == PCI_VENDOR_ID_APPLE &&
+	       nvme_pci_apple_ans_host_match(pdev);
+}
+
 static int nvme_pci_apple_ans_init(struct nvme_dev *dev, int node)
 {
+	const struct of_device_id *match;
 	struct apple_ans_nvme *ans;
+
+	match = nvme_pci_apple_ans_host_match(to_pci_dev(dev->dev));
+	if (!match)
+		return -ENODEV;
 
 	ans = kzalloc_node(sizeof(*ans), GFP_KERNEL, node);
 	if (!ans)
 		return -ENOMEM;
 
+	ans->host = match->data;
+	dev->late_bus_master = ans->host->late_bus_master;
 	spin_lock_init(&ans->req_lock);
 	dev->dma_data = ans;
 	return 0;
@@ -80,7 +164,6 @@ static int nvme_pci_apple_ans_find_hmb(struct nvme_dev *dev, u32 size_req,
 {
 	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
-	struct pci_host_bridge *bridge;
 	struct device_node *pcie_np;
 	struct device_node *mem_np;
 	struct resource res;
@@ -88,13 +171,7 @@ static int nvme_pci_apple_ans_find_hmb(struct nvme_dev *dev, u32 size_req,
 	u32 iova;
 	int ret;
 
-	bridge = pci_find_host_bridge(pdev->bus);
-	if (!bridge)
-		return -ENODEV;
-
-	pcie_np = bridge->dev.parent ? bridge->dev.parent->of_node : NULL;
-	if (!pcie_np)
-		pcie_np = bridge->dev.of_node;
+	pcie_np = nvme_pci_apple_ans_host_np(pdev);
 	if (!pcie_np)
 		return -ENODEV;
 
@@ -145,7 +222,7 @@ static int nvme_pci_apple_ans_reset_dma(struct nvme_dev *dev)
 	int ret;
 
 	for (tag = 0; tag < APPLE_ANS_NVMMU_MAX_REQS; tag++) {
-		ret = apple_ans_nvmmu_map(dev->dev, tag, NULL, 0, NULL);
+		ret = apple_ans_nvmmu_map(dev->dev, tag, NULL, 0, false, NULL);
 		if (ret)
 			return ret;
 	}
@@ -157,10 +234,33 @@ static int nvme_pci_apple_ans_reset_dma(struct nvme_dev *dev)
 	return 0;
 }
 
-static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+static int nvme_pci_apple_ans_config(struct nvme_dev *dev)
 {
 	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	u16 ltr, l1ss;
+
+	if (pci_write_config_byte(pdev, PCI_LATENCY_TIMER, 0x40))
+		return -EIO;
+
+	ltr = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_LTR);
+	if (ltr && pci_write_config_dword(pdev, ltr + PCI_LTR_MAX_SNOOP_LAT,
+					  APPLE_ANS_LTR_MAX_LATENCY))
+		return -EIO;
+
+	l1ss = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_L1SS);
+	if (l1ss &&
+	    (pci_write_config_dword(pdev, l1ss + PCI_L1SS_CTL2, 0) ||
+	     pci_write_config_dword(pdev, l1ss + PCI_L1SS_CTL1,
+				    ans->host->l1ss_ctl1)))
+		return -EIO;
+
+	return 0;
+}
+
+static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+{
+	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
 	u32 csts, core_mask, log_size;
 	u32 hmb_size, hmb_align;
 	int ret;
@@ -168,22 +268,25 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
 	if (!ans)
 		return 0;
 
-	if (pci_write_config_byte(pdev, PCI_LATENCY_TIMER, 0x40) !=
-	    PCIBIOS_SUCCESSFUL ||
-	    pci_write_config_dword(pdev, APPLE_ANS_PCI_CFG_17C,
-				   APPLE_ANS_PCI_CFG_17C_VALUE) !=
-	    PCIBIOS_SUCCESSFUL ||
-	    pci_write_config_dword(pdev, APPLE_ANS_PCI_CFG_18C, 0) !=
-	    PCIBIOS_SUCCESSFUL ||
-	    pci_write_config_dword(pdev, APPLE_ANS_PCI_CFG_188,
-				   APPLE_ANS_PCI_CFG_188_VALUE) !=
-	    PCIBIOS_SUCCESSFUL)
-		return -EIO;
-
 	core_mask = readl(dev->bar + APPLE_ANS_REG_CORE_MASK);
 	log_size = readl(dev->bar + APPLE_ANS_REG_LOG_SIZE);
 	hmb_size = readl(dev->bar + APPLE_ANS_REG_HMB_SIZE_REQ);
 	hmb_align = readl(dev->bar + APPLE_ANS_REG_HMB_ALIGN_REQ);
+
+	/*
+	 * Check what the controller needs from the boot loader before writing
+	 * anything to it: without a usable HMB, leave it as the loader left it.
+	 */
+	if (!ans->hmb_size) {
+		ret = nvme_pci_apple_ans_find_hmb(dev, hmb_size, hmb_align);
+		if (ret)
+			return dev_err_probe(dev->dev, ret,
+					     "no usable ANS host memory buffer\n");
+	}
+
+	ret = nvme_pci_apple_ans_config(dev);
+	if (ret)
+		return ret;
 
 	writel(0, dev->bar + NVME_REG_CC);
 	ret = readl_poll_timeout(dev->bar + NVME_REG_CSTS, csts,
@@ -191,12 +294,6 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
 				 1000, 2000000);
 	if (ret)
 		return ret;
-
-	if (!ans->hmb_size) {
-		ret = nvme_pci_apple_ans_find_hmb(dev, hmb_size, hmb_align);
-		if (ret)
-			return ret;
-	}
 
 	ret = nvme_pci_apple_ans_reset_dma(dev);
 	if (ret)
@@ -225,6 +322,46 @@ static int nvme_pci_apple_ans_prepare_enable(struct nvme_dev *dev)
 	       dev->bar + APPLE_ANS_REG_HMB_BASE_HI);
 	writel(ans->hmb_size, dev->bar + APPLE_ANS_REG_HMB_SIZE);
 	readl(dev->bar + APPLE_ANS_REG_HMB_SIZE);
+
+	return 0;
+}
+
+static int nvme_pci_apple_ans_write_cc(struct nvme_dev *dev, u32 cc)
+{
+	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
+
+	writel(cc, dev->bar + NVME_REG_CC);
+	if (!ans)
+		return 0;
+
+	ans->cc = cc;
+	ans->cc_jiffies = jiffies;
+	ans->cc_written = true;
+	if ((cc & NVME_CC_ENABLE) && !(cc & NVME_CC_SHN_MASK) &&
+	    ans->host->enable_settle_ms)
+		msleep(ans->host->enable_settle_ms);
+
+	return 0;
+}
+
+static int nvme_pci_apple_ans_read_csts(struct nvme_dev *dev, u32 *csts)
+{
+	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
+	unsigned long deadline;
+
+	*csts = readl(dev->bar + NVME_REG_CSTS);
+	if (!ans || !ans->cc_written || !ans->host->rdy_timeout_ms ||
+	    (ans->cc & NVME_CC_SHN_MASK))
+		return 0;
+
+	deadline = ans->cc_jiffies +
+		   msecs_to_jiffies(ans->host->rdy_timeout_ms);
+	if (!!(*csts & NVME_CSTS_RDY) != !!(ans->cc & NVME_CC_ENABLE) &&
+	    time_after(jiffies, deadline)) {
+		dev_err(dev->dev, "ANS RDY timeout (CC %#x, CSTS %#x)\n",
+			ans->cc, *csts);
+		return -ETIMEDOUT;
+	}
 
 	return 0;
 }
@@ -276,7 +413,7 @@ static int nvme_pci_apple_ans_free_req(struct nvme_dev *dev,
 	if (tag >= APPLE_ANS_NVMMU_MAX_REQS)
 		return -EINVAL;
 
-	ret = apple_ans_nvmmu_map(dev->dev, tag, NULL, 0, NULL);
+	ret = apple_ans_nvmmu_map(dev->dev, tag, NULL, 0, false, NULL);
 	if (ret) {
 		/* The controller may still hold this slot: never reuse it. */
 		dev_err_ratelimited(dev->dev,
@@ -436,7 +573,8 @@ static blk_status_t nvme_pci_apple_ans_map_data(struct request *req)
 		goto out_unmap;
 	}
 
-	ret = apple_ans_nvmmu_map(dev->dev, tag, areq->pages, npages, &flatdma);
+	ret = apple_ans_nvmmu_map(dev->dev, tag, areq->pages, npages,
+				  rq_dma_dir(req) == DMA_FROM_DEVICE, &flatdma);
 	if (ret) {
 		status = errno_to_blk_status(ret);
 		if (status == BLK_STS_NOTSUPP)
@@ -471,6 +609,8 @@ const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops = {
 	.exit		= nvme_pci_apple_ans_exit,
 	.preinit	= nvme_pci_apple_ans_preinit,
 	.prepare_enable = nvme_pci_apple_ans_prepare_enable,
+	.write_cc	= nvme_pci_apple_ans_write_cc,
+	.read_csts	= nvme_pci_apple_ans_read_csts,
 	.map_data	= nvme_pci_apple_ans_map_data,
 	.unmap_data	= nvme_pci_apple_ans_unmap_data,
 	.queue_depth	= nvme_pci_apple_ans_queue_depth,

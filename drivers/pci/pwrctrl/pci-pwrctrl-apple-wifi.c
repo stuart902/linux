@@ -17,6 +17,7 @@
 
 struct apple_wifi_pwrctrl_data {
 	bool pulse_device_wake;
+	bool assert_device_wake;
 	unsigned int step_delay_min_us;
 	unsigned int step_delay_max_us;
 	unsigned int stabilization_delay_ms;
@@ -36,6 +37,17 @@ static const struct apple_wifi_pwrctrl_data apple_iphone7_plus_wifi_data = {
 };
 
 static const struct apple_wifi_pwrctrl_data apple_j172_wifi_data = {
+	.stabilization_delay_ms = 100,
+};
+
+/*
+ * BCM4350 (iPad Air 2): REG_ON, 100 ms, then DEVICE_WAKE held asserted.
+ * iOS drives DEVICE_WAKE through AppleEmbeddedPCIEPort::setDeviceWake()
+ * while the device is active, and the Apple NVRAM (device_wake_opt=1)
+ * makes the firmware depend on it to leave deep sleep.
+ */
+static const struct apple_wifi_pwrctrl_data apple_bcm4350_wifi_data = {
+	.assert_device_wake = true,
 	.stabilization_delay_ms = 100,
 };
 
@@ -98,6 +110,17 @@ static int apple_wifi_power_on(struct pci_pwrctrl *pwrctrl)
 
 	if (wifi->data->stabilization_delay_ms)
 		msleep(wifi->data->stabilization_delay_ms);
+
+	if (wifi->data->assert_device_wake) {
+		ret = apple_wifi_set_device_wake(wifi, 1);
+		if (ret) {
+			rollback = apple_wifi_set_vdd(wifi, false);
+			if (rollback)
+				dev_err(pwrctrl->dev,
+					"failed to roll back VDD: %d\n", rollback);
+			return ret;
+		}
+	}
 
 	return 0;
 }
@@ -198,6 +221,10 @@ static const struct of_device_id apple_wifi_pwrctrl_of_match[] = {
 	{
 		.compatible = "apple,d111-bcm4355-wifi",
 		.data = &apple_iphone7_plus_wifi_data,
+	},
+	{
+		.compatible = "pci14e4,43a3",
+		.data = &apple_bcm4350_wifi_data,
 	},
 	{
 		.compatible = "pci14e4,43dc",
