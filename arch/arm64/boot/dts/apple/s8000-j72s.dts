@@ -13,3 +13,7 @@
 	compatible = "apple,j72s", "apple,s8000", "apple,arm-platform";
 	model = "Apple iPad 5 (Cellular) (Samsung)";
 };
+
+&touchscreen {
+	firmware-name = "apple/j72s-fwstart.z2fw";
+};

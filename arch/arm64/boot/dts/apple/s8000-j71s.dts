@@ -13,3 +13,7 @@
 	compatible = "apple,j71s", "apple,s8000", "apple,arm-platform";
 	model = "Apple iPad 5 (Wi-Fi) (Samsung)";
 };
+
+&touchscreen {
+	firmware-name = "apple/j71s-fwstart.z2fw";
+};

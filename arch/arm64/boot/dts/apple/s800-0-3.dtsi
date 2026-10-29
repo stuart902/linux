@@ -76,6 +76,65 @@
 			#performance-domain-cells = <0>;
 		};
 
+		/*
+		 * Imagination MSVDX ("VXD") H.264 decoder, ADT vxd@7F00000. It
+		 * has its own two-level GART, so no DART.
+		 */
+		vxd: video-codec@207f00000 {
+			compatible = "apple,s8000-vxd";
+			reg = <0x2 0x07f00000 0x0 0x100000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 157 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_vdec>;
+			status = "disabled";
+		};
+
+		i2s_switch: syscon@20a003000 {
+			compatible = "apple,s8000-i2s-switch", "syscon";
+			reg = <0x2 0x0a003000 0x0 0x1000>;
+		};
+
+		spi1: spi@20a084000 {
+			compatible = "apple,s8000-spi", "apple,spi";
+			reg = <0x2 0x0a084000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 189 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi3: spi@20a08c000 {
+			compatible = "apple,s8000-spi", "apple,spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 191 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* SmartIO DMA endpoints 0x28 (TX) and 0x29 (RX), from the ADT. */
+		mca0: mca@20a0a0000 {
+			compatible = "apple,s8000-mca";
+			reg = <0x2 0x0a0a0000 0x0 0x4000>,
+			      <0x2 0x0a002000 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 201 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca0>;
+			dmas = <&sio 0x28>, <&sio 0x29>;
+			dma-names = "tx", "rx";
+			#clock-cells = <0>;
+			clock-output-names = "mca0-mclk";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@20a0c0000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0c0000 0x0 0x4000>;
@@ -86,6 +145,43 @@
 			clocks = <&clkref>, <&clkref>;
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart0>;
+			status = "disabled";
+		};
+
+		/*
+		 * uart2 carries the ADT's "wlan" node (wlan-pcie-uart,bcm4355):
+		 * the platform-control function of the PCIe Wi-Fi module.
+		 */
+		wlan_uart2: wlan-platform-control@20a0c8000 {
+			compatible = "apple,t8010-wlan-uart-provider";
+			reg = <0x2 0x0a0c8000 0x0 0x4000>;
+			power-domains = <&ps_uart2>;
+			status = "disabled";
+		};
+
+		serial3: serial@20a0cc000 {
+			compatible = "apple,s8000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0cc000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 195 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart3>;
+			status = "disabled";
+		};
+
+		serial5: serial@20a0d4000 {
+			compatible = "apple,s8000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0d4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 197 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart5>;
 			status = "disabled";
 		};
 
@@ -128,6 +224,25 @@
 			power-domains = <&ps_i2c2>;
 			#address-cells = <1>;
 			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* ADT /arm-io/sio: iop,s8000, AppleA7IOP version 1 */
+		sio: dma-controller@20ae00000 {
+			compatible = "apple,s8000-sio";
+			reg = <0x2 0x0ae00000 0x0 0x10000>,
+			      <0x2 0x0a000000 0x0 0x2000>;
+			reg-names = "a7iop", "shim";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 187 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 186 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_sio>;
+			resets = <&ps_sio>;
+			firmware-name = "apple/s8000-smartio.bin";
+			dma-channels = <64>;
+			#dma-cells = <1>;
 			status = "disabled";
 		};
 
@@ -199,9 +314,19 @@
 			#size-cells = <1>;
 
 			reg = <0x2 0xe000000 0 0x8c000>;
+
+			touchclk: clock-controller@78000 {
+				compatible = "apple,s8000-touch-clock", "apple,t8010-touch-clock";
+				reg = <0x78000 0x8>;
+				#clock-cells = <0>;
+				clocks = <&clkref>;
+				clock-output-names = "touchclk";
+				clock-frequency = <32768>;
+				status = "disabled";
+			};
 		};
 
-		aic: interrupt-controller@20e100000 {
+		aic:interrupt-controller@20e100000 {
 			compatible = "apple,s8000-aic", "apple,aic";
 			reg = <0x2 0x0e100000 0x0 0x100000>;
 			#interrupt-cells = <3>;
