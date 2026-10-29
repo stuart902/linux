@@ -813,6 +813,37 @@ static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
 		chg->phase = TRISTAR_CHARGING;
 }
 
+/*
+ * On the iPad 5 the PMIC returns the input limit to its attach default of
+ * 100 mA some 25-400 ms after attach, after the fallback has been written.
+ * Put the fallback back; a grant above it was set by a later ramp, so drop
+ * to the fallback and ramp again under the usual pack checks. A limit above
+ * the one written is put back down at once. Caller holds lock.
+ */
+static void tristar_check_limit(struct tristar_charger *chg)
+{
+	u32 reg = chg->control_base + TRISTAR_CHG_INPUT_LIMIT;
+	unsigned int hw, code = chg->code;
+
+	if (regmap_read(chg->regmap, reg, &hw) || hw == code)
+		return;
+	dev_warn_ratelimited(chg->dev, "input limit changed to %u mA by the PMIC; restoring\n",
+			     tristar_code_ma(hw));
+	if (hw > code) {
+		if (tristar_set_code(chg, code))
+			dev_crit(chg->dev, "Input-limit write failed; limit unverified\n");
+		return;
+	}
+	if (tristar_set_code(chg, min_t(unsigned int, code, TRISTAR_CHG_FALLBACK_CODE))) {
+		dev_crit(chg->dev, "Fallback write failed; input limit unverified\n");
+		return;
+	}
+	if (code > TRISTAR_CHG_FALLBACK_CODE) {
+		chg->phase = TRISTAR_RAMPING;
+		chg->step_ns = 0;
+	}
+}
+
 static void tristar_guard(struct tristar_charger *chg, u64 now)
 {
 	struct tristar_pack pack;
@@ -820,6 +851,9 @@ static void tristar_guard(struct tristar_charger *chg, u64 now)
 	if (now - chg->guard_ns < NSEC_PER_SEC)
 		return;
 	chg->guard_ns = now;
+	tristar_check_limit(chg);
+	if (chg->phase != TRISTAR_CHARGING)
+		return;
 	if (tristar_read_pack(&pack))
 		return;
 	if (chg->code > TRISTAR_CHG_FALLBACK_CODE && !tristar_pack_allows_grant(&pack)) {
