@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/sound/apple,s8000-mca.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple S8000 (A9) MCA I2S controller
+title: Apple S8000/T8010 MCA I2S controller
 
 maintainers:
   - Berkay Kösebay <brkosebay@users.noreply.github.com>
@@ -14,14 +14,41 @@ description: |
   window and a 32-bit MCLK control word, which the driver exports as the
   clock feeding the codec's MCLK. Its pads are connected to the outside
   through the i2s-switch, a routing block shared by all MCAs. Samples are
-  moved by SmartIO DMA.
+  moved by SmartIO DMA. T8010 uses the same register layout (version 5),
+  with an AP NCO bitclock for the playback-only digital speaker path.
 
 allOf:
   - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          const: apple,t8010-mca
+    then:
+      properties:
+        dmas:
+          maxItems: 1
+        dma-names:
+          maxItems: 1
+      required:
+        - clocks
+        - clock-names
+    else:
+      properties:
+        clocks: false
+        clock-names: false
 
 properties:
   compatible:
-    const: apple,s8000-mca
+    enum:
+      - apple,s8000-mca
+      - apple,t8010-mca
+
+  clocks:
+    maxItems: 1
+    description: AP NCO channel supplying the T8010 bitclock
+
+  clock-names:
+    const: bitclk
 
   reg:
     items:

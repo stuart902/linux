@@ -47,6 +47,7 @@ properties:
               - apm,xgene-rb
               - apm,xgene-scu
               - apple,s8000-i2s-switch
+              - apple,t8010-i2s-switch
               - atmel,sama5d2-sfrbu
               - atmel,sama5d3-nfc-io
               - atmel,sama5d3-sfrbu
