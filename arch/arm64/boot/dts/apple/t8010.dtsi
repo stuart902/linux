@@ -25,6 +25,16 @@
 		clock-output-names = "clkref";
 	};
 
+	/*
+	 * The NCO's reference, as on t8103: its rate is set per board from the
+	 * board's ADT clock-frequency table, since the true clock tree is unknown.
+	 */
+	nco_clkref: clock-ref-nco {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-output-names = "nco_ref";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -145,6 +155,37 @@
 		#size-cells = <2>;
 		nonposted-mmio;
 		ranges;
+
+		i2s_switch: syscon@20a004000 {
+			compatible = "apple,t8010-i2s-switch", "syscon";
+			reg = <0x2 0x0a004000 0x0 0x1000>;
+			status = "disabled";
+		};
+
+		mca2: mca@20a0a8000 {
+			compatible = "apple,t8010-mca";
+			reg = <0x2 0x0a0a8000 0x0 0x4000>,
+			      <0x2 0x0a002008 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupts = <AIC_IRQ 229 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca2>;
+			clocks = <&nco 2>;
+			clock-names = "bitclk";
+			dmas = <&sio 0x2c>;
+			dma-names = "tx";
+			#clock-cells = <0>;
+			clock-output-names = "mca2-mclk";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		nco: clock-controller@20e044000 {
+			compatible = "apple,t8010-nco";
+			reg = <0x2 0x0e044000 0x0 0x14000>;
+			clocks = <&nco_clkref>;
+			#clock-cells = <1>;
+			status = "disabled";
+		};
 
 		cpufreq: performance-controller@202f20000 {
 			compatible = "apple,t8010-cluster-cpufreq", "apple,t8103-cluster-cpufreq", "apple,cluster-cpufreq";
