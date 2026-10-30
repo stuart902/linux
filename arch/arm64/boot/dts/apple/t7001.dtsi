@@ -29,6 +29,14 @@
 		clock-output-names = "clkref";
 	};
 
+	spi3_clk: clock-spi3 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* ADT clock ID 0x12e: clock-frequencies[46]. */
+		clock-frequency = <60000000>;
+		clock-output-names = "spi3";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -209,6 +217,18 @@
 			pinctrl-0 = <&i2c3_pins>;
 			pinctrl-names = "default";
 			power-domains = <&ps_i2c3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi3: spi@20a08c000 {
+			compatible = "apple,t7000-spi", "apple,spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 155 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi3_clk>;
+			power-domains = <&ps_spi3>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
