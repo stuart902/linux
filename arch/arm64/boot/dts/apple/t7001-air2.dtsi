@@ -10,6 +10,13 @@
 / {
 	chassis-type = "tablet";
 
+	aliases {
+		bluetooth0 = &bluetooth;
+		serial3 = &serial3;
+		touchscreen0 = &touchscreen;
+		wifi0 = &wifi0;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -68,6 +75,20 @@
 
 		/* To be filled by loader */
 	};
+
+	battery_info: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <7340000>;
+	};
+
+	/* Wi-Fi REG_ON is D2207 GPIO 3. */
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&pmu_gpio 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <100000>;
+	};
 };
 
 &serial0 {
@@ -82,6 +103,19 @@
 		reg = <0x3c>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+
+		touch_analog: regulator-touch-analog {
+			compatible = "apple,d2207-touch-analog-regulator";
+			regulator-name = "touch-analog";
+		};
+
+		pmu_gpio: gpio {
+			compatible = "apple,d2207-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only Bluetooth (2) and Wi-Fi (3) REG_ON are used; the other lines stay as iBoot left them. */
+			gpio-reserved-ranges = <0 2>, <4 17>;
+		};
 
 		rtc@5c0 {
 			compatible = "apple,arabela-pmic-rtc", "apple,amber-pmic-rtc";
@@ -109,5 +143,99 @@
 				};
 			};
 		};
+	};
+};
+
+&serial5 {
+	pinctrl-0 = <&uart5_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		battery: fuel-gauge {
+			compatible = "ti,bq27545-hdq";
+			monitored-battery = <&battery_info>;
+		};
+	};
+};
+
+&pcie_dart1 {
+	status = "okay";
+};
+
+&pcie {
+	iommu-map = <0x100 &pcie_dart1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	status = "okay";
+
+	pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		reset-gpios = <&pinctrl 179 GPIO_ACTIVE_LOW>;
+		max-link-speed = <1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,43a3";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl 165 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+		};
+	};
+};
+
+/*
+ * The N1 touchscreen, from the ADT spi3/multi-touch functions: chip select
+ * GPIO 51, reset GPIO 82, interrupt GPIO 84, LDO enable GPIO 95, analog
+ * supply pmuL(0x20e) and the PMGR touch clock at 32768 Hz. Its display
+ * sync (GPIO 55) stays an input, as in iOS.
+ */
+&spi3 {
+	cs-gpios = <&pinctrl 51 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j81-touchscreen";
+		reg = <0>;
+		/* N1 selects 83 ns; the controller rounds up to divider 5 */
+		spi-max-frequency = <12048192>;
+		interrupts-extended = <&pinctrl 84 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pinctrl 82 GPIO_ACTIVE_LOW>;
+		power-ldo-gpios = <&pinctrl 95 GPIO_ACTIVE_HIGH>;
+		ana-supply = <&touch_analog>;
+		clocks = <&touchclk>;
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+		/* As the iPad 5's C1F15 sensor; unconfirmed on the Air 2 */
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
+
+/*
+ * The BCM4350C2's Bluetooth on UART3, from the ADT uart3/bluetooth node:
+ * 3 Mbit/s, power enable on D2207 GPIO 2, BT_WAKE on GPIO 164. m1n1 adds
+ * the device address.
+ */
+&serial3 {
+	pinctrl-0 = <&uart3_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,j81-bcm4350c2-bt";
+		current-speed = <115200>;
+		max-speed = <3000000>;
+		shutdown-gpios = <&pmu_gpio 2 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
 	};
 };

@@ -29,6 +29,14 @@
 		clock-output-names = "clkref";
 	};
 
+	spi3_clk: clock-spi3 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* ADT clock ID 0x12e: clock-frequencies[46]. */
+		clock-frequency = <60000000>;
+		clock-output-names = "spi3";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -146,6 +154,30 @@
 			status = "disabled";
 		};
 
+		serial3: serial@20a0cc000 {
+			compatible = "apple,t7000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0cc000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 161 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart3>;
+			status = "disabled";
+		};
+
+		serial5: serial@20a0d4000 {
+			compatible = "apple,t7000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0d4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 163 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart5>;
+			status = "disabled";
+		};
+
 		i2c0: i2c@20a110000 {
 			compatible = "apple,t7000-i2c", "apple,i2c";
 			reg = <0x2 0x0a110000 0x0 0x1000>;
@@ -197,6 +229,18 @@
 			pinctrl-0 = <&i2c3_pins>;
 			pinctrl-names = "default";
 			power-domains = <&ps_i2c3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi3: spi@20a08c000 {
+			compatible = "apple,t7000-spi", "apple,spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 155 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi3_clk>;
+			power-domains = <&ps_spi3>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
@@ -329,6 +373,64 @@
 				pinmux = <APPLE_PINMUX(135, 1)>,
 					 <APPLE_PINMUX(134, 1)>;
 			};
+
+			uart3_pins: uart3-pins {
+				pinmux = <APPLE_PINMUX(14, 1)>,
+					 <APPLE_PINMUX(15, 1)>,
+					 <APPLE_PINMUX(32, 1)>,
+					 <APPLE_PINMUX(33, 1)>;
+			};
+
+			uart5_pins: uart5-pins {
+				pinmux = <APPLE_PINMUX(34, 1)>;
+			};
+		};
+
+		/*
+		 * The ADT gives this DART 2 MiB, which covers the PCIe port 1
+		 * window at 0x602004000; its registers end below 0x100.
+		 */
+		pcie_dart1: iommu@602002000 {
+			compatible = "apple,t7000-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x02002000 0x0 0x2000>;
+			#iommu-cells = <5>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			/* ADT dart-apcie1: error-reflector, fetch-config, diag-config */
+			apple,error-reflector = /bits/ 64 <0x20ffff000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
+			status = "disabled";
+		};
+
+		pcie: pcie@610000000 {
+			compatible = "apple,t7000-pcie";
+			device_type = "pci";
+			reg = <0x6 0x10000000 0x0 0x1000000>,
+			      <0x6 0x00000000 0x0 0x2000>,
+			      <0x6 0x01004000 0x0 0x1000>,
+			      <0x6 0x02004000 0x0 0x1000>,
+			      <0x6 0x03004000 0x0 0x1000>,
+			      <0x6 0x04004000 0x0 0x1000>;
+			reg-names = "config", "rc", "port0", "port1", "port2", "port3";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 212 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 215 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 218 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 221 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "port0", "port1", "port2", "port3";
+			msi-controller;
+			msi-parent = <&pcie>;
+			msi-ranges = <&aic AIC_IRQ 224 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-doorbell = <0xbffff000>;
+			bus-range = <0 4>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x6 0x20000000 0x6 0x20000000 0x1 0xa0000000>,
+				 <0x02000000 0x0 0xc0000000 0x7 0xc0000000 0x0 0x40000000>;
+			power-domains = <&ps_pcie>, <&ps_pcie_ref>, <&ps_pcie_aux>;
+			status = "disabled";
 		};
 	};
 

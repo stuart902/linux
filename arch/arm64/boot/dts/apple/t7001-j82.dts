@@ -12,3 +12,11 @@
 	compatible = "apple,j82", "apple,t7001", "apple,arm-platform";
 	model = "Apple iPad Air 2 (Cellular)";
 };
+
+&wifi0 {
+	brcm,board-type = "apple,rieslingb";
+};
+
+&touchscreen {
+	firmware-name = "apple/j82-fwstart.z2fw";
+};
