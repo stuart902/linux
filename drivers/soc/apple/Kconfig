@@ -38,6 +38,18 @@ config APPLE_RTKIT
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_AOP_T8010
+	tristate "Apple T8010 Always-On Processor"
+	depends on APPLE_RTKIT
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  The Always-On Processor (AOP) of the Apple A10 runs the firmware for
+	  the motion sensors and the always-on microphones. This driver loads
+	  and starts that firmware and provides its services to the sensor
+	  drivers.
+
+	  Say 'y' or 'm' here if you have an A10-based iPad or iPhone.
+
 config APPLE_PMP_T8015_V1
 	tristate "Apple T8015 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST
