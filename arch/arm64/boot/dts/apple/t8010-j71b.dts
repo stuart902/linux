@@ -43,6 +43,15 @@
 	brcm,board-type = "apple,j71b";
 };
 
+&aop {
+	firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
 &touchscreen {
 	firmware-name = "apple/j71b-fwstart.z2fw";
 };
