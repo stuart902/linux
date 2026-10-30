@@ -19,6 +19,7 @@ properties:
       - apple,j493-touchbar
       - apple,j71b-touchscreen
       - apple,j71t-touchscreen
+      - apple,j81-touchscreen
       - apple,j172-touchscreen
       - apple,d11-touchscreen
       - apple,d111-touchscreen
@@ -179,7 +180,9 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,j71t-touchscreen
+          enum:
+            - apple,j71t-touchscreen
+            - apple,j81-touchscreen
     then:
       properties:
         pinctrl-names:
@@ -199,13 +202,19 @@ allOf:
         - clocks
         - ana-supply
         - power-ldo-gpios
-        - pinctrl-0
-        - pinctrl-1
-        - pinctrl-names
     else:
       properties:
         ana-supply: false
         attn-gpios: false
+  - if:
+      properties:
+        compatible:
+          const: apple,j71t-touchscreen
+    then:
+      required:
+        - pinctrl-0
+        - pinctrl-1
+        - pinctrl-names
   - if:
       properties:
         compatible:
