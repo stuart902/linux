@@ -11,6 +11,7 @@
 	chassis-type = "tablet";
 
 	aliases {
+		touchscreen0 = &touchscreen;
 		wifi0 = &wifi0;
 	};
 
@@ -101,6 +102,11 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 
+		touch_analog: regulator-touch-analog {
+			compatible = "apple,d2207-touch-analog-regulator";
+			regulator-name = "touch-analog";
+		};
+
 		pmu_gpio: gpio {
 			compatible = "apple,d2207-pmic-gpio";
 			gpio-controller;
@@ -179,4 +185,35 @@
 			vdd-supply = <&wlan_vdd>;
 		};
 	};
+};
+
+/*
+ * The N1 touchscreen, from the ADT spi3/multi-touch functions: chip select
+ * GPIO 51, reset GPIO 82, interrupt GPIO 84, LDO enable GPIO 95, analog
+ * supply pmuL(0x20e) and the PMGR touch clock at 32768 Hz. Its display
+ * sync (GPIO 55) stays an input, as in iOS.
+ */
+&spi3 {
+	cs-gpios = <&pinctrl 51 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j81-touchscreen";
+		reg = <0>;
+		/* N1 selects 83 ns; the controller rounds up to divider 5 */
+		spi-max-frequency = <12048192>;
+		interrupts-extended = <&pinctrl 84 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pinctrl 82 GPIO_ACTIVE_LOW>;
+		power-ldo-gpios = <&pinctrl 95 GPIO_ACTIVE_HIGH>;
+		ana-supply = <&touch_analog>;
+		clocks = <&touchclk>;
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+		/* As the iPad 5's C1F15 sensor; unconfirmed on the Air 2 */
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
 };

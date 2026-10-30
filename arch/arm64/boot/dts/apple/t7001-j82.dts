@@ -16,3 +16,7 @@
 &wifi0 {
 	brcm,board-type = "apple,rieslingb";
 };
+
+&touchscreen {
+	firmware-name = "apple/j82-fwstart.z2fw";
+};

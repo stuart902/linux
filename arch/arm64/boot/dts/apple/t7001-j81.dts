@@ -16,3 +16,7 @@
 &wifi0 {
 	brcm,board-type = "apple,rieslinga";
 };
+
+&touchscreen {
+	firmware-name = "apple/j81-fwstart.z2fw";
+};
