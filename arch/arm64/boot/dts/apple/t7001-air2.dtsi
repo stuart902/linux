@@ -11,6 +11,8 @@
 	chassis-type = "tablet";
 
 	aliases {
+		bluetooth0 = &bluetooth;
+		serial3 = &serial3;
 		touchscreen0 = &touchscreen;
 		wifi0 = &wifi0;
 	};
@@ -111,8 +113,8 @@
 			compatible = "apple,d2207-pmic-gpio";
 			gpio-controller;
 			#gpio-cells = <2>;
-			/* Only Wi-Fi REG_ON (3) is used; the other lines stay as iBoot left them. */
-			gpio-reserved-ranges = <0 3>, <4 17>;
+			/* Only Bluetooth (2) and Wi-Fi (3) REG_ON are used; the other lines stay as iBoot left them. */
+			gpio-reserved-ranges = <0 2>, <4 17>;
 		};
 
 		rtc@5c0 {
@@ -216,4 +218,24 @@
 
 &touchclk {
 	status = "okay";
+};
+
+/*
+ * The BCM4350C2's Bluetooth on UART3, from the ADT uart3/bluetooth node:
+ * 3 Mbit/s, power enable on D2207 GPIO 2, BT_WAKE on GPIO 164. m1n1 adds
+ * the device address.
+ */
+&serial3 {
+	pinctrl-0 = <&uart3_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,j81-bcm4350c2-bt";
+		current-speed = <115200>;
+		max-speed = <3000000>;
+		shutdown-gpios = <&pmu_gpio 2 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
+	};
 };
