@@ -20,6 +20,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -46,6 +47,7 @@
 #define  MCA_RESET_RX		BIT(1)
 #define MCA_FRAME		0x10
 #define  MCA_FRAME_MASTER	BIT(0)
+#define  MCA_FRAME_PROVIDER_PHASE	BIT(2)
 #define  MCA_FRAME_RUN		BIT(1)
 #define  MCA_FRAME_FMT		BIT(3)	/* set unless format flag bit 1 */
 #define  MCA_FRAME_DUTY		BIT(6)
@@ -129,6 +131,8 @@
 #define MCA_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE)
 
 struct s8000_mca_hw {
+	u32 version;
+	bool clock_provider;
 	/* AppleAE2MCA _getMCLKClkCon: nclk / 2 (0x18) | output enable (0x40) */
 	u32 mclk_ctl;
 	unsigned long mclk_rate;
@@ -150,6 +154,8 @@ struct s8000_mca {
 	void __iomem *base;
 	void __iomem *mclk_reg;
 	struct clk_hw mclk_hw;
+	struct clk *bitclk;
+	bool bitclk_enabled;
 
 	struct regmap *sw;	/* i2s-switch, NULL if not routed */
 	u32 sw_aud;
@@ -240,13 +246,17 @@ static void mca_route(struct s8000_mca *mca, bool on)
 		return;
 
 	if (on) {
-		pin = FIELD_PREP(I2S_SW_CLK_SRC, I2S_SW_CODE_NONE) |
+		pin = FIELD_PREP(I2S_SW_CLK_SRC, mca->hw->clock_provider ?
+				 I2S_SW_CODE_AUD(mca->sw_aud) : I2S_SW_CODE_NONE) |
 		      FIELD_PREP(I2S_SW_DATA_SRC0, I2S_SW_CODE_AUD(mca->sw_aud)) |
 		      FIELD_PREP(I2S_SW_DATA_SRC1, I2S_SW_CODE_AUD(mca->sw_aud));
-		aud = FIELD_PREP(I2S_SW_CLK_SRC, I2S_SW_CODE_PIN(mca->sw_pin)) |
+		aud = FIELD_PREP(I2S_SW_CLK_SRC, mca->hw->clock_provider ?
+				 I2S_SW_CODE_NONE : I2S_SW_CODE_PIN(mca->sw_pin)) |
 		      FIELD_PREP(I2S_SW_DATA_SRC0, I2S_SW_CODE_PIN(mca->sw_pin)) |
 		      FIELD_PREP(I2S_SW_DATA_SRC1, I2S_SW_CODE_PIN(mca->sw_pin));
 		oe = I2S_SW_PIN_OE_DATA;
+		if (mca->hw->clock_provider)
+			oe |= I2S_SW_PIN_OE_CLK;
 	}
 
 	regmap_write(mca->sw, I2S_SW_PIN(mca->sw_pin), pin);
@@ -256,8 +266,12 @@ static void mca_route(struct s8000_mca *mca, bool on)
 
 static int mca_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 {
-	/* iOS runs MCA0 as the clock consumer of the CS42L81. */
-	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_BC_FC)
+	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+	unsigned int provider = mca->hw->clock_provider ? SND_SOC_DAIFMT_BP_FP :
+						       SND_SOC_DAIFMT_BC_FC;
+
+	/* S8000 consumes codec clocks; T8010 drives the digital speaker amps. */
+	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != provider)
 		return -EINVAL;
 	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
 		return -EINVAL;
@@ -299,6 +313,9 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 
 	if (channels != 2)
 		return -EINVAL;
+	/* Qualify one clock family first; no unverified v5 capture or TDM. */
+	if (mca->hw->clock_provider && params_rate(params) != 48000)
+		return -EINVAL;
 
 	switch (slot) {
 	case 16:
@@ -328,6 +345,18 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 		     FIELD_PREP(MCA_FRAME_SLOTS, slots - 1) |
 		     FIELD_PREP(MCA_FRAME_MCLK_DIV, 0) |
 		     MCA_FRAME_DUTY | MCA_FRAME_FMT;
+
+	if (mca->hw->clock_provider) {
+		unsigned long bitclk = params_rate(params) * frame_bits;
+		int ret;
+
+		ret = clk_set_rate(mca->bitclk, bitclk);
+		if (ret)
+			return ret;
+		if (clk_get_rate(mca->bitclk) != bitclk)
+			return -EINVAL;
+		mca->frame |= MCA_FRAME_MASTER | MCA_FRAME_PROVIDER_PHASE;
+	}
 
 	dma->addr_width = slot == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
 				       DMA_SLAVE_BUSWIDTH_4_BYTES;
@@ -436,9 +465,20 @@ static int mca_prepare(struct snd_pcm_substream *substream,
 	first = !(mca->prep_mask & ~BIT(dir));
 	spin_unlock_irqrestore(&mca->hw_lock, flags);
 
+	if (first && mca->bitclk && !mca->bitclk_enabled) {
+		ret = clk_prepare_enable(mca->bitclk);
+		if (ret)
+			return ret;
+		mca->bitclk_enabled = true;
+	}
 	ret = first ? mca_init_block(mca) : mca_init_dir(mca, tx);
-	if (ret)
+	if (ret) {
+		if (first && mca->bitclk_enabled) {
+			clk_disable_unprepare(mca->bitclk);
+			mca->bitclk_enabled = false;
+		}
 		return ret;
+	}
 
 	spin_lock_irqsave(&mca->hw_lock, flags);
 	mca->prep_mask |= BIT(dir);
@@ -479,8 +519,13 @@ static int mca_hw_free(struct snd_pcm_substream *substream,
 	mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
 	spin_unlock_irqrestore(&mca->hw_lock, flags);
 
-	if (last)
+	if (last) {
 		mca_route(mca, false);
+		if (mca->bitclk_enabled) {
+			clk_disable_unprepare(mca->bitclk);
+			mca->bitclk_enabled = false;
+		}
+	}
 	return 0;
 }
 
@@ -776,6 +821,13 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	if (IS_ERR(mca->mclk_reg))
 		return PTR_ERR(mca->mclk_reg);
 
+	if (mca->hw->clock_provider) {
+		mca->bitclk = devm_clk_get(dev, "bitclk");
+		if (IS_ERR(mca->bitclk))
+			return dev_err_probe(dev, PTR_ERR(mca->bitclk),
+					     "failed to get AP NCO bitclock\n");
+	}
+
 	ret = s8000_mca_get_route(mca);
 	if (ret)
 		return ret;
@@ -801,7 +853,7 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	pm_runtime_put(dev);
 
 	mca->fifo_tx = FIELD_GET(MCA_FIFO_SIZE_TX, fifo);
-	if (ver != 4 || mca->fifo_tx < 8)
+	if (ver != mca->hw->version || mca->fifo_tx < 8)
 		dev_warn(dev, "unexpected MCA version %u, TX FIFO %u\n", ver,
 			 mca->fifo_tx);
 	if (mca->fifo_tx < 8)
@@ -825,6 +877,8 @@ static int s8000_mca_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "failed to add MCLK provider\n");
 
 	mca->dai_drv = mca_dai;
+	if (mca->hw->clock_provider)
+		mca->dai_drv.playback.rates = SNDRV_PCM_RATE_48000;
 	if (!mca->capture)
 		memset(&mca->dai_drv.capture, 0, sizeof(mca->dai_drv.capture));
 
@@ -842,6 +896,7 @@ static int s8000_mca_probe(struct platform_device *pdev)
 
 /* MCA0 on S8000/S8003, from iOS 16.7.10 AppleAE2MCA and the J71t ADT */
 static const struct s8000_mca_hw s8000_mca_hw = {
+	.version = 4,
 	.mclk_ctl = 0x58,
 	.mclk_rate = 12000000,
 	.sio_xfer16 = 0x21,
@@ -851,8 +906,20 @@ static const struct s8000_mca_hw s8000_mca_hw = {
 	.sio_trigger = 0x180,
 };
 
+/* J71b MCA2 TX: iPadOS 17.7.11 dma-channels, not the A9 MCA0 shim. */
+static const struct s8000_mca_hw t8010_mca_hw = {
+	.version = 5,
+	.clock_provider = true,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
+	.sio_fifo = 0x180,
+	.sio_trigger = 0xcc,
+};
+
 static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
+	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s8000_mca_of_match);

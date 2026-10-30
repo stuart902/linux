@@ -10,18 +10,19 @@ config SND_SOC_APPLE_MCA
 	  on Apple Silicon SoCs.
 
 config SND_SOC_APPLE_S8000_MCA
-	tristate "Apple S8000 (A9) MCA driver"
+	tristate "Apple S8000/T8010 MCA driver"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on COMMON_CLK
 	select MFD_SYSCON
 	select SND_SOC_GENERIC_DMAENGINE_PCM
 	help
 	  This option enables an ASoC CPU DAI driver for the "mca-version 4"
-	  I2S serializer of the Apple A9 (S8000/S8003). The driver also
+	  I2S serializer of the Apple A9 (S8000/S8003), and the version 5
+	  serializer of the A10 (T8010). The driver also
 	  exports the MCA's MCLK output as a clock for the codec and routes
 	  the MCA to its pad in the shared i2s-switch. Samples are moved by
 	  SmartIO DMA, so APPLE_SIO_DMA is needed for audio.
 
-	  Say Y or M here if you have an Apple A9 device such as the iPad 5.
+	  Say Y or M here if you have an Apple A9 device such as the iPad 5 or iPad 6.
 
 endmenu
