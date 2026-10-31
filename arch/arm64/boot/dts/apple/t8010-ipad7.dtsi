@@ -13,6 +13,12 @@
  */
 #include "t8010-ipad6.dtsi"
 
+/ {
+	aliases {
+		als0 = &als;
+	};
+};
+
 /* The iPad 7 port controller is Bellatrix, with its own charger policy. */
 /delete-node/ &tristar_charger;
 /delete-node/ &tristar;
@@ -87,7 +93,8 @@
 &i2c2 {
 	status = "okay";
 
-	light-sensor@39 {
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als: light-sensor@39 {
 		compatible = "apple,ct819", "amstaos,tsl2581";
 		reg = <0x39>;
 		interrupts-extended = <&pinctrl_ap 27 IRQ_TYPE_LEVEL_LOW>;
