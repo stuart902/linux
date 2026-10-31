@@ -24,6 +24,7 @@ obj-$(CONFIG_ADXL372_SPI) += adxl372_spi.o
 obj-$(CONFIG_ADXL380) += adxl380.o
 obj-$(CONFIG_ADXL380_I2C) += adxl380_i2c.o
 obj-$(CONFIG_ADXL380_SPI) += adxl380_spi.o
+obj-$(CONFIG_APPLE_AOP_ACCEL) += apple_aop_accel.o
 obj-$(CONFIG_BMA180) += bma180.o
 obj-$(CONFIG_BMA220) += bma220_core.o
 obj-$(CONFIG_BMA220_I2C) += bma220_i2c.o
