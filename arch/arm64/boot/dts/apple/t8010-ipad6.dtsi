@@ -73,6 +73,10 @@
 	power-domains = <&ps_disp0_fe &ps_disp0_be &ps_dp>;
 };
 
+&disp0 {
+	status = "okay";
+};
+
 &hurricane_opp09 {
 	status = "okay";
 };

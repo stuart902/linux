@@ -494,6 +494,28 @@
 			};
 		};
 
+		/*
+		 * iBoot leaves the eDP link, the panel and the pipe running; the
+		 * driver adopts that mode. The display DART (dart-disp0) is only
+		 * read, to check that the scanout bypasses translation.
+		 */
+		disp0: display-controller@206200000 {
+			compatible = "apple,t8010-display-pipe", "apple,s8000-display-pipe";
+			reg = <0x2 0x06200000 0x0 0x9000>,
+			      <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "adp", "dart0", "dart1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 154 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 158 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 159 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 160 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 161 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 155 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_disp0_fe>, <&ps_disp0_be>, <&ps_dp>;
+			status = "disabled";
+		};
+
 		pmgr: power-management@20e000000 {
 			compatible = "apple,t8010-pmgr", "apple,pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
