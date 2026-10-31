@@ -9,7 +9,7 @@ title: Apple A9 display pipe (disp0)
 maintainers:
   - Berkay Kösebay <brkosebay@users.noreply.github.com>
 
-description:
+description: |
   The display subsystem of the Apple A9 SoCs (S8000/S8003), called "disp0"
   with the compatible "adbe0,s8000" in the Apple device tree. It contains
   the ADP/ADBE display pipe that scans out to the internal eDP panel. The
