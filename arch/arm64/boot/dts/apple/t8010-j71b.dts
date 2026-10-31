@@ -52,6 +52,17 @@
 	status = "okay";
 };
 
+/*
+ * The AOP reports the accelerometer in the device frame with y up when the
+ * iPad is upright; desktops (iio-sensor-proxy) take upright as y down and
+ * left/right accordingly, with z unchanged.
+ */
+&aop_accel {
+	mount-matrix = "-1", "0", "0",
+		       "0", "-1", "0",
+		       "0", "0", "1";
+};
+
 &touchscreen {
 	firmware-name = "apple/j71b-fwstart.z2fw";
 };
