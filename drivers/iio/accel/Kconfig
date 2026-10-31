@@ -206,6 +206,18 @@ config ADXL380_I2C
 	  To compile this driver as a module, choose M here: the
 	  module will be called adxl380_i2c.
 
+config APPLE_AOP_ACCEL
+	tristate "Apple AOP accelerometer"
+	depends on APPLE_AOP_T8010
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Say yes here to get support for the accelerometer that the Always-On
+	  Processor (AOP) of Apple A10 iPads and iPhones serves.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called apple_aop_accel.
+
 config BMA180
 	tristate "Bosch BMA023/BMA1x0/BMA250 3-Axis Accelerometer Driver"
 	depends on I2C && INPUT_BMA150=n
