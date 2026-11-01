@@ -564,6 +564,12 @@
 			reg = <0x2 0xe000000 0 0x8c000>;
 		};
 
+		pmgr_misc: power-management@20e068000 {
+			compatible = "apple,t8010-pmgr-misc";
+			reg = <0x2 0x0e068000 0x0 0x4>;
+			reg-names = "soc-ps";
+		};
+
 		aic: interrupt-controller@20e100000 {
 			compatible = "apple,t8010-aic", "apple,aic";
 			reg = <0x2 0x0e100000 0x0 0x100000>;
