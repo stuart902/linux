@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t8010-aop.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8010 Always-On Processor
+
+maintainers:
+  - Dalton Alexandre <alley.nightly_0b@icloud.com>
+
+description:
+  The Always-On Processor (AOP) of the A10 is an ARMv7 coprocessor that
+  runs RTKit firmware and serves the motion sensors (accelerometer,
+  gyroscope, compass, pressure) and the always-on microphones. It runs from
+  local SRAM, with a further firmware segment in system memory, and talks
+  to the application processor through an A7 IOP mailbox. Its firmware is
+  board-specific and is loaded by the operating system.
+
+properties:
+  compatible:
+    const: apple,t8010-aop
+
+  reg:
+    items:
+      - description: AKF coprocessor control registers
+      - description: Always-on boot control registers
+      - description: Local SRAM
+
+  reg-names:
+    items:
+      - const: akf
+      - const: control
+      - const: sram
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    const: mbox
+
+  firmware-name:
+    items:
+      - description: Main image, loaded into the local SRAM
+      - description: External segment, loaded into system memory
+
+  apple,ecid:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      The chip's unique ID (ECID), filled in by the bootloader. The
+      firmware's boot arguments carry it.
+
+patternProperties:
+  "^(accel|gyro|compass|pressure)$":
+    type: object
+    description:
+      A sensor served by the AOP firmware, named like the firmware's service.
+    properties:
+      compatible:
+        enum:
+          - apple,t8010-aop-accel
+          - apple,t8010-aop-gyro
+          - apple,t8010-aop-compass
+          - apple,t8010-aop-pressure
+
+      mount-matrix:
+        description: The sensor's mounting rotation in the device.
+    required:
+      - compatible
+    additionalProperties: false
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - mbox-names
+  - firmware-name
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        aop@210800000 {
+            compatible = "apple,t8010-aop";
+            reg = <0x2 0x10800000 0x0 0x4000>,
+                  <0x2 0x10000500 0x0 0x100>,
+                  <0x2 0x10e00000 0x0 0xa0000>;
+            reg-names = "akf", "control", "sram";
+            mboxes = <&aop_mbox>;
+            mbox-names = "mbox";
+            firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
+
+            accel {
+                compatible = "apple,t8010-aop-accel";
+            };
+        };
+    };

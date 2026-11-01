@@ -2064,6 +2064,13 @@ L:	linux-hwmon@vger.kernel.org
 S:	Odd fixes
 F:	drivers/hwmon/applesmc.c
 
+APPLE T8010 ALWAYS-ON PROCESSOR
+M:	Dalton Alexandre <alley.nightly_0b@icloud.com>
+S:	Maintained
+F:	Documentation/devicetree/bindings/soc/apple/apple,t8010-aop.yaml
+F:	drivers/soc/apple/aop.c
+F:	include/linux/soc/apple/aop.h
+
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
 S:	Obsolete

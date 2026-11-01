@@ -24,7 +24,7 @@ config APPLE_PMGR_MISC
 	  controls for SoC devices. This driver manages miscellaneous
 	  power controls.
 
-	  Say 'y' here if you have a Pro/Max/Ultra Apple SoC.
+	  Say 'y' here if you have a Pro/Max/Ultra Apple SoC or an A10.
 
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
@@ -38,6 +38,18 @@ config APPLE_RTKIT
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_AOP_T8010
+	tristate "Apple T8010 Always-On Processor"
+	depends on APPLE_RTKIT
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  The Always-On Processor (AOP) of the Apple A10 runs the firmware for
+	  the motion sensors and the always-on microphones. This driver loads
+	  and starts that firmware and provides its services to the sensor
+	  drivers.
+
+	  Say 'y' or 'm' here if you have an A10-based iPad or iPhone.
+
 config APPLE_PMP_T8015_V1
 	tristate "Apple T8015 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -49,17 +61,17 @@ config APPLE_PMP_T8015_V1
 	  Say 'y' here if you have an Apple A11 SoC.
 
 config APPLE_SIO
-	tristate "Apple T8010 SmartIO coprocessor"
+	tristate "Apple S8000/T8010 SmartIO coprocessor"
 	depends on ARM64
 	depends on PM
 	depends on ARCH_APPLE || COMPILE_TEST
 	help
-	  Support the SmartIO coprocessor found on Apple T8010 SoCs. SmartIO
-	  boots dedicated firmware and exchanges endpoint messages with the
-	  application processor. It provides DMA services to peripheral
-	  controllers such as SPI.
+	  Support the SmartIO coprocessor found on Apple S8000/S8003 and T8010
+	  SoCs. SmartIO boots dedicated firmware and exchanges endpoint
+	  messages with the application processor. It provides DMA services
+	  to peripheral controllers such as SPI and MCA.
 
-	  Say Y here if you have an Apple T8010 SoC.
+	  Say Y here if you have an Apple S8000/S8003 or T8010 SoC.
 
 config APPLE_T8010_WLAN
 	tristate "Apple T8010 WLAN platform control"

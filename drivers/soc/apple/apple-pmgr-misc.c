@@ -9,20 +9,37 @@
 #include <linux/bitops.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 
 #define APPLE_CLKGEN_PSTATE 0
 #define APPLE_CLKGEN_PSTATE_DESIRED GENMASK(3, 0)
+#define APPLE_CLKGEN_PSTATE_PENDING BIT(31)
 
 #define DCS_DEV_PSTATE_MIN_T600X 7
 #define SYS_DEV_PSTATE_SUSPEND 1
 
+/*
+ * T8010 SoC/memory states (iOS's PMGR driver: a table indexed by the SoC
+ * and the memory state, each low or high): both low, as the system boots,
+ * and both high
+ */
+#define T8010_SOC_PSTATE_LOW 0xd
+#define T8010_SOC_PSTATE_HIGH 0xc
+
 enum sys_device {
 	DEV_FABRIC,
 	DEV_DCS,
+	DEV_SOC,
 	DEV_MAX,
+};
+
+static const char *const sys_device_names[DEV_MAX] = {
+	[DEV_FABRIC] = "fabric",
+	[DEV_DCS] = "dcs",
+	[DEV_SOC] = "soc",
 };
 
 struct apple_pmgr_sys_device {
@@ -32,11 +49,15 @@ struct apple_pmgr_sys_device {
 };
 
 struct apple_pmgr_misc_hw {
+	unsigned long devices;		/* BIT(enum sys_device) */
 	u32 dev_min_ps[DEV_MAX];
+	u32 dev_active_ps[DEV_MAX];	/* 0: keep the state the system booted with */
+	bool wait_pending;		/* wait for a state change to complete */
 };
 
 struct apple_pmgr_misc {
 	struct device *dev;
+	const struct apple_pmgr_misc_hw *hw;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
 };
 
@@ -59,6 +80,12 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 	val = readl_relaxed(misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
 	FIELD_MODIFY(APPLE_CLKGEN_PSTATE_DESIRED, &val, pstate);
 	writel_relaxed(val, misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
+
+	if (misc->hw->wait_pending &&
+	    readl_relaxed_poll_timeout_atomic(misc->devices[dev].base + APPLE_CLKGEN_PSTATE, val,
+					      !(val & APPLE_CLKGEN_PSTATE_PENDING), 1, 1000))
+		dev_warn(misc->dev, "%s state change to %u did not complete\n",
+			 sys_device_names[dev], pstate);
 }
 
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
@@ -85,9 +112,9 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 
 static int apple_pmgr_init_device(struct apple_pmgr_misc *misc,
 				  const struct apple_pmgr_misc_hw *hw,
-				  enum sys_device dev,
-				  const char *device_name)
+				  enum sys_device dev)
 {
+	const char *device_name = sys_device_names[dev];
 	void __iomem *base;
 	char name[32];
 	u32 val;
@@ -106,6 +133,11 @@ static int apple_pmgr_init_device(struct apple_pmgr_misc *misc,
 		FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED, val);
 	misc->devices[dev].suspend_state = hw->dev_min_ps[dev];
 
+	if (hw->dev_active_ps[dev]) {
+		misc->devices[dev].active_state = hw->dev_active_ps[dev];
+		apple_pmgr_sys_dev_set_pstate(misc, dev, true);
+	}
+
 	return 0;
 }
 
@@ -114,6 +146,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	const struct apple_pmgr_misc_hw *hw;
 	struct apple_pmgr_misc *misc;
+	unsigned int i;
 	int ret;
 
 	misc = devm_kzalloc(dev, sizeof(*misc), GFP_KERNEL);
@@ -124,14 +157,13 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	hw = of_device_get_match_data(dev);
 	if (!hw)
 		return -EINVAL;
+	misc->hw = hw;
 
-	ret = apple_pmgr_init_device(misc, hw, DEV_FABRIC, "fabric");
-	if (ret)
-		return ret;
-
-	ret = apple_pmgr_init_device(misc, hw, DEV_DCS, "dcs");
-	if (ret)
-		return ret;
+	for_each_set_bit(i, &hw->devices, DEV_MAX) {
+		ret = apple_pmgr_init_device(misc, hw, i);
+		if (ret)
+			return ret;
+	}
 
 	platform_set_drvdata(pdev, misc);
 
@@ -139,6 +171,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 }
 
 static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t600x = {
+	.devices = BIT(DEV_FABRIC) | BIT(DEV_DCS),
 	.dev_min_ps = {
 		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
 		[DEV_DCS] = DCS_DEV_PSTATE_MIN_T600X,
@@ -146,15 +179,28 @@ static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t600x = {
 };
 
 static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t602x = {
+	.devices = BIT(DEV_FABRIC) | BIT(DEV_DCS),
 	.dev_min_ps = {
 		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
 		[DEV_DCS] = SYS_DEV_PSTATE_SUSPEND,
 	},
 };
 
+/*
+ * The T8010 boots with SoC and memory in their low states (memory at 396
+ * of 792 MHz, half the bandwidth): run both high while active
+ */
+static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t8010 = {
+	.devices = BIT(DEV_SOC),
+	.dev_min_ps = { [DEV_SOC] = T8010_SOC_PSTATE_LOW },
+	.dev_active_ps = { [DEV_SOC] = T8010_SOC_PSTATE_HIGH },
+	.wait_pending = true,
+};
+
 static const struct of_device_id apple_pmgr_misc_of_match[] = {
 	{ .compatible = "apple,t6000-pmgr-misc", .data = &apple_pmgr_misc_hw_t600x },
 	{ .compatible = "apple,t6020-pmgr-misc", .data = &apple_pmgr_misc_hw_t602x },
+	{ .compatible = "apple,t8010-pmgr-misc", .data = &apple_pmgr_misc_hw_t8010 },
 	{}
 };
 
