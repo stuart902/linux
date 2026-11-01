@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,s8000-display-pipe.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple A9 and A10 display pipe (disp0)
+
+maintainers:
+  - Berkay Kösebay <brkosebay@users.noreply.github.com>
+
+description: |
+  The display subsystem of the Apple A9 SoCs (S8000/S8003), called "disp0"
+  with the compatible "adbe0,s8000" in the Apple device tree, and of the A10
+  (T8010, "disp0,t8010"), whose pipe has the same ADP control, parameter
+  FIFO and layer registers in its first window. It contains
+  the ADP/ADBE display pipe that scans out to the internal eDP panel. The
+  bootloader leaves the pipe, the eDP link and the panel running; the pipe
+  reads memory through the display DART (dart-disp0), which the bootloader
+  leaves in bypass (on the A10, the scanout's streams have no page tables).
+  The DART has no node of its own: it must not be reset under the running
+  scanout, so its two register windows are listed here and only read, to
+  check that the scanout bypasses translation.
+
+properties:
+  compatible:
+    oneOf:
+      - const: apple,s8000-display-pipe
+      - items:
+          - const: apple,t8010-display-pipe
+          - const: apple,s8000-display-pipe
+
+  reg:
+    minItems: 3
+    maxItems: 8
+
+  reg-names:
+    minItems: 3
+    maxItems: 8
+
+  interrupts:
+    minItems: 5
+    maxItems: 6
+
+  power-domains:
+    minItems: 2
+    maxItems: 3
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8010-display-pipe
+    then:
+      properties:
+        reg:
+          items:
+            - description:
+                ADP window, with the control and interrupt registers, the
+                parameter FIFO port and the pipe layer registers
+            - description: Display DART (dart-disp0), first window
+            - description: Display DART (dart-disp0), second window
+        reg-names:
+          items:
+            - const: adp
+            - const: dart0
+            - const: dart1
+        interrupts:
+          items:
+            - description:
+                Pipe interrupt; carries vblank, parameter packet completion
+                and pipe errors
+            - description: Second display interrupt
+            - description: Third display interrupt
+            - description: Fourth display interrupt
+            - description: Fifth display interrupt
+            - description: Sixth display interrupt
+        power-domains:
+          items:
+            - description: Display pipe front end (disp0_fe)
+            - description: Display pipe back end (disp0_be)
+            - description: DisplayPort/eDP controller (dp)
+    else:
+      properties:
+        reg:
+          minItems: 6
+          items:
+            - description:
+                ADP window, with the control and interrupt registers, the
+                parameter FIFO port and the pipe layer registers
+            - description: Display block window A
+            - description: Display block window B
+            - description: Display block window C
+            - description: Display block window D
+            - description: Seven-register side block
+            - description: Display DART (dart-disp0), first window
+            - description: Display DART (dart-disp0), second window
+
+        reg-names:
+          minItems: 6
+          items:
+            - const: adp
+            - const: disp-a
+            - const: disp-b
+            - const: disp-c
+            - const: disp-d
+            - const: side
+            - const: dart0
+            - const: dart1
+
+        interrupts:
+          items:
+            - description:
+                Pipe interrupt; carries vblank, parameter packet completion
+                and pipe errors
+            - description: Back-end interrupt
+            - description: Third display interrupt
+            - description: Fourth display interrupt
+            - description: Fifth display interrupt
+
+        power-domains:
+          items:
+            - description: Display pipe (disp0)
+            - description: DisplayPort/eDP controller (dp)
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-controller@206200000 {
+            compatible = "apple,s8000-display-pipe";
+            reg = <0x2 0x06200000 0x0 0x100000>,
+                  <0x2 0x06400000 0x0 0x8000>,
+                  <0x2 0x06440000 0x0 0x8000>,
+                  <0x2 0x06480000 0x0 0x8000>,
+                  <0x2 0x064c0000 0x0 0x8000>,
+                  <0x2 0x06500000 0x0 0x1c>,
+                  <0x2 0x06304000 0x0 0x4000>,
+                  <0x2 0x06300000 0x0 0x4000>;
+            reg-names = "adp", "disp-a", "disp-b", "disp-c", "disp-d",
+                        "side", "dart0", "dart1";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 140 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 146 IRQ_TYPE_LEVEL_HIGH>;
+            power-domains = <&ps_disp0>, <&ps_dp>;
+        };
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-controller@206200000 {
+            compatible = "apple,t8010-display-pipe", "apple,s8000-display-pipe";
+            reg = <0x2 0x06200000 0x0 0x9000>,
+                  <0x2 0x06304000 0x0 0x4000>,
+                  <0x2 0x06300000 0x0 0x4000>;
+            reg-names = "adp", "dart0", "dart1";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 154 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 158 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 159 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 160 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 161 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 155 IRQ_TYPE_LEVEL_HIGH>;
+            power-domains = <&ps_disp0_fe>, <&ps_disp0_be>, <&ps_dp>;
+        };
+    };
