@@ -5,6 +5,7 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <linux/bitmap.h>
 #include <linux/bitrev.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
@@ -15,6 +16,8 @@
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/jiffies.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -23,6 +26,9 @@
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
+
+#include "apple_z2_n61.h"
 
 #define APPLE_Z2_NUM_FINGERS_OFFSET      16
 #define APPLE_Z2_FINGERS_OFFSET          24
@@ -55,7 +61,7 @@
 #define APPLE_Z2_GEN2_MIN_RESULT_SIZE    64
 #define APPLE_Z2_HBPP_CMD_BLOB           0x3001
 #define APPLE_Z2_FW_MAGIC                0x5746325A
-#define APPLE_Z2_RX_BUF_SIZE             4000
+#define APPLE_Z2_RX_BUF_SIZE             8192
 #define APPLE_Z2_D111_CAL_SIZE           0x400
 #define LOAD_COMMAND_INIT_PAYLOAD        0
 #define LOAD_COMMAND_SEND_BLOB           1
@@ -69,6 +75,39 @@
 #define ORB_GAP_CAL_PROP_NAME            "apple,z2-orb-gap-cal-blob"
 #define ORB_FORCE_CAL_PROP_NAME          "apple,z2-orb-force-cal-blob"
 #define SHAPE_ACCEL_CAL_PROP_NAME        "apple,z2-shape-accel-cal-blob"
+#define DISPLAY_OFFSET_CAL_PROP_NAME     "apple,z2-display-offset-cal-blob"
+#define FIREFLY_CAL_PROP_NAME            "apple,z2-firefly-cal-blob"
+#define PRESSURE_CAL_PROP_NAME           "apple,z2-pressure-cal-blob"
+#define FIREFLY_P100_CAL_PROP_NAME       "apple,z2-firefly-p100-cal-blob"
+#define EXT_CAL_PROP_NAME                "apple,z2-ext-cal-blob"
+#define PROX_CAL_PROP_NAME               "apple,z2-prox-cal-blob"
+
+/* Classic contact reports (iPad 5), parsed like MTParse_BinaryPathOrImage. */
+#define APPLE_Z2_CLASSIC_REPORT_FIRST    0x43
+#define APPLE_Z2_CLASSIC_REPORT_LAST     0x45
+#define APPLE_Z2_CLASSIC_HEADER_MIN      22
+#define APPLE_Z2_CLASSIC_CONTACT_MIN     20
+#define APPLE_Z2_CLASSIC_CONTACT_MAX     64
+#define APPLE_Z2_CLASSIC_MAX_CONTACTS    32
+
+/* N1 HBPP bootloader (iOS MTSPIBootloader_N1). */
+#define APPLE_Z2_HBPP_ACK_BLOB           0x4bc1
+#define APPLE_Z2_HBPP_ACK_WRITE          0x4ad1
+#define APPLE_Z2_HBPP_ATTEMPTS           5
+#define APPLE_Z2_N1_VERSION_REG          0x10008ffc
+#define APPLE_Z2_N1_APU_EN_REG           0x10003800
+#define APPLE_Z2_N1_CONST_CAL_REG        0x10003000
+#define APPLE_Z2_N1_CONST_CAL_V11A0      0x434d11a0
+#define APPLE_Z2_N1_REPORT_MAX           512
+#define APPLE_Z2_N1_REPORT_FAMILY        0xd1
+#define APPLE_Z2_N1_REPORT_SENSOR        0xd3
+#define APPLE_Z2_N1_REPORT_REGION        0xd0
+#define APPLE_Z2_N1_REPORT_REGION_PARAMS 0xa1
+/* Runtime bounds of the iPad 5 interrupt service and its recovery. */
+#define APPLE_Z2_N1_IRQ_FRAMES           8
+#define APPLE_Z2_N1_FRAME_ATTEMPTS       3
+#define APPLE_Z2_N1_REARM_ATTEMPTS       3
+#define APPLE_Z2_N1_REARM_DELAY_MS       1000
 
 #define APPLE_Z2_FW_CONFIG_WORDS         11
 #define APPLE_Z2_FW_CONFIG_MIN_DMA       BIT(0)
@@ -77,6 +116,7 @@
 #define APPLE_Z2_FW_CONFIG_CPHA          BIT(3)
 #define APPLE_Z2_FW_CONFIG_CPOL          BIT(4)
 #define APPLE_Z2_FW_CONFIG_BOOT_TIMEOUT  BIT(8)
+#define APPLE_Z2_FW_CONFIG_HBPP_VERSION  BIT(11)
 
 enum apple_z2_protocol_state {
 	APPLE_Z2_STATE_OFF,
@@ -93,17 +133,81 @@ enum apple_z2_protocol_state {
 enum apple_z2_variant {
 	APPLE_Z2_VARIANT_GENERIC,
 	APPLE_Z2_VARIANT_J172,
+	APPLE_Z2_VARIANT_J71B,
+	APPLE_Z2_VARIANT_J71T,
 	APPLE_Z2_VARIANT_D11,
 	APPLE_Z2_VARIANT_D111,
+	APPLE_Z2_VARIANT_N61,
 };
 
+struct apple_z2_hbpp_reg {
+	u32 addr;
+	u32 value;
+};
+
+/**
+ * struct apple_z2_n1_info - N1 bootloader and runtime parameters
+ * @calib_regs:		register calibration written after the firmware
+ * @num_calib_regs:	number of entries in @calib_regs
+ * @execute_addr:	firmware entry point (fw-execute-addr)
+ * @execute_arg:	execute command argument
+ * @cal_size:		size of the unit's multi-touch calibration (MtCl)
+ * @cal_chunk_size:	largest calibration payload per HBPP packet
+ * @control_delay_us:	delay between the two phases of a control command
+ * @get_delay_us:	delay before each report read
+ * @wake_holdoff_ms:	wake commands within this time are suppressed
+ * @get_attempts:	report reads tried while replies are corrupt
+ * @device_info_attempts: device-information reads tried
+ * @device_info_retry_us: delay between device-information reads
+ * @interface:		expected interface version
+ * @family:		expected family (report 0xd1)
+ * @rows:		expected sensor rows (report 0xd3)
+ * @columns:		expected sensor columns (report 0xd3)
+ * @surface_width:	expected surface width (report 0xd9)
+ * @surface_height:	expected surface height (report 0xd9)
+ */
+struct apple_z2_n1_info {
+	const struct apple_z2_hbpp_reg *calib_regs;
+	unsigned int num_calib_regs;
+	u32 execute_addr;
+	u32 execute_arg;
+	unsigned int cal_size;
+	unsigned int cal_chunk_size;
+	unsigned int control_delay_us;
+	unsigned int get_delay_us;
+	unsigned int wake_holdoff_ms;
+	unsigned int get_attempts;
+	unsigned int device_info_attempts;
+	unsigned int device_info_retry_us;
+	u8 interface;
+	u8 family;
+	u8 rows;
+	u8 columns;
+	u32 surface_width;
+	u32 surface_height;
+};
+
+/**
+ * struct apple_z2_chip_info - per-compatible data
+ * @name:		input device name
+ * @variant:		protocol variant
+ * @cs_setup_us:	generation-1 chip-select setup delay
+ * @cs_hold_us:		generation-1 chip-select hold delay
+ * @cs_inactive_us:	generation-1 chip-select inactive delay
+ * @n1:			N1 bootloader and runtime parameters
+ */
 struct apple_z2_chip_info {
 	const char *name;
 	enum apple_z2_variant variant;
+	unsigned int cs_setup_us;
+	unsigned int cs_hold_us;
+	unsigned int cs_inactive_us;
+	const struct apple_z2_n1_info *n1;
 };
 
 struct apple_z2 {
 	struct spi_device *spidev;
+	const struct apple_z2_chip_info *info;
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *power_ana_gpio;
 	struct gpio_desc *power_ldo_gpio;
@@ -113,6 +217,18 @@ struct apple_z2 {
 	struct pinctrl_state *j172_sync_active_state;
 	struct regulator *hv_supply;
 	struct regulator *core_supply;
+	struct regulator *ana_supply;
+	struct pinctrl *sync_pinctrl;
+	struct pinctrl_state *sync_active;
+	struct pinctrl_state *sync_inactive;
+	struct gpio_desc *attn_gpio;
+	struct delayed_work rearm_work;
+	unsigned int rearm_attempts;
+	unsigned long last_wake;
+	bool wake_valid;
+	bool ana_enabled;
+	bool irq_on;
+	bool stopping;
 	struct clk *clk;
 	struct input_dev *input_dev;
 	struct completion boot_irq;
@@ -124,6 +240,10 @@ struct apple_z2 {
 	bool platform_powered;
 	bool upload_irq_masked;
 	bool runtime_frame_valid;
+	bool runtime_queue_empty;
+	bool runtime_control_reply;
+	bool irq_type_changed;
+	unsigned int saved_irq_type;
 	bool surface_descriptor_valid;
 	bool j172_sync_pinctrl_active;
 	bool hv_enabled;
@@ -134,6 +254,7 @@ struct apple_z2 {
 	unsigned int z2_inter_packet_delay_us;
 	unsigned int z2_cs_delay_us;
 	unsigned int boot_timeout_ms;
+	u32 hbpp_version;
 	s16 sensor_max_x;
 	s16 sensor_min_x;
 	s16 sensor_max_y;
@@ -145,9 +266,36 @@ struct apple_z2 {
 	u8 *rx_buf;
 };
 
-static bool apple_z2_is_j172(const struct apple_z2 *z2)
+static bool apple_z2_uses_ipad_protocol(const struct apple_z2 *z2)
 {
-	return z2->variant == APPLE_Z2_VARIANT_J172;
+	return z2->variant == APPLE_Z2_VARIANT_J172 ||
+	       z2->variant == APPLE_Z2_VARIANT_J71B;
+}
+
+static bool apple_z2_is_j71b(const struct apple_z2 *z2)
+{
+	return z2->variant == APPLE_Z2_VARIANT_J71B;
+}
+
+static bool apple_z2_is_n61(const struct apple_z2 *z2)
+{
+	return z2->variant == APPLE_Z2_VARIANT_N61;
+}
+
+static bool apple_z2_is_j71t(const struct apple_z2 *z2)
+{
+	return z2->variant == APPLE_Z2_VARIANT_J71T;
+}
+
+/* The generation-1 byte-stream runtime protocol of the iPad 5 and 6. */
+static bool apple_z2_is_gen1(const struct apple_z2 *z2)
+{
+	return apple_z2_is_j71b(z2) || apple_z2_is_j71t(z2);
+}
+
+static bool apple_z2_uses_gen1_data(const struct apple_z2 *z2)
+{
+	return apple_z2_is_gen1(z2) || apple_z2_is_n61(z2);
 }
 
 static bool apple_z2_is_d11(const struct apple_z2 *z2)
@@ -206,12 +354,23 @@ enum apple_z2_calibration_provider {
 	APPLE_Z2_CAL_ORB_GAP,
 	APPLE_Z2_CAL_ORB_FORCE,
 	APPLE_Z2_CAL_SHAPE_ACCEL,
+	APPLE_Z2_CAL_DISPLAY_OFFSET,
+	APPLE_Z2_CAL_FIREFLY,
+	APPLE_Z2_CAL_PRESSURE,
+	APPLE_Z2_CAL_FIREFLY_P100,
+	APPLE_Z2_CAL_EXT_MULTI_TOUCH,
+	APPLE_Z2_CAL_PROX = 9,
 };
 
 static void apple_z2_apply_z2_delays(struct apple_z2 *z2);
 static void apple_z2_post_z2_xfer_delay(struct apple_z2 *z2);
 static void apple_z2_set_gpio(struct gpio_desc *gpio, int value);
 static void apple_z2_z2_checksum(u8 *cmd, unsigned int len);
+static bool apple_z2_z2_checksum_valid(const u8 *cmd, unsigned int len);
+static int apple_z2_hbpp_xfer(struct apple_z2 *z2, unsigned int len);
+static int apple_z2_hbpp_nop(struct apple_z2 *z2);
+static void apple_z2_platform_power_off(struct apple_z2 *z2);
+static int apple_z2_j71t_boot(struct apple_z2 *z2);
 
 static bool apple_z2_float_to_integer(const u8 *raw, s64 *value)
 {
@@ -387,9 +546,15 @@ static void apple_z2_parse_touches(struct apple_z2 *z2,
 	int slot_valid;
 	struct apple_z2_finger *fingers;
 
-	if (msg_len >= APPLE_Z2_J172_HEADER_SIZE &&
+	if (!apple_z2_is_n61(z2) && msg_len >= APPLE_Z2_J172_HEADER_SIZE &&
 	    msg[0] == APPLE_Z2_HID_REPORT_ID && msg[3] == 4) {
 		apple_z2_parse_j172_touches(z2, msg, msg_len);
+		return;
+	}
+
+	if (apple_z2_is_j71b(z2)) {
+		dev_warn_ratelimited(&z2->spidev->dev,
+				     "unknown contact layout, len=%zu\n", msg_len);
 		return;
 	}
 
@@ -404,7 +569,7 @@ static void apple_z2_parse_touches(struct apple_z2 *z2,
 			 msg_len, nfingers);
 		return;
 	}
-	if (apple_z2_is_iphone7_plus(z2) && nfingers &&
+	if ((apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2)) && nfingers &&
 	    !z2->surface_descriptor_valid) {
 		dev_warn_ratelimited(&z2->spidev->dev,
 				     "iPhone 7 Plus touch packet without surface descriptor\n");
@@ -422,7 +587,7 @@ static void apple_z2_parse_touches(struct apple_z2 *z2,
 		input_mt_slot(z2->input_dev, slot);
 		if (!input_mt_report_slot_state(z2->input_dev, MT_TOOL_FINGER, slot_valid))
 			continue;
-		if (apple_z2_is_iphone7_plus(z2)) {
+		if (apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2)) {
 			abs_x = (s16)le16_to_cpu(fingers[i].abs_x);
 			abs_y = (s16)le16_to_cpu(fingers[i].abs_y);
 			coords_valid = apple_z2_scale_iphone7_coord(abs_x,
@@ -454,7 +619,7 @@ static void apple_z2_parse_touches(struct apple_z2 *z2,
 		input_report_abs(z2->input_dev, ABS_MT_WIDTH_MINOR,
 				 le16_to_cpu(fingers[i].tool_minor));
 		orientation = (s16)le16_to_cpu(fingers[i].orientation);
-		if (apple_z2_is_iphone7_plus(z2))
+		if (apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2))
 			orientation = (s16)(0x4000 - orientation);
 		input_report_abs(z2->input_dev, ABS_MT_ORIENTATION, orientation);
 		input_report_abs(z2->input_dev, ABS_MT_TOUCH_MAJOR,
@@ -466,14 +631,112 @@ static void apple_z2_parse_touches(struct apple_z2 *z2,
 	input_sync(z2->input_dev);
 }
 
+/*
+ * Classic contact reports 0x43..0x45 (iOS MultitouchSupport
+ * MTParse_BinaryFrameHeader and mt_FillMTContactDirectFromBinary): byte 2
+ * is the header length, LE16 at 14 the image bytes after the header, byte
+ * 16 the contact count and byte 17 the contact stride. Each contact holds
+ * its ID, its state, signed LE16 X/Y at 4/6 in 0.01 mm, the ellipse radii
+ * at 12/14 and the angle at 16.
+ */
+static void apple_z2_parse_classic_touches(struct apple_z2 *z2,
+					   const u8 *report, size_t len)
+{
+	DECLARE_BITMAP(ids, 256);
+	unsigned int header_len, offset, stride, count, i, x, y;
+	const u8 *contact;
+	bool active;
+	int slot;
+
+	if (!len || report[0] < APPLE_Z2_CLASSIC_REPORT_FIRST ||
+	    report[0] > APPLE_Z2_CLASSIC_REPORT_LAST)
+		return;
+	if (len < APPLE_Z2_CLASSIC_HEADER_MIN)
+		goto invalid;
+
+	header_len = report[2];
+	count = report[16];
+	stride = report[17];
+	offset = header_len + get_unaligned_le16(report + 14);
+	if (header_len < APPLE_Z2_CLASSIC_HEADER_MIN || offset > len ||
+	    count > APPLE_Z2_CLASSIC_MAX_CONTACTS ||
+	    (count && (stride < APPLE_Z2_CLASSIC_CONTACT_MIN ||
+		       stride > APPLE_Z2_CLASSIC_CONTACT_MAX ||
+		       count > (len - offset) / stride)))
+		goto invalid;
+
+	if (count && !z2->surface_descriptor_valid) {
+		dev_warn_ratelimited(&z2->spidev->dev,
+				     "touch report without surface descriptor\n");
+		return;
+	}
+
+	/* Check the whole report before changing any slot. */
+	bitmap_zero(ids, 256);
+	for (i = 0; i < count; i++)
+		if (test_and_set_bit(report[offset + i * stride], ids))
+			goto invalid;
+
+	for (i = 0; i < count; i++) {
+		contact = report + offset + i * stride;
+		slot = input_mt_get_slot_by_key(z2->input_dev, contact[0]);
+		if (slot < 0) {
+			dev_warn_ratelimited(&z2->spidev->dev,
+					     "unable to get slot for finger\n");
+			continue;
+		}
+
+		active = contact[1] == APPLE_Z2_TOUCH_STARTED ||
+			 contact[1] == APPLE_Z2_TOUCH_MOVED;
+		input_mt_slot(z2->input_dev, slot);
+		if (!input_mt_report_slot_state(z2->input_dev, MT_TOOL_FINGER,
+						active))
+			continue;
+
+		if (!apple_z2_scale_iphone7_coord((s16)get_unaligned_le16(contact + 4),
+						  z2->sensor_max_x,
+						  z2->sensor_min_x,
+						  z2->props.max_x, &x) ||
+		    !apple_z2_scale_iphone7_coord((s16)get_unaligned_le16(contact + 6),
+						  z2->sensor_max_y,
+						  z2->sensor_min_y,
+						  z2->props.max_y, &y))
+			continue;
+
+		/* Raw Y grows upwards; the DT inverts it for the panel. */
+		touchscreen_report_pos(z2->input_dev, &z2->props, x, y, true);
+		input_report_abs(z2->input_dev, ABS_MT_TOUCH_MAJOR,
+				 get_unaligned_le16(contact + 12));
+		input_report_abs(z2->input_dev, ABS_MT_TOUCH_MINOR,
+				 get_unaligned_le16(contact + 14));
+		input_report_abs(z2->input_dev, ABS_MT_ORIENTATION,
+				 (s16)get_unaligned_le16(contact + 16));
+	}
+
+	input_mt_sync_frame(z2->input_dev);
+	input_sync(z2->input_dev);
+	return;
+
+invalid:
+	dev_warn_ratelimited(&z2->spidev->dev,
+			     "invalid touch report %02x, len=%zu\n",
+			     report[0], len);
+}
+
 static void apple_z2_dispatch_frame(struct apple_z2 *z2, const u8 *payload,
 				    size_t payload_len)
 {
 	const u8 *report;
 	u16 report_len;
 
-	/* iPhone 7 Plus Gen2 packets carry the legacy report header directly. */
-	if (apple_z2_is_iphone7_plus(z2)) {
+	/* The iPad 5 sends classic reports without the HID envelope. */
+	if (apple_z2_is_j71t(z2)) {
+		apple_z2_parse_classic_touches(z2, payload, payload_len);
+		return;
+	}
+
+	/* N61 Gen1 and iPhone 7 Plus carry the legacy report header directly. */
+	if (apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2)) {
 		if (payload_len < APPLE_Z2_FINGERS_OFFSET)
 			return;
 
@@ -512,7 +775,8 @@ static void apple_z2_dispatch_frame(struct apple_z2 *z2, const u8 *payload,
 }
 
 static bool apple_z2_gen2_packet_valid(const u8 *buf, size_t buf_len,
-				       u8 counter, bool strict_counter)
+				       u8 counter, bool strict_counter,
+				       bool check_counter)
 {
 	bool counter_valid;
 	u16 payload_len;
@@ -522,8 +786,9 @@ static bool apple_z2_gen2_packet_valid(const u8 *buf, size_t buf_len,
 	if (buf_len < 7)
 		return false;
 
-	counter_valid = strict_counter ? buf[1] == counter :
-					buf[1] == 1 || buf[1] == 2;
+	counter_valid = !check_counter ||
+			(strict_counter ? buf[1] == counter :
+					  buf[1] == 1 || buf[1] == 2);
 	payload_len = get_unaligned_le16(buf + 2);
 	if (((buf[0] + buf[1] + buf[2] + buf[3] + buf[4]) & 0xff) ||
 	    (buf[0] & 0xfe) != 0xea || !counter_valid ||
@@ -537,10 +802,55 @@ static bool apple_z2_gen2_packet_valid(const u8 *buf, size_t buf_len,
 	return !checksum;
 }
 
+/*
+ * Generation-1 data phases: the controller expects the request bytes to
+ * keep streaming while it answers, so transmit from a copy. On J71b,
+ * transfers above 16 bytes run in SPI mode 0 at 500 kHz.
+ */
+static int apple_z2_gen1_exchange(struct apple_z2 *z2, u8 *buf, size_t len)
+{
+	struct spi_transfer xfer = {
+		.rx_buf = buf,
+		.len = len,
+		.bits_per_word = 8,
+	};
+	u32 saved_mode = z2->spidev->mode;
+	bool mode_changed = apple_z2_is_j71b(z2) && len > 16;
+	u8 *tx;
+	int error, restore;
+
+	if (!len || len > APPLE_Z2_RX_BUF_SIZE)
+		return -EMSGSIZE;
+	if (apple_z2_uses_gen1_data(z2))
+		xfer.speed_hz = 500000;
+	tx = kmemdup(buf, len, GFP_KERNEL);
+	if (!tx)
+		return -ENOMEM;
+	xfer.tx_buf = tx;
+
+	if (mode_changed) {
+		z2->spidev->mode = saved_mode & ~SPI_CPHA;
+		error = spi_setup(z2->spidev);
+		if (error)
+			goto restore_mode;
+	}
+	error = spi_sync_transfer(z2->spidev, &xfer, 1);
+restore_mode:
+	if (mode_changed) {
+		z2->spidev->mode = saved_mode;
+		restore = spi_setup(z2->spidev);
+		if (!error)
+			error = restore;
+	}
+	kfree(tx);
+	return error;
+}
+
 static int apple_z2_read_packet(struct apple_z2 *z2)
 {
 	struct spi_transfer xfer = { };
 	bool strict_counter;
+	bool resynced = false;
 	int error;
 	size_t pkt_len;
 	size_t wire_len;
@@ -548,6 +858,8 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	u8 counter;
 
 	z2->runtime_frame_valid = false;
+	z2->runtime_queue_empty = false;
+	z2->runtime_control_reply = false;
 	memset(z2->tx_buf, 0, APPLE_Z2_CMD_SIZE);
 	memset(z2->rx_buf, 0, APPLE_Z2_CMD_SIZE);
 	z2->tx_buf[0] = APPLE_Z2_CMD_READ_INTERRUPT_DATA;
@@ -562,11 +874,37 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	if (error)
 		return error;
 	apple_z2_post_z2_xfer_delay(z2);
+	if (apple_z2_is_n61(z2)) {
+		if (!apple_z2_z2_checksum_valid(z2->rx_buf, APPLE_Z2_CMD_SIZE))
+			return -EPROTO;
+	}
 
-	if (z2->rx_buf[0] != APPLE_Z2_REPLY_INTERRUPT_DATA)
+	/*
+	 * The iPad 5 (iOS 0xfffffff005ea1cf4) checks the whole length reply:
+	 * an E-class response with the byte sum of its first 14 bytes at 14.
+	 */
+	if (apple_z2_is_j71t(z2)) {
+		if ((z2->rx_buf[0] & 0xf0) != 0xe0 ||
+		    !apple_z2_z2_checksum_valid(z2->rx_buf, APPLE_Z2_CMD_SIZE))
+			return -EBADMSG;
+	} else if (z2->rx_buf[0] != APPLE_Z2_REPLY_INTERRUPT_DATA) {
 		return 0;
+	}
 
-	pkt_len = (get_unaligned_le16(z2->rx_buf + 1) + 8) & 0xfffffffc;
+	payload_len = get_unaligned_le16(z2->rx_buf + 1);
+data_phase:
+	if (apple_z2_uses_gen1_data(z2) && !payload_len) {
+		z2->runtime_queue_empty = true;
+		if (apple_z2_is_n61(z2))
+			z2->index_parity = !z2->index_parity;
+		return 0;
+	}
+	if (apple_z2_is_j71t(z2))
+		pkt_len = (size_t)payload_len + 5;
+	else if (apple_z2_uses_gen1_data(z2))
+		pkt_len = max_t(size_t, 16, (size_t)payload_len + 5);
+	else
+		pkt_len = (payload_len + 8) & 0xfffffffc;
 	if (pkt_len > APPLE_Z2_RX_BUF_SIZE) {
 		dev_warn(&z2->spidev->dev, "packet too large: %zu\n", pkt_len);
 		return -EMSGSIZE;
@@ -576,7 +914,33 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 		wire_len = max_t(size_t, wire_len,
 				 APPLE_Z2_GEN2_MIN_RESULT_SIZE);
 
-	if (apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2)) {
+	if (apple_z2_uses_gen1_data(z2)) {
+		/* Data phase acknowledges the queued report. */
+		if (apple_z2_is_n61(z2)) {
+			error = apple_z2_n61_interrupt_request(z2->rx_buf,
+							       wire_len, counter);
+			if (error)
+				return error;
+		} else {
+			memset(z2->rx_buf, 0, max_t(size_t, wire_len, APPLE_Z2_CMD_SIZE));
+			z2->rx_buf[0] = APPLE_Z2_CMD_READ_INTERRUPT_DATA;
+			z2->rx_buf[1] = counter;
+			z2->rx_buf[2] = 1;
+			apple_z2_z2_checksum(z2->rx_buf, APPLE_Z2_CMD_SIZE);
+		}
+		/*
+		 * The iPad 5 (iOS 0xfffffff005ea1f24) carries the same checksum
+		 * in the last two bytes of the data phase, not at 14.
+		 */
+		if (apple_z2_is_j71t(z2)) {
+			u16 checksum = get_unaligned_le16(z2->rx_buf + 14);
+
+			put_unaligned_le16(0, z2->rx_buf + 14);
+			put_unaligned_le16(checksum, z2->rx_buf + wire_len - 2);
+		}
+		error = apple_z2_gen1_exchange(z2, z2->rx_buf, wire_len);
+	} else if (apple_z2_uses_ipad_protocol(z2) ||
+		   apple_z2_is_iphone7_plus(z2)) {
 		memset(z2->rx_buf, 0xa5, wire_len);
 		xfer.tx_buf = z2->rx_buf;
 		xfer.rx_buf = z2->rx_buf;
@@ -590,13 +954,48 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	if (apple_z2_is_iphone7_plus(z2))
 		apple_z2_post_z2_xfer_delay(z2);
 
+	/*
+	 * Generation-1 firmware answers no-data (0) or a checksummed control
+	 * reply while service is pending. Neither is a frame; keep the tag.
+	 */
+	if (apple_z2_uses_gen1_data(z2) &&
+	    (!z2->rx_buf[0] ||
+	     (wire_len >= 16 && z2->rx_buf[0] == APPLE_Z2_CMD_LAST &&
+	      apple_z2_z2_checksum_valid(z2->rx_buf, 16)))) {
+		/*
+		 * J71b: a header (interrupt data and its length) answering the
+		 * data phase means the controller and this driver are a transfer
+		 * apart. Ignored, every later read got a header back and touch
+		 * stayed dead until the controller was rebooted. Take it as the
+		 * next frame's header and read that frame.
+		 */
+		if (apple_z2_is_j71b(z2) && !resynced &&
+		    z2->rx_buf[0] == APPLE_Z2_REPLY_INTERRUPT_DATA) {
+			resynced = true;
+			payload_len = get_unaligned_le16(z2->rx_buf + 1);
+			dev_dbg(&z2->spidev->dev,
+				"header in the data phase (%u bytes pending): resynchronising\n",
+				payload_len);
+			goto data_phase;
+		}
+		z2->runtime_control_reply = true;
+		return 0;
+	}
+
 	/* D11 touch reports do not follow the requested alternating tag. */
 	strict_counter = !apple_z2_is_d11(z2) ||
 			 (pkt_len > 5 && z2->rx_buf[5] ==
 					 APPLE_Z2_D11_STATUS_REPORT);
+	/*
+	 * The iPad 5 firmware's data header is not known to echo the tag, and
+	 * iOS does not check it there; its payload has to fill the transfer.
+	 */
 	z2->runtime_frame_valid =
 		apple_z2_gen2_packet_valid(z2->rx_buf, pkt_len, counter,
-					   strict_counter);
+					   strict_counter,
+					   !apple_z2_is_j71t(z2)) &&
+		(!apple_z2_is_j71t(z2) ||
+		 get_unaligned_le16(z2->rx_buf + 2) + 5 == pkt_len);
 	if (!z2->runtime_frame_valid)
 		return 0;
 
@@ -663,18 +1062,26 @@ static void apple_z2_set_spi_delay(struct spi_delay *delay,
 static unsigned int apple_z2_effective_cs_delay_us(struct apple_z2 *z2)
 {
 	/* J172 firmware expresses this field in ns; Linux SPI uses us here. */
-	return apple_z2_is_j172(z2) ? 10 : z2->z2_cs_delay_us;
+	if (apple_z2_uses_gen1_data(z2))
+		return z2->info->cs_setup_us;
+	return apple_z2_uses_ipad_protocol(z2) ? 10 : z2->z2_cs_delay_us;
 }
 
 static void apple_z2_apply_z2_delays(struct apple_z2 *z2)
 {
 	unsigned int cs_delay_us = apple_z2_effective_cs_delay_us(z2);
-	unsigned int inactive_us = apple_z2_is_j172(z2) ? 10 :
-				  z2->z2_inter_packet_delay_us;
+	unsigned int hold_us = cs_delay_us;
+	unsigned int inactive_us = apple_z2_uses_ipad_protocol(z2) ? 10 :
+				   z2->z2_inter_packet_delay_us;
+
+	if (apple_z2_uses_gen1_data(z2)) {
+		hold_us = z2->info->cs_hold_us;
+		inactive_us = z2->info->cs_inactive_us;
+	}
 
 	if (cs_delay_us) {
 		apple_z2_set_spi_delay(&z2->spidev->cs_setup, cs_delay_us);
-		apple_z2_set_spi_delay(&z2->spidev->cs_hold, cs_delay_us);
+		apple_z2_set_spi_delay(&z2->spidev->cs_hold, hold_us);
 	}
 	if (inactive_us)
 		apple_z2_set_spi_delay(&z2->spidev->cs_inactive, inactive_us);
@@ -714,8 +1121,9 @@ static void apple_z2_avoid_short_dma(struct apple_z2 *z2,
 	xfer->rx_buf = z2->rx_buf;
 }
 
-static int apple_z2_z2_xfer_locked_delay(struct apple_z2 *z2,
-					 const char *tag, bool post_delay)
+/* Sends the 16-byte command in tx_buf as it is. */
+static int apple_z2_z2_raw_xfer_locked(struct apple_z2 *z2, const char *tag,
+				       bool post_delay)
 {
 	struct spi_transfer xfer = {
 		.tx_buf = z2->tx_buf,
@@ -724,7 +1132,6 @@ static int apple_z2_z2_xfer_locked_delay(struct apple_z2 *z2,
 	};
 	int error;
 
-	apple_z2_z2_checksum(z2->tx_buf, APPLE_Z2_CMD_SIZE);
 	apple_z2_apply_z2_delays(z2);
 	error = spi_sync_transfer(z2->spidev, &xfer, 1);
 	if (error) {
@@ -739,6 +1146,13 @@ static int apple_z2_z2_xfer_locked_delay(struct apple_z2 *z2,
 		APPLE_Z2_CMD_SIZE, z2->tx_buf, APPLE_Z2_CMD_SIZE,
 		z2->rx_buf);
 	return 0;
+}
+
+static int apple_z2_z2_xfer_locked_delay(struct apple_z2 *z2,
+					 const char *tag, bool post_delay)
+{
+	apple_z2_z2_checksum(z2->tx_buf, APPLE_Z2_CMD_SIZE);
+	return apple_z2_z2_raw_xfer_locked(z2, tag, post_delay);
 }
 
 static int apple_z2_z2_xfer_locked(struct apple_z2 *z2, const char *tag)
@@ -864,7 +1278,7 @@ static int apple_z2_read_report_info_locked(struct apple_z2 *z2, u8 report,
 	}
 
 	if (z2->rx_buf[0] != APPLE_Z2_CMD_REPORT_INFO ||
-	    z2->rx_buf[1] != report ||
+	    (z2->rx_buf[1] != report && !apple_z2_is_j71t(z2)) ||
 	    !apple_z2_z2_checksum_valid(z2->rx_buf, APPLE_Z2_CMD_SIZE))
 		return -EPROTO;
 
@@ -899,6 +1313,13 @@ static int apple_z2_read_report_locked(struct apple_z2 *z2, u8 report,
 		return error;
 
 	if (len <= 11) {
+		if (apple_z2_is_n61(z2)) {
+			apple_z2_n61_short_read_request(z2->rx_buf, report, len);
+			error = apple_z2_gen1_exchange(z2, z2->rx_buf, APPLE_Z2_CMD_SIZE);
+			if (!error)
+				apple_z2_post_z2_xfer_delay(z2);
+			return error;
+		}
 		snprintf(last_tag, sizeof(last_tag), "%s-last", tag);
 		error = apple_z2_z2_cmd_locked(z2, APPLE_Z2_CMD_LAST, 0,
 					       last_tag);
@@ -909,12 +1330,27 @@ static int apple_z2_read_report_locked(struct apple_z2 *z2, u8 report,
 	}
 
 	data_len = len + 5;
-	memset(z2->rx_buf, 0xa5, data_len);
-	xfer.tx_buf = z2->rx_buf;
-	xfer.rx_buf = z2->rx_buf;
-	xfer.len = data_len;
 	apple_z2_apply_z2_delays(z2);
-	error = spi_sync_transfer(z2->spidev, &xfer, 1);
+	if (apple_z2_uses_gen1_data(z2)) {
+		/* Long read request repeated with phase 1 and a checksum. */
+		if (apple_z2_is_n61(z2)) {
+			apple_z2_n61_long_read_request(z2->rx_buf, report, len);
+		} else {
+			memset(z2->rx_buf, 0, data_len);
+			z2->rx_buf[0] = APPLE_Z2_CMD_CTRL_READ_LONG;
+			z2->rx_buf[1] = report;
+			z2->rx_buf[2] = 1;
+			put_unaligned_le16(len, z2->rx_buf + 3);
+			apple_z2_z2_checksum(z2->rx_buf, data_len);
+		}
+		error = apple_z2_gen1_exchange(z2, z2->rx_buf, data_len);
+	} else {
+		memset(z2->rx_buf, 0xa5, data_len);
+		xfer.tx_buf = z2->rx_buf;
+		xfer.rx_buf = z2->rx_buf;
+		xfer.len = data_len;
+		error = spi_sync_transfer(z2->spidev, &xfer, 1);
+	}
 	if (error)
 		return error;
 	apple_z2_post_z2_xfer_delay(z2);
@@ -923,9 +1359,12 @@ static int apple_z2_read_report_locked(struct apple_z2 *z2, u8 report,
 	return 0;
 }
 
-static int apple_z2_store_surface_descriptor(struct apple_z2 *z2, u16 len)
+/*
+ * Surface descriptor (report 0xd9): LE32 width and height in 0.01 mm, then
+ * the signed LE16 left, bottom, right and top edges.
+ */
+static int apple_z2_set_surface(struct apple_z2 *z2, const u8 *descriptor)
 {
-	const u8 *descriptor = z2->rx_buf + 3;
 	unsigned int x_pixels;
 	unsigned int y_pixels;
 	unsigned int x_res;
@@ -936,12 +1375,6 @@ static int apple_z2_store_surface_descriptor(struct apple_z2 *z2, u16 len)
 	s16 min_y;
 	u32 width;
 	u32 height;
-
-	if (len != APPLE_Z2_SURFACE_DESCRIPTOR_SIZE ||
-	    z2->rx_buf[0] != APPLE_Z2_CMD_CTRL_READ_LONG ||
-	    z2->rx_buf[1] != APPLE_Z2_REPORT_SURFACE || z2->rx_buf[2] ||
-	    !apple_z2_z2_checksum_valid(z2->rx_buf, len + 5))
-		return -EPROTO;
 
 	width = get_unaligned_le32(descriptor);
 	height = get_unaligned_le32(descriptor + 4);
@@ -976,6 +1409,256 @@ static int apple_z2_store_surface_descriptor(struct apple_z2 *z2, u16 len)
 		 width, height, min_x, max_x, min_y, max_y, x_res, y_res);
 
 	return 0;
+}
+
+static int apple_z2_store_surface_descriptor(struct apple_z2 *z2, u16 len)
+{
+	if (len != APPLE_Z2_SURFACE_DESCRIPTOR_SIZE ||
+	    z2->rx_buf[0] != APPLE_Z2_CMD_CTRL_READ_LONG ||
+	    z2->rx_buf[1] != APPLE_Z2_REPORT_SURFACE ||
+	    z2->rx_buf[2] > (apple_z2_uses_gen1_data(z2) ? 1 : 0) ||
+	    !apple_z2_z2_checksum_valid(z2->rx_buf, len + 5))
+		return -EPROTO;
+
+	return apple_z2_set_surface(z2, z2->rx_buf + 3);
+}
+
+/*
+ * The iPad 5 suppresses wake commands within its hold-off time (iOS N1
+ * wake helper 0xfffffff005ea75e8) and then waits 2 ms.
+ */
+static int apple_z2_n1_wake_locked(struct apple_z2 *z2)
+{
+	const struct apple_z2_n1_info *n1 = z2->info->n1;
+	int error;
+
+	if (z2->wake_valid &&
+	    time_before(jiffies, z2->last_wake +
+				 msecs_to_jiffies(n1->wake_holdoff_ms)))
+		return 0;
+
+	error = apple_z2_z2_cmd_locked_delay(z2, APPLE_Z2_CMD_WAKE, 0,
+					     "n1-wake", false);
+	if (error)
+		return error;
+
+	z2->last_wake = jiffies;
+	z2->wake_valid = true;
+	usleep_range(2000, 2100);
+	return 0;
+}
+
+/*
+ * Device information (iOS 0xfffffff005ea2880): E2 is sent twice and the
+ * second reply carries the interface version and the maximum packet size.
+ */
+static int apple_z2_n1_device_info_locked(struct apple_z2 *z2)
+{
+	const struct apple_z2_n1_info *n1 = z2->info->n1;
+	u16 max_packet_size;
+	unsigned int i;
+	int error = 0;
+
+	for (i = 0; i < n1->device_info_attempts; i++) {
+		if (i)
+			usleep_range(n1->device_info_retry_us,
+				     n1->device_info_retry_us + 1000);
+
+		error = apple_z2_n1_wake_locked(z2);
+		if (!error)
+			error = apple_z2_z2_cmd_locked_delay(z2,
+							     APPLE_Z2_CMD_DEVICE_INFO,
+							     0, "n1-e2", false);
+		if (!error)
+			error = apple_z2_z2_cmd_locked_delay(z2,
+							     APPLE_Z2_CMD_DEVICE_INFO,
+							     0, "n1-e2-reply",
+							     false);
+		if (!error &&
+		    (z2->rx_buf[0] != APPLE_Z2_CMD_DEVICE_INFO ||
+		     !apple_z2_z2_checksum_valid(z2->rx_buf, APPLE_Z2_CMD_SIZE)))
+			error = -EBADMSG;
+		if (!error)
+			break;
+	}
+	if (error) {
+		dev_err(&z2->spidev->dev, "device information failed: %d\n",
+			error);
+		return error;
+	}
+
+	max_packet_size = get_unaligned_le16(z2->rx_buf + 3);
+	if (z2->rx_buf[2] != n1->interface || max_packet_size < 16 ||
+	    max_packet_size > APPLE_Z2_RX_BUF_SIZE - 5) {
+		dev_err(&z2->spidev->dev,
+			"unexpected interface %u, max packet %u\n",
+			z2->rx_buf[2], max_packet_size);
+		return -EPROTO;
+	}
+
+	return 0;
+}
+
+/*
+ * One report read: E3 for the length, then E6 (below 12 bytes) or E7.
+ * The second phase sets byte 2 to 1 and keeps the first phase's checksum,
+ * at 14 for E6 and in the last two bytes of the length + 5 transfer for
+ * E7 (iOS 0xfffffff005ea3110 and 0xfffffff005ea3374). The data starts at
+ * rx_buf + 3. -EBADMSG reports a corrupt reply.
+ */
+static int apple_z2_n1_get_report_once(struct apple_z2 *z2, u8 report,
+				       u16 min_len, u16 *len)
+{
+	unsigned int xfer_len;
+	u16 checksum;
+	u8 status;
+	u8 cmd;
+	int error;
+
+	error = apple_z2_n1_wake_locked(z2);
+	if (error)
+		return error;
+
+	error = apple_z2_read_report_info_locked(z2, report, &status, len,
+						 "n1-report");
+	if (error)
+		return error == -EPROTO ? -EBADMSG : error;
+	if (status || *len < min_len || *len > APPLE_Z2_N1_REPORT_MAX) {
+		dev_err(&z2->spidev->dev,
+			"report %02x: status %u, length %u\n", report, status,
+			*len);
+		return -EPROTO;
+	}
+
+	error = apple_z2_n1_wake_locked(z2);
+	if (error)
+		return error;
+
+	cmd = *len < 12 ? APPLE_Z2_CMD_CTRL_READ_SHORT :
+			  APPLE_Z2_CMD_CTRL_READ_LONG;
+	memset(z2->tx_buf, 0, APPLE_Z2_CMD_SIZE);
+	memset(z2->rx_buf, 0, APPLE_Z2_CMD_SIZE);
+	z2->tx_buf[0] = cmd;
+	z2->tx_buf[1] = report;
+	put_unaligned_le16(*len, z2->tx_buf + 3);
+	error = apple_z2_z2_xfer_locked(z2, "n1-get");
+	if (error)
+		return error;
+	checksum = get_unaligned_le16(z2->tx_buf + 14);
+
+	if (cmd == APPLE_Z2_CMD_CTRL_READ_SHORT) {
+		z2->tx_buf[2] = 1;
+		error = apple_z2_z2_raw_xfer_locked(z2, "n1-get-data", false);
+		xfer_len = APPLE_Z2_CMD_SIZE;
+	} else {
+		xfer_len = *len + 5;
+		memset(z2->rx_buf, 0, xfer_len);
+		z2->rx_buf[0] = cmd;
+		z2->rx_buf[1] = report;
+		z2->rx_buf[2] = 1;
+		put_unaligned_le16(*len, z2->rx_buf + 3);
+		put_unaligned_le16(checksum, z2->rx_buf + xfer_len - 2);
+		apple_z2_apply_z2_delays(z2);
+		error = apple_z2_gen1_exchange(z2, z2->rx_buf, xfer_len);
+	}
+	if (error)
+		return error;
+
+	if (z2->rx_buf[0] != cmd ||
+	    !apple_z2_z2_checksum_valid(z2->rx_buf, xfer_len))
+		return -EBADMSG;
+
+	return 0;
+}
+
+/*
+ * iOS delays every report read and retries corrupt replies; one budget
+ * covers its nested retries. Other errors end the read.
+ */
+static int apple_z2_n1_get_report_locked(struct apple_z2 *z2, u8 report,
+					 u16 min_len, u16 *len)
+{
+	const struct apple_z2_n1_info *n1 = z2->info->n1;
+	unsigned int i;
+	int error = -EBADMSG;
+
+	for (i = 0; i < n1->get_attempts && error == -EBADMSG; i++) {
+		if (i)
+			usleep_range(1000, 2000);
+		usleep_range(n1->get_delay_us, n1->get_delay_us + 1000);
+		error = apple_z2_n1_get_report_once(z2, report, min_len, len);
+	}
+	if (error)
+		dev_err(&z2->spidev->dev, "report %02x read failed: %d\n",
+			report, error);
+
+	return error;
+}
+
+/*
+ * Runtime discovery after the firmware starts (iOS cacheProperties,
+ * 0xfffffff005e976e0): device information, then the family, sensor,
+ * region and region-parameter reports, then the surface descriptor.
+ */
+static int apple_z2_n1_discover_locked(struct apple_z2 *z2)
+{
+	const struct apple_z2_n1_info *n1 = z2->info->n1;
+	const u8 *data = z2->rx_buf + 3;
+	u16 len;
+	int error;
+
+	z2->wake_valid = false;
+	error = apple_z2_n1_device_info_locked(z2);
+	if (error)
+		return error;
+
+	error = apple_z2_n1_get_report_locked(z2, APPLE_Z2_N1_REPORT_FAMILY,
+					      1, &len);
+	if (error)
+		return error;
+	if (data[0] != n1->family) {
+		dev_err(&z2->spidev->dev, "unexpected family %u\n", data[0]);
+		return -ENODEV;
+	}
+
+	/* Endianness (1: little endian), rows, columns, BE16 version. */
+	error = apple_z2_n1_get_report_locked(z2, APPLE_Z2_N1_REPORT_SENSOR,
+					      5, &len);
+	if (error)
+		return error;
+	if (data[0] != 1 || data[1] != n1->rows || data[2] != n1->columns) {
+		dev_err(&z2->spidev->dev,
+			"unexpected sensor: endianness %u, %ux%u\n",
+			data[0], data[1], data[2]);
+		return -ENODEV;
+	}
+	dev_dbg(&z2->spidev->dev, "firmware version %#x\n",
+		get_unaligned_be16(data + 3));
+
+	error = apple_z2_n1_get_report_locked(z2, APPLE_Z2_N1_REPORT_REGION,
+					      8, &len);
+	if (error)
+		return error;
+
+	error = apple_z2_n1_get_report_locked(z2,
+					      APPLE_Z2_N1_REPORT_REGION_PARAMS,
+					      6, &len);
+	if (error)
+		return error;
+
+	error = apple_z2_n1_get_report_locked(z2, APPLE_Z2_REPORT_SURFACE,
+					      APPLE_Z2_SURFACE_DESCRIPTOR_SIZE,
+					      &len);
+	if (error)
+		return error;
+	if (get_unaligned_le32(data) != n1->surface_width ||
+	    get_unaligned_le32(data + 4) != n1->surface_height) {
+		dev_err(&z2->spidev->dev, "unexpected surface %ux%u\n",
+			get_unaligned_le32(data), get_unaligned_le32(data + 4));
+		return -ENODEV;
+	}
+
+	return apple_z2_set_surface(z2, data);
 }
 
 static int apple_z2_iphone7_plus_init_locked(struct apple_z2 *z2)
@@ -1020,6 +1703,40 @@ static int apple_z2_iphone7_plus_init_locked(struct apple_z2 *z2)
 	return 0;
 }
 
+static int apple_z2_n61_init_locked(struct apple_z2 *z2)
+{
+	static const u8 rep9d[] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+	static const u8 repbf[] = { 0x9d, 0x81, 0x09, 0 };
+	static const u8 repaf[] = { 0 };
+	u16 length;
+	u8 status;
+	int error;
+
+	error = apple_z2_z2_cmd_locked(z2, APPLE_Z2_CMD_WAKE, 0, "n61-wake");
+	if (error)
+		return error;
+	error = apple_z2_read_report_info_locked(z2, APPLE_Z2_REPORT_SURFACE,
+						 &status, &length, "n61-d9");
+	if (error)
+		return error;
+	if (status || length != APPLE_Z2_SURFACE_DESCRIPTOR_SIZE)
+		return -EPROTO;
+	error = apple_z2_read_report_locked(z2, APPLE_Z2_REPORT_SURFACE,
+					    length, "n61-d9-read");
+	if (error)
+		return error;
+	error = apple_z2_store_surface_descriptor(z2, length);
+	if (error)
+		return error;
+	error = apple_z2_write_report_locked(z2, 0x9d, rep9d, sizeof(rep9d), "n61-9d");
+	if (error)
+		return error;
+	error = apple_z2_write_report_locked(z2, 0xbf, repbf, sizeof(repbf), "n61-bf");
+	if (error)
+		return error;
+	return apple_z2_write_report_locked(z2, 0xaf, repaf, sizeof(repaf), "n61-af");
+}
+
 static int apple_z2_j172_init_reads_locked(struct apple_z2 *z2)
 {
 	u8 status;
@@ -1059,12 +1776,17 @@ static int apple_z2_j172_init_reads_locked(struct apple_z2 *z2)
 						 "73");
 	if (error)
 		return error;
-	if (status || prop_len != 8)
+	/* J71b firmware reports 0x73 as unsupported (status 2, no data). */
+	if (apple_z2_is_j71b(z2) && status == 2 && !prop_len) {
+		prop_len = 0;
+	} else if (status || prop_len != 8) {
 		return -EPROTO;
-
-	error = apple_z2_read_report_locked(z2, 0x73, prop_len, "73-read-1");
-	if (error)
-		return error;
+	} else {
+		error = apple_z2_read_report_locked(z2, 0x73, prop_len,
+						    "73-read-1");
+		if (error)
+			return error;
+	}
 
 	for (i = 2; i <= 3; i++) {
 		char db_tag[16];
@@ -1075,6 +1797,8 @@ static int apple_z2_j172_init_reads_locked(struct apple_z2 *z2)
 		if (error)
 			return error;
 
+		if (!prop_len)
+			continue;
 		snprintf(prop_tag, sizeof(prop_tag), "73-read-%u", i);
 		error = apple_z2_read_report_locked(z2, 0x73, prop_len,
 						    prop_tag);
@@ -1103,6 +1827,10 @@ static int apple_z2_j172_init_writes_locked(struct apple_z2 *z2)
 						 "9d");
 	if (error)
 		return error;
+	/* J71b firmware has no 0x9d; its paired 0xbf mode write is J172-only. */
+	if (apple_z2_is_j71b(z2) && status == 2 && !len)
+		return apple_z2_advance_protocol(z2, APPLE_Z2_STATE_RUNTIME,
+						 APPLE_Z2_STATE_REPORTS_READY);
 	if (status || len != sizeof(rep9d))
 		return -EPROTO;
 
@@ -1139,6 +1867,227 @@ static int apple_z2_j172_init_writes_locked(struct apple_z2 *z2)
 					 APPLE_Z2_STATE_REPORTS_READY);
 }
 
+/*
+ * Generation-1 controllers raise a level interrupt while reports are
+ * queued. Service it by reading (and so acknowledging) up to four reports.
+ */
+static int apple_z2_gen1_drain(struct apple_z2 *z2)
+{
+	unsigned int i;
+	int error;
+
+	for (i = 0; i < 4; i++) {
+		error = apple_z2_read_packet(z2);
+		if (error)
+			return error;
+		if (z2->runtime_queue_empty ||
+		    (!z2->runtime_frame_valid && !z2->runtime_control_reply))
+			break;
+	}
+	return 0;
+}
+
+static int apple_z2_gen1_set_level_irq(struct apple_z2 *z2)
+{
+	int error;
+
+	z2->saved_irq_type = irq_get_trigger_type(z2->spidev->irq);
+	if (!z2->saved_irq_type)
+		return -EINVAL;
+	error = irq_set_irq_type(z2->spidev->irq, IRQ_TYPE_LEVEL_LOW);
+	if (error)
+		return error;
+	z2->irq_type_changed = true;
+	return 0;
+}
+
+static void apple_z2_gen1_restore_irq_type(struct apple_z2 *z2)
+{
+	int error;
+
+	if (!z2->irq_type_changed)
+		return;
+	error = irq_set_irq_type(z2->spidev->irq, z2->saved_irq_type);
+	if (error)
+		dev_warn(&z2->spidev->dev,
+			 "failed to restore IRQ type: %d\n", error);
+	else
+		z2->irq_type_changed = false;
+}
+
+/*
+ * The interrupt is requested disabled. Track whether it is enabled, so that
+ * a boot that failed with it disabled is not disabled a second time.
+ */
+static void apple_z2_irq_on(struct apple_z2 *z2)
+{
+	if (z2->irq_on)
+		return;
+	z2->irq_on = true;
+	enable_irq(z2->spidev->irq);
+}
+
+static void apple_z2_irq_off(struct apple_z2 *z2)
+{
+	if (!z2->irq_on)
+		return;
+	z2->irq_on = false;
+	disable_irq(z2->spidev->irq);
+}
+
+static void apple_z2_release_contacts(struct apple_z2 *z2)
+{
+	unsigned int i;
+
+	for (i = 0; i < z2->input_dev->mt->num_slots; i++) {
+		input_mt_slot(z2->input_dev, i);
+		input_mt_report_slot_inactive(z2->input_dev);
+	}
+	input_mt_sync_frame(z2->input_dev);
+	input_sync(z2->input_dev);
+}
+
+/*
+ * ATN is the interrupt line read back as a GPIO. Without it, frames are
+ * read until the queue is empty.
+ */
+static int apple_z2_n1_attn(struct apple_z2 *z2, bool queue_empty)
+{
+	if (!z2->attn_gpio)
+		return !queue_empty;
+
+	return gpiod_get_value_cansleep(z2->attn_gpio);
+}
+
+/*
+ * One iPad 5 frame: 1 when a frame (or a control reply) was read, 0 when
+ * the queue is empty and ATN is released. A failed read, or an empty queue
+ * while ATN stays asserted, is retried up to three times.
+ */
+static int apple_z2_n1_frame_locked(struct apple_z2 *z2)
+{
+	unsigned int i;
+	int error = 0;
+
+	for (i = 0; i < APPLE_Z2_N1_FRAME_ATTEMPTS; i++) {
+		if (i)
+			usleep_range(1000, 2000);
+
+		error = apple_z2_read_packet(z2);
+		if (!error) {
+			if (z2->runtime_frame_valid || z2->runtime_control_reply)
+				return 1;
+			if (!z2->runtime_queue_empty) {
+				error = -EBADMSG;
+				continue;
+			}
+			error = apple_z2_n1_attn(z2, true);
+			if (!error)
+				return 0;
+			if (error > 0)
+				error = -EPROTO;
+		}
+	}
+
+	return error;
+}
+
+/*
+ * Read frames while ATN stays asserted, at most eight per call; more, or a
+ * failed frame, is an error.
+ */
+static int apple_z2_n1_service_locked(struct apple_z2 *z2)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < APPLE_Z2_N1_IRQ_FRAMES; i++) {
+		ret = apple_z2_n1_frame_locked(z2);
+		if (ret <= 0)
+			return ret;
+		ret = apple_z2_n1_attn(z2, false);
+		if (ret <= 0)
+			return ret;
+	}
+
+	return -EOVERFLOW;
+}
+
+/*
+ * After a runtime error the interrupt stays masked and this work tries to
+ * resynchronise: wake and drain, then rediscovery, up to three times a
+ * second apart, then a full boot. It never reloads firmware otherwise.
+ */
+static void apple_z2_n1_rearm_work(struct work_struct *work)
+{
+	struct apple_z2 *z2 = container_of(to_delayed_work(work),
+					   struct apple_z2, rearm_work);
+	int error;
+
+	mutex_lock(&z2->io_lock);
+	if (z2->stopping || !z2->booted) {
+		mutex_unlock(&z2->io_lock);
+		return;
+	}
+
+	if (z2->rearm_attempts++ < APPLE_Z2_N1_REARM_ATTEMPTS) {
+		z2->wake_valid = false;
+		error = apple_z2_n1_wake_locked(z2);
+		if (!error)
+			error = apple_z2_n1_service_locked(z2);
+		if (error) {
+			apple_z2_release_contacts(z2);
+			z2->index_parity = 0;
+			error = apple_z2_n1_discover_locked(z2);
+			if (!error)
+				error = apple_z2_n1_service_locked(z2);
+		}
+		if (!error) {
+			z2->rearm_attempts = 0;
+			apple_z2_irq_on(z2);
+		} else {
+			dev_warn(&z2->spidev->dev,
+				 "touch resynchronisation %u failed: %d\n",
+				 z2->rearm_attempts, error);
+			schedule_delayed_work(&z2->rearm_work,
+					      msecs_to_jiffies(APPLE_Z2_N1_REARM_DELAY_MS));
+		}
+		mutex_unlock(&z2->io_lock);
+		return;
+	}
+
+	z2->booted = false;
+	mutex_unlock(&z2->io_lock);
+
+	dev_warn(&z2->spidev->dev, "restarting the touch controller\n");
+	apple_z2_platform_power_off(z2);
+	error = apple_z2_j71t_boot(z2);
+	if (error)
+		dev_err(&z2->spidev->dev, "touch controller restart failed: %d\n",
+			error);
+}
+
+static void apple_z2_n1_irq_locked(struct apple_z2 *z2)
+{
+	int error;
+
+	if (z2->stopping || !z2->irq_on)
+		return;
+
+	error = apple_z2_n1_service_locked(z2);
+	if (!error)
+		return;
+
+	dev_warn_ratelimited(&z2->spidev->dev,
+			     "touch frame error %d, resynchronising\n", error);
+	apple_z2_release_contacts(z2);
+	z2->irq_on = false;
+	disable_irq_nosync(z2->spidev->irq);
+	z2->rearm_attempts = 0;
+	schedule_delayed_work(&z2->rearm_work,
+			      msecs_to_jiffies(APPLE_Z2_N1_REARM_DELAY_MS));
+}
+
 static irqreturn_t apple_z2_irq(int irq, void *data)
 {
 	struct apple_z2 *z2 = data;
@@ -1146,9 +2095,14 @@ static irqreturn_t apple_z2_irq(int irq, void *data)
 
 	if (unlikely(!z2->booted)) {
 		complete(&z2->boot_irq);
+	} else if (apple_z2_is_j71t(z2)) {
+		mutex_lock(&z2->io_lock);
+		apple_z2_n1_irq_locked(z2);
+		mutex_unlock(&z2->io_lock);
 	} else {
 		mutex_lock(&z2->io_lock);
-		error = apple_z2_read_packet(z2);
+		error = apple_z2_is_gen1(z2) ? apple_z2_gen1_drain(z2) :
+						 apple_z2_read_packet(z2);
 		mutex_unlock(&z2->io_lock);
 		if (error)
 			dev_warn_ratelimited(&z2->spidev->dev,
@@ -1289,17 +2243,53 @@ static void apple_z2_platform_power_off(struct apple_z2 *z2)
 {
 	int error;
 
-	if (apple_z2_is_iphone7_plus(z2))
+	if (apple_z2_is_gen1(z2))
+		apple_z2_gen1_restore_irq_type(z2);
+
+	if (apple_z2_is_j71t(z2)) {
+		gpiod_set_value_cansleep(z2->reset_gpio, 1);
+		error = z2->sync_active ?
+			pinctrl_select_state(z2->sync_pinctrl,
+					     z2->sync_inactive) : 0;
+		if (error)
+			dev_warn(&z2->spidev->dev,
+				 "failed to stop display sync: %d\n", error);
+		if (z2->clk_enabled) {
+			clk_disable_unprepare(z2->clk);
+			z2->clk_enabled = false;
+		}
+		apple_z2_set_gpio(z2->power_ldo_gpio, 0);
+		if (z2->ana_enabled) {
+			error = regulator_disable(z2->ana_supply);
+			if (error)
+				dev_warn(&z2->spidev->dev,
+					 "failed to disable analog supply: %d\n",
+					 error);
+			else
+				z2->ana_enabled = false;
+		}
+		z2->platform_powered = false;
+		return;
+	}
+
+	if (apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2))
 		gpiod_set_value_cansleep(z2->reset_gpio, 1);
 
 	if (z2->clk_enabled) {
 		clk_disable_unprepare(z2->clk);
 		z2->clk_enabled = false;
 	}
-	if (apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2))
+	if (apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2))
 		usleep_range(1000, 2000);
 
-	if (apple_z2_is_iphone7_plus(z2)) {
+	if (apple_z2_is_j71b(z2)) {
+		apple_z2_set_gpio(z2->power_ldo_gpio, 0);
+		apple_z2_set_gpio(z2->power_ana_gpio, 0);
+		z2->platform_powered = false;
+		return;
+	}
+
+	if (apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2)) {
 		if (z2->core_enabled) {
 			error = regulator_disable(z2->core_supply);
 			if (error) {
@@ -1323,7 +2313,7 @@ static void apple_z2_platform_power_off(struct apple_z2 *z2)
 		return;
 	}
 
-	if (apple_z2_is_j172(z2)) {
+	if (apple_z2_uses_ipad_protocol(z2)) {
 		error = apple_z2_j172_sync_set_inactive(z2);
 		if (error)
 			dev_warn(&z2->spidev->dev,
@@ -1381,6 +2371,113 @@ static int apple_z2_j172_power_on(struct apple_z2 *z2)
 					 APPLE_Z2_STATE_POWERED);
 }
 
+static int apple_z2_j71b_power_on(struct apple_z2 *z2)
+{
+	int error;
+
+	gpiod_set_value_cansleep(z2->reset_gpio, 1);
+	apple_z2_platform_power_off(z2);
+	msleep(50);
+
+	apple_z2_set_gpio(z2->power_ana_gpio, 1);
+	usleep_range(10000, 11000);
+	apple_z2_set_gpio(z2->power_ldo_gpio, 1);
+	usleep_range(1000, 2000);
+
+	error = apple_z2_enable_clock(z2);
+	if (error) {
+		apple_z2_platform_power_off(z2);
+		return error;
+	}
+
+	usleep_range(15000, 16000);
+	z2->platform_powered = true;
+	return apple_z2_advance_protocol(z2, APPLE_Z2_STATE_OFF,
+					 APPLE_Z2_STATE_POWERED);
+}
+
+/*
+ * iPad 5 power-up (iOS 0xfffffff005e985dc, 0xfffffff005ea100c,
+ * 0xfffffff005ea0ecc): analog supply and LDO, 5 ms, reference clock,
+ * 15 ms, REQ_WAKEUP (19 c1), 10 ms, display sync, the HBPP NOP probe,
+ * reset release and 15 ms.
+ */
+static int apple_z2_j71t_power_on(struct apple_z2 *z2)
+{
+	int error;
+
+	gpiod_set_value_cansleep(z2->reset_gpio, 1);
+	usleep_range(5000, 6000);
+
+	error = regulator_enable(z2->ana_supply);
+	if (error)
+		return error;
+	z2->ana_enabled = true;
+	apple_z2_set_gpio(z2->power_ldo_gpio, 1);
+	usleep_range(5000, 6000);
+
+	error = apple_z2_enable_clock(z2);
+	if (error)
+		goto err_power_off;
+	usleep_range(15000, 16000);
+
+	z2->tx_buf[0] = 0x19;
+	z2->tx_buf[1] = 0xc1;
+	error = apple_z2_hbpp_xfer(z2, 2);
+	if (error)
+		goto err_power_off;
+	usleep_range(10000, 11000);
+
+	if (z2->sync_active) {
+		error = pinctrl_select_state(z2->sync_pinctrl,
+					     z2->sync_active);
+		if (error)
+			goto err_power_off;
+	}
+
+	error = apple_z2_hbpp_nop(z2);
+	if (error)
+		goto err_power_off;
+	gpiod_set_value_cansleep(z2->reset_gpio, 0);
+	usleep_range(15000, 16000);
+
+	z2->platform_powered = true;
+	return 0;
+
+err_power_off:
+	apple_z2_platform_power_off(z2);
+	return error;
+}
+
+static int apple_z2_n61_power_on(struct apple_z2 *z2)
+{
+	int error;
+
+	gpiod_set_value_cansleep(z2->reset_gpio, 1);
+	/* Chestnut prepares its shared boost/Sage rails before the touch LDO. */
+	error = regulator_enable(z2->hv_supply);
+	if (error)
+		return error;
+	z2->hv_enabled = true;
+	error = regulator_enable(z2->core_supply);
+	if (error)
+		goto err_power_off;
+	z2->core_enabled = true;
+	/* The N61 enable-CS helper settles for 5 ms before clock startup. */
+	usleep_range(5000, 6000);
+	error = apple_z2_enable_clock(z2);
+	if (error)
+		goto err_power_off;
+	usleep_range(15000, 16000);
+	z2->platform_powered = true;
+	z2->protocol_state = APPLE_Z2_STATE_POWERED;
+	return 0;
+
+err_power_off:
+	apple_z2_platform_power_off(z2);
+	return error;
+}
+
 static int apple_z2_iphone7_plus_power_on(struct apple_z2 *z2)
 {
 	int error;
@@ -1420,7 +2517,11 @@ static int apple_z2_platform_power_on(struct apple_z2 *z2)
 	if (z2->platform_powered)
 		return 0;
 
-	if (apple_z2_is_j172(z2))
+	if (apple_z2_is_j71b(z2))
+		return apple_z2_j71b_power_on(z2);
+	if (apple_z2_is_j71t(z2))
+		return apple_z2_j71t_power_on(z2);
+	if (apple_z2_uses_ipad_protocol(z2))
 		return apple_z2_j172_power_on(z2);
 	if (apple_z2_is_iphone7_plus(z2))
 		return apple_z2_iphone7_plus_power_on(z2);
@@ -1465,6 +2566,18 @@ static const char *apple_z2_calibration_property(u32 provider)
 		return ORB_FORCE_CAL_PROP_NAME;
 	case APPLE_Z2_CAL_SHAPE_ACCEL:
 		return SHAPE_ACCEL_CAL_PROP_NAME;
+	case APPLE_Z2_CAL_DISPLAY_OFFSET:
+		return DISPLAY_OFFSET_CAL_PROP_NAME;
+	case APPLE_Z2_CAL_FIREFLY:
+		return FIREFLY_CAL_PROP_NAME;
+	case APPLE_Z2_CAL_PRESSURE:
+		return PRESSURE_CAL_PROP_NAME;
+	case APPLE_Z2_CAL_FIREFLY_P100:
+		return FIREFLY_P100_CAL_PROP_NAME;
+	case APPLE_Z2_CAL_EXT_MULTI_TOUCH:
+		return EXT_CAL_PROP_NAME;
+	case APPLE_Z2_CAL_PROX:
+		return PROX_CAL_PROP_NAME;
 	default:
 		return NULL;
 	}
@@ -1526,33 +2639,26 @@ static const u8 *apple_z2_build_cal_blob(struct apple_z2 *z2,
 	return no_free_ptr(blob_data);
 }
 
-/* Build the HBPP14 calibration packet used by iPhone 7 Plus Gen2 firmware. */
-static const u8 *apple_z2_build_iphone7_cal(struct apple_z2 *z2,
-					    const char *property, u32 address,
-					    u32 max_size, size_t *size)
+/*
+ * Build an HBPP14 data packet loading @len bytes to @address: the 18 e1
+ * prefix, the 30 01 data command, the BE16 word count, the address as two
+ * BE16 halves (low half first), a BE16 sum of the count and address bytes,
+ * the payload with each byte pair swapped and its 32-bit byte sum.
+ */
+static u8 *apple_z2_build_hbpp_blob(struct apple_z2 *z2, u32 address,
+				    const u8 *data, size_t len, size_t *size)
 {
-	u8 *cal_data;
-	int cal_size;
 	size_t padded_size;
 	size_t words;
 	size_t blob_size;
 	u32 checksum;
 	u16 header_checksum;
+	u8 *payload;
 	unsigned int i;
-	int error;
 
-	if (!device_property_present(&z2->spidev->dev, property))
-		return ERR_PTR(-ENOENT);
-
-	cal_size = device_property_count_u8(&z2->spidev->dev, property);
-	if (cal_size <= 0)
-		return ERR_PTR(cal_size ?: -EINVAL);
-	if (cal_size > max_size)
-		return ERR_PTR(-E2BIG);
-
-	padded_size = round_up((size_t)cal_size, sizeof(__le32));
+	padded_size = round_up(len, sizeof(__le32));
 	words = padded_size / sizeof(__le32);
-	if (words > U16_MAX)
+	if (!words || words > U16_MAX)
 		return ERR_PTR(-E2BIG);
 	blob_size = 12 + padded_size + sizeof(__le32);
 	u8 *blob_data __free(kfree) = kzalloc(blob_size, GFP_KERNEL);
@@ -1561,8 +2667,11 @@ static const u8 *apple_z2_build_iphone7_cal(struct apple_z2 *z2,
 
 	put_unaligned_be16(0x18e1, blob_data);
 	put_unaligned_be16(APPLE_Z2_HBPP_CMD_BLOB, blob_data + 2);
-	/* HBPP 0x103 encodes the full number of four-byte payload words. */
-	put_unaligned_be16(words, blob_data + 4);
+	/*
+	 * HBPP 0x103 encodes the full number of four-byte payload words,
+	 * HBPP 0x104 and later one less.
+	 */
+	put_unaligned_be16(z2->hbpp_version >= 0x104 ? words - 1 : words, blob_data + 4);
 	put_unaligned_be16(address, blob_data + 6);
 	put_unaligned_be16(address >> 16, blob_data + 8);
 	header_checksum = 0;
@@ -1570,22 +2679,468 @@ static const u8 *apple_z2_build_iphone7_cal(struct apple_z2 *z2,
 		header_checksum += blob_data[i];
 	put_unaligned_be16(header_checksum, blob_data + 10);
 
-	cal_data = blob_data + 12;
+	payload = blob_data + 12;
+	memcpy(payload, data, len);
+	checksum = 0;
+	for (i = 0; i < len; i++)
+		checksum += payload[i];
+	for (i = 0; i < padded_size; i += 2)
+		swap(payload[i], payload[i + 1]);
+	put_unaligned_be16(checksum, payload + padded_size);
+	put_unaligned_be16(checksum >> 16, payload + padded_size + 2);
+
+	*size = blob_size;
+	return no_free_ptr(blob_data);
+}
+
+/* Build the HBPP14 calibration packet used by iPhone 7 Plus Gen2 firmware. */
+static const u8 *apple_z2_build_iphone7_cal(struct apple_z2 *z2,
+					    const char *property, u32 address,
+					    u32 max_size, size_t *size)
+{
+	int cal_size;
+	int error;
+
+	/*
+	 * Units without this calibration keep the default the firmware file
+	 * loads before the record.
+	 */
+	if (!device_property_present(&z2->spidev->dev, property)) {
+		dev_info(&z2->spidev->dev, "no %s, keeping the firmware default\n", property);
+		*size = 0;
+		return NULL;
+	}
+
+	cal_size = device_property_count_u8(&z2->spidev->dev, property);
+	if (cal_size <= 0)
+		return ERR_PTR(cal_size ?: -EINVAL);
+	if (cal_size > max_size)
+		return ERR_PTR(-E2BIG);
+
+	u8 *cal_data __free(kfree) = kmalloc(cal_size, GFP_KERNEL);
+	if (!cal_data)
+		return ERR_PTR(-ENOMEM);
 	error = device_property_read_u8_array(&z2->spidev->dev, property,
 					      cal_data, cal_size);
 	if (error)
 		return ERR_PTR(error);
 
-	checksum = 0;
-	for (i = 0; i < cal_size; i++)
-		checksum += cal_data[i];
-	for (i = 0; i < padded_size; i += 2)
-		swap(cal_data[i], cal_data[i + 1]);
-	put_unaligned_be16(checksum, cal_data + padded_size);
-	put_unaligned_be16(checksum >> 16, cal_data + padded_size + 2);
+	return apple_z2_build_hbpp_blob(z2, address, cal_data, cal_size, size);
+}
 
-	*size = blob_size;
-	return no_free_ptr(blob_data);
+/* N1 controller values are two BE16 halves, low half first. */
+static void apple_z2_hbpp_put32(u8 *p, u32 value)
+{
+	put_unaligned_be16(value, p);
+	put_unaligned_be16(value >> 16, p + 2);
+}
+
+static u32 apple_z2_hbpp_get32(const u8 *p)
+{
+	return get_unaligned_be16(p) | (u32)get_unaligned_be16(p + 2) << 16;
+}
+
+static u16 apple_z2_hbpp_sum(const u8 *p, size_t len)
+{
+	u16 sum = 0;
+
+	while (len--)
+		sum += *p++;
+	return sum;
+}
+
+/* Full-duplex transfer of the first @len bytes of tx_buf into rx_buf. */
+static int apple_z2_hbpp_xfer(struct apple_z2 *z2, unsigned int len)
+{
+	struct spi_transfer xfer = {
+		.tx_buf = z2->tx_buf,
+		.rx_buf = z2->rx_buf,
+		.len = len,
+		.bits_per_word = 8,
+	};
+
+	memset(z2->rx_buf, 0, len);
+	return spi_sync_transfer(z2->spidev, &xfer, 1);
+}
+
+/* ATN_ACK (iOS 0xfffffff005ea23c0): 1a a1, the reply is a BE16 status. */
+static int apple_z2_hbpp_ack(struct apple_z2 *z2, u16 *reply)
+{
+	int error;
+
+	z2->tx_buf[0] = 0x1a;
+	z2->tx_buf[1] = 0xa1;
+	error = apple_z2_hbpp_xfer(z2, 2);
+	if (!error)
+		*reply = get_unaligned_be16(z2->rx_buf);
+	return error;
+}
+
+/* The NOP probe: 1a a1, then 18 e1 seven times (iOS 0xfffffff005ea21a8). */
+static int apple_z2_hbpp_nop(struct apple_z2 *z2)
+{
+	unsigned int i;
+
+	z2->tx_buf[0] = 0x1a;
+	z2->tx_buf[1] = 0xa1;
+	for (i = 2; i < APPLE_Z2_CMD_SIZE; i += 2) {
+		z2->tx_buf[i] = 0x18;
+		z2->tx_buf[i + 1] = 0xe1;
+	}
+	return apple_z2_hbpp_xfer(z2, APPLE_Z2_CMD_SIZE);
+}
+
+static bool apple_z2_hbpp_word(u16 word)
+{
+	switch (word) {
+	case 0x18e1:
+	case 0x1aa1:
+	case 0x1f01:
+	case 0x4879:
+	case 0x4969:
+	case 0x4ad1:
+	case 0x4bc1:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * Register read (iOS 0xfffffff005ea2564): 1c 73, the address and the BE16
+ * sum of its bytes, then 1a a1 18 e1 18 e1 18 e1 returns the value at 2.
+ */
+static int apple_z2_hbpp_read_reg(struct apple_z2 *z2, u32 addr, u32 *value)
+{
+	static const u8 result[] = {
+		0x1a, 0xa1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1,
+	};
+	int error;
+
+	z2->tx_buf[0] = 0x1c;
+	z2->tx_buf[1] = 0x73;
+	apple_z2_hbpp_put32(z2->tx_buf + 2, addr);
+	put_unaligned_be16(apple_z2_hbpp_sum(z2->tx_buf + 2, 4), z2->tx_buf + 6);
+	error = apple_z2_hbpp_xfer(z2, 8);
+	if (error)
+		return error;
+
+	memcpy(z2->tx_buf, result, sizeof(result));
+	error = apple_z2_hbpp_xfer(z2, sizeof(result));
+	if (!error)
+		*value = apple_z2_hbpp_get32(z2->rx_buf + 2);
+	return error;
+}
+
+/*
+ * Masked register write (iOS 0xfffffff005ea268c): 1e 33, address, mask,
+ * value and the BE16 sum of those 12 bytes; ATN_ACK answers 0x4ad1.
+ */
+static int apple_z2_hbpp_write_reg(struct apple_z2 *z2, u32 addr, u32 value)
+{
+	u16 reply;
+	int error;
+
+	z2->tx_buf[0] = 0x1e;
+	z2->tx_buf[1] = 0x33;
+	apple_z2_hbpp_put32(z2->tx_buf + 2, addr);
+	apple_z2_hbpp_put32(z2->tx_buf + 6, 0xffffffff);
+	apple_z2_hbpp_put32(z2->tx_buf + 10, value);
+	put_unaligned_be16(apple_z2_hbpp_sum(z2->tx_buf + 2, 12),
+			   z2->tx_buf + 14);
+	error = apple_z2_hbpp_xfer(z2, APPLE_Z2_CMD_SIZE);
+	if (!error)
+		error = apple_z2_hbpp_ack(z2, &reply);
+	if (error)
+		return error;
+	if (reply != APPLE_Z2_HBPP_ACK_WRITE) {
+		dev_err(&z2->spidev->dev, "register %#x write: ACK %#06x\n",
+			addr, reply);
+		return -EPROTO;
+	}
+
+	return 0;
+}
+
+/*
+ * HBPP data packets are sent byte-wise as they are; ATN_ACK answers 0x4bc1.
+ * iOS tries each packet up to five times.
+ */
+static int apple_z2_hbpp_send(struct apple_z2 *z2, const u8 *data, size_t len)
+{
+	struct spi_transfer xfer = {
+		.tx_buf = data,
+		.len = len,
+		.bits_per_word = 8,
+	};
+	unsigned int i;
+	u16 reply = 0;
+	int error = 0;
+
+	for (i = 0; i < APPLE_Z2_HBPP_ATTEMPTS; i++) {
+		if (i)
+			usleep_range(1000, 2000);
+		error = spi_sync_transfer(z2->spidev, &xfer, 1);
+		if (!error)
+			error = apple_z2_hbpp_ack(z2, &reply);
+		if (!error && reply == APPLE_Z2_HBPP_ACK_BLOB)
+			return 0;
+	}
+
+	dev_err(&z2->spidev->dev, "HBPP packet of %zu bytes: error %d, ACK %#06x\n",
+		len, error, reply);
+	return error ?: -EPROTO;
+}
+
+/*
+ * The unit's calibration goes to the controller in packets of at most
+ * cal_chunk_size bytes (iOS 0xfffffff005ea5f58).
+ */
+static int apple_z2_n1_send_calibration(struct apple_z2 *z2,
+					const char *property, u32 address,
+					u32 max_size)
+{
+	const struct apple_z2_n1_info *n1 = z2->info->n1;
+	size_t offset, chunk, size;
+	int cal_size;
+	int error;
+
+	if (!device_property_present(&z2->spidev->dev, property))
+		return 0;
+
+	cal_size = device_property_count_u8(&z2->spidev->dev, property);
+	if (cal_size <= 0)
+		return cal_size ?: -EINVAL;
+	if (cal_size > max_size)
+		return -E2BIG;
+
+	u8 *cal_data __free(kfree) = kmalloc(cal_size, GFP_KERNEL);
+	if (!cal_data)
+		return -ENOMEM;
+	error = device_property_read_u8_array(&z2->spidev->dev, property,
+					      cal_data, cal_size);
+	if (error)
+		return error;
+
+	for (offset = 0; offset < cal_size; offset += chunk) {
+		chunk = min_t(size_t, cal_size - offset, n1->cal_chunk_size);
+
+		const u8 *blob __free(kfree) =
+			apple_z2_build_hbpp_blob(z2, address + offset,
+						 cal_data + offset, chunk,
+						 &size);
+		if (IS_ERR(blob))
+			return PTR_ERR(blob);
+
+		error = apple_z2_hbpp_send(z2, blob, size);
+		if (error)
+			return error;
+	}
+
+	return 0;
+}
+
+/*
+ * HBPP detection (iOS 0xfffffff005ea2348): both BE16 words the NOP probe
+ * returns are HBPP status words. The controller version is at 0x10008ffc.
+ */
+static int apple_z2_n1_detect(struct apple_z2 *z2)
+{
+	u32 version;
+	int error;
+
+	error = apple_z2_hbpp_nop(z2);
+	if (error)
+		return error;
+	if (!apple_z2_hbpp_word(get_unaligned_be16(z2->rx_buf)) ||
+	    !apple_z2_hbpp_word(get_unaligned_be16(z2->rx_buf + 2))) {
+		dev_err(&z2->spidev->dev, "no HBPP bootloader: %*ph\n", 4,
+			z2->rx_buf);
+		return -ENODEV;
+	}
+
+	error = apple_z2_hbpp_read_reg(z2, APPLE_Z2_N1_VERSION_REG, &version);
+	if (error)
+		return error;
+	if (!version || version == U32_MAX) {
+		dev_err(&z2->spidev->dev, "invalid controller version %#x\n",
+			version);
+		return -ENODEV;
+	}
+
+	dev_dbg(&z2->spidev->dev, "N1 controller %#x\n", version);
+	return 0;
+}
+
+/*
+ * After the calibration and the firmware: the register calibration of
+ * MTSPIBootloader_N1::performCalibSeq() (iOS 0xfffffff005ea8830), the
+ * calibration request 1f 01 with its 65 ms, and the firmware execute
+ * command 1d 53 (iOS 0xfffffff005ea5fc8). The bootloader waits 40 ms
+ * after it, its caller another 2 ms before discovery.
+ */
+static int apple_z2_n1_start_firmware(struct apple_z2 *z2)
+{
+	const struct apple_z2_n1_info *n1 = z2->info->n1;
+	u32 version, value;
+	unsigned int i;
+	u16 reply;
+	int error;
+
+	/* iOS reads the version again after the firmware upload. */
+	error = apple_z2_hbpp_read_reg(z2, APPLE_Z2_N1_VERSION_REG, &version);
+	if (error)
+		return error;
+
+	for (i = 0; i < n1->num_calib_regs; i++) {
+		value = n1->calib_regs[i].value;
+		if (n1->calib_regs[i].addr == APPLE_Z2_N1_CONST_CAL_REG &&
+		    version == APPLE_Z2_N1_CONST_CAL_V11A0)
+			value = 2;
+		error = apple_z2_hbpp_write_reg(z2, n1->calib_regs[i].addr,
+						value);
+		if (error)
+			return error;
+	}
+
+	/* SPI_APU_EN, read by iOS for its log only */
+	error = apple_z2_hbpp_read_reg(z2, APPLE_Z2_N1_APU_EN_REG, &value);
+	if (error)
+		return error;
+	dev_dbg(&z2->spidev->dev, "controller %#x, SPI_APU_EN %#x\n",
+		version, value);
+
+	z2->tx_buf[0] = 0x1f;
+	z2->tx_buf[1] = 0x01;
+	error = apple_z2_hbpp_xfer(z2, 2);
+	if (error)
+		return error;
+	msleep(65);
+	/* iOS checks only that the ACK transfer completes. */
+	error = apple_z2_hbpp_ack(z2, &reply);
+	if (error)
+		return error;
+	dev_dbg(&z2->spidev->dev, "calibration status %#06x\n", reply);
+
+	z2->tx_buf[0] = 0x1d;
+	z2->tx_buf[1] = 0x53;
+	apple_z2_hbpp_put32(z2->tx_buf + 2, n1->execute_addr);
+	put_unaligned_le32(n1->execute_arg, z2->tx_buf + 6);
+	put_unaligned_be16(apple_z2_hbpp_sum(z2->tx_buf + 2, 8), z2->tx_buf + 10);
+	error = apple_z2_hbpp_xfer(z2, 12);
+	if (error)
+		return error;
+	msleep(40);
+	usleep_range(2000, 3000);
+
+	return 0;
+}
+
+static int apple_z2_n1_finish_boot(struct apple_z2 *z2)
+{
+	int error;
+
+	error = apple_z2_n1_start_firmware(z2);
+	if (error)
+		return error;
+
+	/*
+	 * Drain what queued up during discovery, then take the falling ATN
+	 * edge the DT describes, as iOS does; the interrupt thread reads
+	 * frames while ATN stays asserted.
+	 */
+	mutex_lock(&z2->io_lock);
+	z2->index_parity = 0;
+	error = apple_z2_n1_discover_locked(z2);
+	if (!error) {
+		z2->booted = true;
+		error = apple_z2_n1_service_locked(z2);
+	}
+	if (!error) {
+		z2->rearm_attempts = 0;
+		apple_z2_irq_on(z2);
+	}
+	mutex_unlock(&z2->io_lock);
+
+	return error;
+}
+
+static const u8 *apple_z2_build_n61_cal(struct apple_z2 *z2,
+				       const char *property, u32 address,
+				       u32 maximum, u32 provider, size_t *size)
+{
+	struct device *dev = &z2->spidev->dev;
+	u8 *cal __free(kfree) = NULL;
+	u8 *packet __free(kfree) = NULL;
+	int length, error;
+
+	if (!apple_z2_n61_calibration_target(address, maximum, provider))
+		return ERR_PTR(-EINVAL);
+	if (!device_property_present(dev, property))
+		return provider == APPLE_Z2_CAL_MULTI_TOUCH ? ERR_PTR(-ENOENT) : NULL;
+	length = device_property_count_u8(dev, property);
+	if (length <= 0 || length > maximum)
+		return ERR_PTR(-EINVAL);
+	cal = kmalloc(length, GFP_KERNEL);
+	if (!cal)
+		return ERR_PTR(-ENOMEM);
+	error = device_property_read_u8_array(dev, property, cal, length);
+	if (error)
+		return ERR_PTR(error);
+	packet = kzalloc(16 + round_up(length, 4), GFP_KERNEL);
+	if (!packet)
+		return ERR_PTR(-ENOMEM);
+	error = apple_z2_n61_calibration_packet(packet, 16 + round_up(length, 4),
+					       cal, length, address);
+	if (error < 0)
+		return ERR_PTR(error);
+	*size = error;
+	return no_free_ptr(packet);
+}
+
+/* Gen1 byte streams keep CS asserted across bounded PIO chunks. */
+static int apple_z2_send_n61_blob(struct apple_z2 *z2, const u8 *data,
+				  u32 size, bool init)
+{
+	struct spi_transfer chunks[APPLE_Z2_N61_MAX_CHUNKS] = { };
+	struct spi_transfer ack = {
+		.tx_buf = z2->tx_buf,
+		.rx_buf = z2->rx_buf,
+		.len = 2,
+		.bits_per_word = 8,
+		.speed_hz = 500000,
+	};
+	unsigned int count, i;
+	u32 offset = 0;
+	int error;
+
+	if (!size || size > APPLE_Z2_N61_MAX_BLOB ||
+	    (init && !apple_z2_n61_init_valid(data, size)))
+		return -EINVAL;
+	count = DIV_ROUND_UP(size, APPLE_Z2_N61_CHUNK);
+	for (i = 0; i < count; i++) {
+		chunks[i].tx_buf = data + offset;
+		chunks[i].len = min_t(u32, size - offset, APPLE_Z2_N61_CHUNK);
+		chunks[i].bits_per_word = 8;
+		chunks[i].speed_hz = 500000;
+		offset += chunks[i].len;
+	}
+	if (init) {
+		memset(z2->rx_buf, 0, size);
+		chunks[0].rx_buf = z2->rx_buf;
+	}
+	apple_z2_apply_z2_delays(z2);
+	error = spi_sync_transfer(z2->spidev, chunks, count);
+	if (error)
+		return error;
+	if (init)
+		return 0;
+	z2->tx_buf[0] = 0x1a;
+	z2->tx_buf[1] = 0xa1;
+	error = spi_sync_transfer(z2->spidev, &ack, 1);
+	if (!error)
+		apple_z2_post_ack_delay(z2);
+	return error;
 }
 
 static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
@@ -1604,6 +3159,9 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 	bool ready;
 	int error;
 
+	if (apple_z2_is_n61(z2))
+		return apple_z2_send_n61_blob(z2, data, size, init);
+
 	/*
 	 * iPhone 7 Plus firmware stores HBPP byte streams in 8-bit wire order.
 	 * SmartIO may still DMA these transfers, but using 16-bit SPI words would
@@ -1612,11 +3170,13 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 	if (!init && !apple_z2_is_iphone7_plus(z2) &&
 	    size >= z2->bpw16_min_len)
 		blob_xfer.bits_per_word = 16;
+	if (init && apple_z2_is_j71b(z2))
+		blob_xfer.speed_hz = 500000;
 
 	dev_dbg(&z2->spidev->dev, "firmware blob len=%u bpw=%u\n",
 		size, blob_xfer.bits_per_word);
 
-	if ((apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2)) && init) {
+	if ((apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2)) && init) {
 		if (size != 4 || data[0] != 0x1a || data[1] != 0xa1 ||
 		    data[2] != 0x18 || data[3] != 0xe1)
 			return dev_err_probe(&z2->spidev->dev, -EINVAL,
@@ -1634,7 +3194,7 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 	if (error)
 		return error;
 
-	if ((apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2)) && init) {
+	if ((apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2)) && init) {
 		ready = z2->rx_buf[0] == 0x1f && z2->rx_buf[1] == 0x01;
 		if (!ready)
 			return dev_err_probe(&z2->spidev->dev, -EPROTO,
@@ -1648,7 +3208,7 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 			return error;
 		apple_z2_post_ack_delay(z2);
 	}
-	if ((apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2)) && init) {
+	if ((apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2)) && init) {
 		error = apple_z2_advance_protocol(z2, APPLE_Z2_STATE_BOOT_IRQ,
 						  APPLE_Z2_STATE_HBPP_READY);
 		if (error)
@@ -1657,7 +3217,7 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 
 	if (defer_irq_wait && z2->upload_irq_masked) {
 		z2->upload_irq_masked = false;
-		enable_irq(z2->spidev->irq);
+		apple_z2_irq_on(z2);
 	}
 
 	if (!defer_irq_wait)
@@ -1741,15 +3301,15 @@ static int apple_z2_wait_ready_irq(struct apple_z2 *z2, u32 timeout_ms)
 {
 	if (!apple_z2_wait_firmware_irq(z2, timeout_ms))
 		return -ETIMEDOUT;
-	if (!apple_z2_is_j172(z2) && !apple_z2_is_iphone7_plus(z2))
+	if (!apple_z2_uses_ipad_protocol(z2) && !apple_z2_is_iphone7_plus(z2))
 		return 0;
 
-	if (apple_z2_is_j172(z2) &&
+	if (apple_z2_uses_ipad_protocol(z2) &&
 	    !apple_z2_wait_firmware_irq(z2, timeout_ms))
 		return -ETIMEDOUT;
 
 	dev_dbg(&z2->spidev->dev, "firmware ready IRQ%s received\n",
-		apple_z2_is_j172(z2) ? "s" : "");
+		apple_z2_uses_ipad_protocol(z2) ? "s" : "");
 	return apple_z2_advance_protocol(z2, APPLE_Z2_STATE_HBPP_READY,
 					 APPLE_Z2_STATE_FIRMWARE_READY);
 }
@@ -1777,16 +3337,22 @@ static int apple_z2_apply_fw_config(struct apple_z2 *z2, const u8 *data,
 	cpha = apple_z2_fw_config_word(data, 4);
 	cpol = apple_z2_fw_config_word(data, 5);
 	boot_timeout = apple_z2_fw_config_word(data, 9);
+	z2->hbpp_version = (valid & APPLE_Z2_FW_CONFIG_HBPP_VERSION) ?
+			   apple_z2_fw_config_word(data, 10) : 0;
 	if ((valid & APPLE_Z2_FW_CONFIG_MIN_DMA) && min_dma) {
 		if (apple_z2_is_iphone7_plus(z2)) {
 			if (min_dma > APPLE_Z2_RX_BUF_SIZE)
 				return -EINVAL;
 			z2->dma_min_len = min_dma;
+		} else if (apple_z2_is_j71b(z2)) {
+			/* Shorter 16-bit transfers corrupt J71b uploads. */
+			z2->bpw16_min_len = max_t(u32, 17, min_dma);
 		} else {
 			z2->bpw16_min_len = min_dma;
 		}
 	}
-	if (valid & APPLE_Z2_FW_CONFIG_Z2_DELAY)
+	/* The iPad 5 control delay comes from its match data. */
+	if ((valid & APPLE_Z2_FW_CONFIG_Z2_DELAY) && !z2->info->n1)
 		z2->z2_inter_packet_delay_us = z2_delay;
 	/* iPhone 7 Plus uses zero to retain the required 1 ms CS delay. */
 	if ((valid & APPLE_Z2_FW_CONFIG_CS_DELAY) &&
@@ -1841,6 +3407,7 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	u32 timeout_ms;
 	bool defer_irq_wait;
 	bool init;
+	bool n61_touch_calibration = false;
 	int error;
 
 	error = request_firmware(&fw, z2->fw_name, &z2->spidev->dev);
@@ -1865,6 +3432,17 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 		size = get_unaligned_le32(fw->data + fw_idx);
 		fw_idx += sizeof(__le32);
 
+		/*
+		 * The N1 bootloader is found by its NOP probe and needs no boot
+		 * interrupt; its packets are checked through ATN_ACK, and its
+		 * calibration uses the HBPP14 records.
+		 */
+		if (apple_z2_is_j71t(z2) &&
+		    (load_cmd == LOAD_COMMAND_INIT_PAYLOAD ||
+		     load_cmd == LOAD_COMMAND_WAIT_IRQ ||
+		     load_cmd == LOAD_COMMAND_SEND_CALIBRATION))
+			return -EINVAL;
+
 		switch (load_cmd) {
 		case LOAD_COMMAND_INIT_PAYLOAD:
 		case LOAD_COMMAND_SEND_BLOB: {
@@ -1872,6 +3450,13 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 
 			if (size > fw->size - fw_idx)
 				return -EINVAL;
+			if (apple_z2_is_j71t(z2)) {
+				error = apple_z2_hbpp_send(z2, blob, size);
+				if (error)
+					return error;
+				fw_idx += size;
+				break;
+			}
 			init = load_cmd == LOAD_COMMAND_INIT_PAYLOAD;
 			next_idx = round_up(fw_idx + size, 4);
 			defer_irq_wait = next_idx <= fw->size &&
@@ -1886,6 +3471,8 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			break;
 		}
 		case LOAD_COMMAND_RAW_XFER:
+			if (apple_z2_is_n61(z2))
+				return -EINVAL;
 			if (size > fw->size - fw_idx)
 				return -EINVAL;
 			error = apple_z2_send_firmware_raw_xfer(z2, fw->data + fw_idx, size);
@@ -1894,6 +3481,8 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			fw_idx += size;
 			break;
 		case LOAD_COMMAND_SET_CONFIG:
+			if (apple_z2_is_n61(z2))
+				return -EINVAL;
 			if (size > fw->size - fw_idx)
 				return -EINVAL;
 			error = apple_z2_apply_fw_config(z2, fw->data + fw_idx, size);
@@ -1903,6 +3492,9 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			break;
 		case LOAD_COMMAND_SEND_CALIBRATION: {
 			const u8 *data __free(kfree) = NULL;
+
+			if (apple_z2_is_n61(z2))
+				return -EINVAL;
 
 			address = size;
 			data = apple_z2_build_cal_blob(z2, CAL_PROP_NAME, address,
@@ -1922,7 +3514,9 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			u32 max_size;
 			u32 provider;
 
-			if (!apple_z2_is_iphone7_plus(z2))
+			if (!apple_z2_is_iphone7_plus(z2) &&
+			    !apple_z2_uses_ipad_protocol(z2) &&
+			    !apple_z2_is_n61(z2) && !apple_z2_is_j71t(z2))
 				return -EINVAL;
 			if (size != sizeof(struct apple_z2_fw_calibration) ||
 			    size > fw->size - fw_idx)
@@ -1936,10 +3530,28 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 				return -EINVAL;
 			fw_idx += size;
 
-			data = apple_z2_build_iphone7_cal(z2, property, address,
-							  max_size, &size);
+			if (apple_z2_is_j71t(z2)) {
+				error = apple_z2_n1_send_calibration(z2, property,
+								     address,
+								     max_size);
+				if (error)
+					return error;
+				break;
+			}
+
+			if (apple_z2_is_n61(z2)) {
+				data = apple_z2_build_n61_cal(z2, property, address,
+							      max_size, provider, &size);
+				if (!IS_ERR_OR_NULL(data) && provider == APPLE_Z2_CAL_MULTI_TOUCH)
+					n61_touch_calibration = true;
+			} else {
+				data = apple_z2_build_iphone7_cal(z2, property, address,
+								  max_size, &size);
+			}
 			if (IS_ERR(data))
 				return PTR_ERR(data);
+			if (!data)
+				break;
 			error = apple_z2_send_firmware_blob(z2, data, size,
 							    false, false);
 			if (error)
@@ -1947,6 +3559,8 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			break;
 		}
 		case LOAD_COMMAND_WAIT_IRQ:
+			if (apple_z2_is_n61(z2))
+				return -EINVAL;
 			if (size != sizeof(__le32) || size > fw->size - fw_idx)
 				return -EINVAL;
 			timeout_ms = get_unaligned_le32(fw->data + fw_idx);
@@ -1954,10 +3568,14 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			error = apple_z2_wait_ready_irq(z2, timeout_ms);
 			if (error)
 				return error;
-			if (apple_z2_is_j172(z2)) {
-				disable_irq(z2->spidev->irq);
+			if (apple_z2_uses_ipad_protocol(z2)) {
+				apple_z2_irq_off(z2);
 				error = apple_z2_read_device_info_locked(z2);
-				enable_irq(z2->spidev->irq);
+				/* J71b: stay masked until its first reports are read. */
+				if (apple_z2_is_j71b(z2))
+					z2->upload_irq_masked = true;
+				else
+					apple_z2_irq_on(z2);
 				if (error)
 					return error;
 			}
@@ -1967,6 +3585,27 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 		}
 
 		fw_idx = round_up(fw_idx, 4);
+	}
+
+	if (apple_z2_is_j71t(z2))
+		return apple_z2_n1_finish_boot(z2);
+
+	if (apple_z2_is_n61(z2)) {
+		if (!n61_touch_calibration)
+			return -ENOENT;
+		msleep(50);
+		mutex_lock(&z2->io_lock);
+		error = apple_z2_n61_init_locked(z2);
+		if (!error) {
+			z2->booted = true;
+			z2->protocol_state = APPLE_Z2_STATE_REPORTS_READY;
+		}
+		mutex_unlock(&z2->io_lock);
+		if (!error && z2->upload_irq_masked) {
+			z2->upload_irq_masked = false;
+			enable_irq(z2->spidev->irq);
+		}
+		return error;
 	}
 
 	if (apple_z2_is_iphone7_plus(z2)) {
@@ -1990,18 +3629,27 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	z2->booted = true;
 	mutex_lock(&z2->io_lock);
 	error = apple_z2_read_packet(z2);
-	if (!error && apple_z2_is_j172(z2) && !z2->runtime_frame_valid)
+	if (!error && apple_z2_uses_ipad_protocol(z2) && !z2->runtime_frame_valid &&
+	    !(apple_z2_is_j71b(z2) && z2->runtime_queue_empty))
 		error = -EPROTO;
-	if (!error && apple_z2_is_j172(z2))
+	if (!error && apple_z2_uses_ipad_protocol(z2))
 		error = apple_z2_advance_protocol(z2, APPLE_Z2_STATE_DEVICE_INFO,
 						  APPLE_Z2_STATE_RUNTIME);
-	if (!error && apple_z2_is_j172(z2))
+	if (!error && apple_z2_uses_ipad_protocol(z2))
 		error = apple_z2_j172_init_reads_locked(z2);
+	if (!error && apple_z2_is_j71b(z2))
+		error = apple_z2_gen1_drain(z2);
+	if (!error && apple_z2_is_j71b(z2))
+		error = apple_z2_gen1_set_level_irq(z2);
+	if (!error && apple_z2_is_j71b(z2) && z2->upload_irq_masked) {
+		z2->upload_irq_masked = false;
+		apple_z2_irq_on(z2);
+	}
 	mutex_unlock(&z2->io_lock);
 	if (error)
 		return error;
 
-	if (!apple_z2_is_j172(z2))
+	if (!apple_z2_uses_ipad_protocol(z2))
 		return 0;
 
 	msleep(2260);
@@ -2069,6 +3717,7 @@ static int apple_z2_boot_preamble(struct apple_z2 *z2, bool full_duplex)
 		.tx_buf = z2->tx_buf,
 		.len = 4,
 		.bits_per_word = 8,
+		.speed_hz = apple_z2_is_j71b(z2) ? 500000 : 0,
 	};
 	int error;
 
@@ -2103,10 +3752,102 @@ static int apple_z2_iphone7_plus_post_boot_preamble(struct apple_z2 *z2)
 	return spi_sync_transfer(z2->spidev, &xfer, 1);
 }
 
+static int apple_z2_n61_boot(struct apple_z2 *z2)
+{
+	static const u8 preamble[] = { 0x19, 0xc1 };
+	static const u8 check[] = { 0x1a, 0xa1, 0x18, 0xe1, 0x18, 0xe1,
+				    0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1,
+				    0x18, 0xe1, 0x18, 0xe1 };
+	unsigned int attempt;
+	int error;
+
+	z2->booted = false;
+	apple_z2_reset_protocol(z2);
+	error = apple_z2_n61_power_on(z2);
+	if (error)
+		return error;
+	/* AppleMultitouchN1SPI exchanges the preamble while reset is held. */
+	error = apple_z2_send_n61_blob(z2, preamble, sizeof(preamble), true);
+	if (error)
+		goto err_power;
+	usleep_range(10000, 11000);
+	/* N61 reset-deassert preflight clocks one complete CHECK exchange. */
+	error = apple_z2_send_n61_blob(z2, check, sizeof(check), true);
+	if (error)
+		goto err_power;
+	gpiod_set_value_cansleep(z2->reset_gpio, 0);
+	/* N61 reset-deassert-delay is 15 ms. Readiness is synchronous. */
+	usleep_range(15000, 16000);
+	for (attempt = 0; attempt < APPLE_Z2_N61_READY_ATTEMPTS; attempt++) {
+		error = apple_z2_send_n61_blob(z2, check, sizeof(check), true);
+		if (error)
+			goto err_power;
+		if (apple_z2_n61_rom_ready(z2->rx_buf, sizeof(check)))
+			break;
+		if (attempt + 1 < APPLE_Z2_N61_READY_ATTEMPTS)
+			usleep_range(5000, 6000);
+	}
+	if (attempt == APPLE_Z2_N61_READY_ATTEMPTS) {
+		error = -ETIMEDOUT;
+		goto err_power;
+	}
+	/* IRQF_NO_AUTOEN keeps runtime IRQs masked until reports are ready. */
+	z2->upload_irq_masked = true;
+	z2->protocol_state = APPLE_Z2_STATE_HBPP_READY;
+	error = apple_z2_upload_firmware(z2);
+	if (!error)
+		return 0;
+	z2->upload_irq_masked = false;
+err_power:
+	gpiod_set_value_cansleep(z2->reset_gpio, 1);
+	apple_z2_platform_power_off(z2);
+	apple_z2_reset_protocol(z2);
+	return error;
+}
+
+/*
+ * The iPad 5 boots without a boot interrupt: power-up, HBPP detection,
+ * the firmware file (calibration and firmware packets), then the N1
+ * register calibration, execute and runtime discovery.
+ */
+static int apple_z2_j71t_boot(struct apple_z2 *z2)
+{
+	int error;
+
+	z2->booted = false;
+	z2->wake_valid = false;
+	apple_z2_reset_protocol(z2);
+
+	/* The SPI mode and timing must be set before the first transfer. */
+	error = apple_z2_apply_initial_config(z2);
+	if (error)
+		return error;
+
+	error = apple_z2_platform_power_on(z2);
+	if (error)
+		return error;
+
+	error = apple_z2_n1_detect(z2);
+	if (!error)
+		error = apple_z2_upload_firmware(z2);
+	if (error) {
+		z2->booted = false;
+		apple_z2_platform_power_off(z2);
+		apple_z2_reset_protocol(z2);
+	}
+
+	return error;
+}
+
 static int apple_z2_boot(struct apple_z2 *z2)
 {
 	bool irq_enabled = false;
 	int error;
+
+	if (apple_z2_is_j71t(z2))
+		return apple_z2_j71t_boot(z2);
+	if (apple_z2_is_n61(z2))
+		return apple_z2_n61_boot(z2);
 
 	z2->booted = false;
 	apple_z2_reset_protocol(z2);
@@ -2114,12 +3855,12 @@ static int apple_z2_boot(struct apple_z2 *z2)
 	if (error)
 		return error;
 
-	if (apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2)) {
+	if (apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2)) {
 		error = apple_z2_apply_initial_config(z2);
 		if (error)
 			goto err_stop;
 	}
-	if (apple_z2_is_j172(z2)) {
+	if (apple_z2_uses_ipad_protocol(z2)) {
 		error = apple_z2_boot_preamble(z2, false);
 		if (error)
 			goto err_stop;
@@ -2138,9 +3879,13 @@ static int apple_z2_boot(struct apple_z2 *z2)
 	}
 
 	reinit_completion(&z2->boot_irq);
-	enable_irq(z2->spidev->irq);
+	apple_z2_irq_on(z2);
 	irq_enabled = true;
-	if (apple_z2_is_j172(z2)) {
+	if (apple_z2_is_j71b(z2)) {
+		/* J71b boots on reset release; a pulse would restart it. */
+		gpiod_set_value_cansleep(z2->reset_gpio, 0);
+		error = 0;
+	} else if (apple_z2_uses_ipad_protocol(z2)) {
 		error = apple_z2_pulse_reset(z2);
 	} else if (apple_z2_is_iphone7_plus(z2)) {
 		gpiod_set_value_cansleep(z2->reset_gpio, 0);
@@ -2158,7 +3903,7 @@ static int apple_z2_boot(struct apple_z2 *z2)
 		error = -ETIMEDOUT;
 		goto err_stop;
 	}
-	if (apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2)) {
+	if (apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2)) {
 		error = apple_z2_advance_protocol(z2,
 						  APPLE_Z2_STATE_SPI_CONFIGURED,
 						  APPLE_Z2_STATE_BOOT_IRQ);
@@ -2171,8 +3916,8 @@ static int apple_z2_boot(struct apple_z2 *z2)
 			goto err_stop;
 	}
 
-	if (apple_z2_is_j172(z2) || apple_z2_is_iphone7_plus(z2)) {
-		disable_irq(z2->spidev->irq);
+	if (apple_z2_uses_ipad_protocol(z2) || apple_z2_is_iphone7_plus(z2)) {
+		apple_z2_irq_off(z2);
 		z2->upload_irq_masked = true;
 	}
 
@@ -2186,10 +3931,10 @@ err_stop:
 	z2->booted = false;
 	if (z2->upload_irq_masked) {
 		z2->upload_irq_masked = false;
-		enable_irq(z2->spidev->irq);
+		apple_z2_irq_on(z2);
 	}
 	if (irq_enabled)
-		disable_irq(z2->spidev->irq);
+		apple_z2_irq_off(z2);
 	gpiod_set_value_cansleep(z2->reset_gpio, 1);
 	apple_z2_platform_power_off(z2);
 	apple_z2_reset_protocol(z2);
@@ -2206,6 +3951,105 @@ static const struct apple_z2_chip_info apple_z2_j493_info = {
 	.variant = APPLE_Z2_VARIANT_GENERIC,
 };
 
+static const struct apple_z2_chip_info apple_z2_j71b_info = {
+	.name = "iPad7,5 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71B,
+	.cs_setup_us = 1000,
+	.cs_inactive_us = 1000,
+};
+
+/*
+ * iPad 5 (J71t) N1, personality C1F15,1 (iOS AppleMultitouchN1SPI). The
+ * register calibration is N1's defaults with the C1F15,1 overrides
+ * fll-mval and clk32-clock-enable (iOS 0xfffffff005ea8ab0,
+ * 0xfffffff005ea8b00); the descriptor values are this model's.
+ */
+static const struct apple_z2_hbpp_reg apple_z2_j71t_calib_regs[] = {
+	{ 0x10003060, 6089 },	/* fll-mval */
+	{ 0x1000305c, 0x20 },
+	{ 0x10003058, 6 },
+	{ APPLE_Z2_N1_CONST_CAL_REG, 3 },
+	{ 0x10003518, 1 },	/* clk32-clock-enable */
+};
+
+static const struct apple_z2_n1_info apple_z2_j71t_n1 = {
+	.calib_regs = apple_z2_j71t_calib_regs,
+	.num_calib_regs = ARRAY_SIZE(apple_z2_j71t_calib_regs),
+	.execute_addr = 0x10003400,
+	.execute_arg = 0x100,
+	.cal_size = 0x400,
+	.cal_chunk_size = 0x3f0,
+	.control_delay_us = 25,
+	.get_delay_us = 2000,
+	.wake_holdoff_ms = 100,
+	.get_attempts = 5,
+	.device_info_attempts = 4,
+	.device_info_retry_us = 3000,
+	.interface = 1,
+	.family = 21,
+	.rows = 40,
+	.columns = 30,
+	.surface_width = 14745,
+	.surface_height = 19657,
+};
+
+/*
+ * iOS configureSPI() programs a zero inter-word delay and 10 us chip-select
+ * setup and hold, with no separate inactive time.
+ */
+static const struct apple_z2_chip_info apple_z2_j71t_info = {
+	.name = "iPad6,11 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71T,
+	.cs_setup_us = 10,
+	.cs_hold_us = 10,
+	.n1 = &apple_z2_j71t_n1,
+};
+
+/*
+ * iPad Air 2 (J81, J82) N1, personality C1F15,2 (iOS AppleMultitouchN1SPI,
+ * "AppleMultitouchSPI - J82" in iPadOS 15.8). It overrides the same two N1
+ * defaults as C1F15,1, fll-mval with its own value, and shares C1F15,1's
+ * touch-size-id (3), parser-type (1) and parser-options (0x10), so the
+ * descriptor values are the iPad 5's.
+ */
+static const struct apple_z2_hbpp_reg apple_z2_j81_calib_regs[] = {
+	{ 0x10003060, 6068 },	/* fll-mval */
+	{ 0x1000305c, 0x20 },
+	{ 0x10003058, 6 },
+	{ APPLE_Z2_N1_CONST_CAL_REG, 3 },
+	{ 0x10003518, 1 },	/* clk32-clock-enable */
+};
+
+static const struct apple_z2_n1_info apple_z2_j81_n1 = {
+	.calib_regs = apple_z2_j81_calib_regs,
+	.num_calib_regs = ARRAY_SIZE(apple_z2_j81_calib_regs),
+	.execute_addr = 0x10003400,
+	.execute_arg = 0x100,
+	.cal_size = 0x400,
+	.cal_chunk_size = 0x3f0,
+	.control_delay_us = 25,
+	.get_delay_us = 2000,
+	.wake_holdoff_ms = 100,
+	.get_attempts = 5,
+	.device_info_attempts = 4,
+	.device_info_retry_us = 3000,
+	.interface = 1,
+	.family = 21,
+	.rows = 40,
+	.columns = 30,
+	.surface_width = 14745,
+	.surface_height = 19657,
+};
+
+/* The iPad 5's N1 runtime, SPI timing and power sequence. */
+static const struct apple_z2_chip_info apple_z2_j81_info = {
+	.name = "iPad5,3 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71T,
+	.cs_setup_us = 10,
+	.cs_hold_us = 10,
+	.n1 = &apple_z2_j81_n1,
+};
+
 static const struct apple_z2_chip_info apple_z2_j172_info = {
 	.name = "iPad7,12 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_J172,
@@ -2219,6 +4063,14 @@ static const struct apple_z2_chip_info apple_z2_d11_info = {
 static const struct apple_z2_chip_info apple_z2_d111_info = {
 	.name = "iPhone9,4 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_D111,
+};
+
+static const struct apple_z2_chip_info apple_z2_n61_info = {
+	.name = "iPhone 6 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_N61,
+	.cs_setup_us = 1000,
+	.cs_hold_us = 1000,
+	.cs_inactive_us = 1000,
 };
 
 static int apple_z2_probe(struct spi_device *spi)
@@ -2247,13 +4099,22 @@ static int apple_z2_probe(struct spi_device *spi)
 		return -ENOMEM;
 
 	z2->spidev = spi;
+	z2->info = info;
 	z2->variant = info->variant;
+	if (apple_z2_is_n61(z2)) {
+		z2->z2_inter_packet_delay_us = 1000;
+		z2->z2_cs_delay_us = 1000;
+	}
 	z2->boot_timeout_ms = 20;
 	if (apple_z2_is_iphone7_plus(z2)) {
 		z2->z2_inter_packet_delay_us = 1000;
 		z2->z2_cs_delay_us = 1000;
 		z2->boot_timeout_ms = 500;
 	}
+	if (apple_z2_is_j71b(z2))
+		z2->boot_timeout_ms = 500;
+	if (info->n1)
+		z2->z2_inter_packet_delay_us = info->n1->control_delay_us;
 	z2->bpw16_min_len = 1;
 	device_property_read_u32(dev, "apple,z2-bpw16-min-len",
 				 &z2->bpw16_min_len);
@@ -2263,14 +4124,15 @@ static int apple_z2_probe(struct spi_device *spi)
 						    "apple,z2-no-init-ack");
 	init_completion(&z2->boot_irq);
 	mutex_init(&z2->io_lock);
+	INIT_DELAYED_WORK(&z2->rearm_work, apple_z2_n1_rearm_work);
 	spi_set_drvdata(spi, z2);
 
 	z2->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(z2->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(z2->reset_gpio),
 				     "unable to get reset GPIO\n");
-	if (apple_z2_is_iphone7_plus(z2)) {
-		z2->hv_supply = devm_regulator_get(dev, "hv");
+	if (apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2)) {
+		z2->hv_supply = devm_regulator_get(dev, apple_z2_is_n61(z2) ? "ana" : "hv");
 		if (IS_ERR(z2->hv_supply))
 			return dev_err_probe(dev, PTR_ERR(z2->hv_supply),
 					     "unable to get HV supply\n");
@@ -2279,6 +4141,42 @@ static int apple_z2_probe(struct spi_device *spi)
 		if (IS_ERR(z2->core_supply))
 			return dev_err_probe(dev, PTR_ERR(z2->core_supply),
 					     "unable to get core supply\n");
+	}
+	if (apple_z2_is_j71t(z2)) {
+		/* Claimed as an input so its pin is configured as one. */
+		z2->attn_gpio = devm_gpiod_get_optional(dev, "attn", GPIOD_IN);
+		if (IS_ERR(z2->attn_gpio))
+			return dev_err_probe(dev, PTR_ERR(z2->attn_gpio),
+					     "unable to get ATN GPIO\n");
+
+		z2->ana_supply = devm_regulator_get(dev, "ana");
+		if (IS_ERR(z2->ana_supply))
+			return dev_err_probe(dev, PTR_ERR(z2->ana_supply),
+					     "unable to get analog supply\n");
+
+		z2->sync_pinctrl = devm_pinctrl_get(dev);
+		if (IS_ERR(z2->sync_pinctrl))
+			return dev_err_probe(dev, PTR_ERR(z2->sync_pinctrl),
+					     "unable to get display-sync pins\n");
+		/*
+		 * Where iOS leaves display sync an input instead of routing it
+		 * to the controller (J81), the board describes no states.
+		 */
+		z2->sync_active = pinctrl_lookup_state(z2->sync_pinctrl,
+						       "display-sync-active");
+		if (PTR_ERR_OR_ZERO(z2->sync_active) == -ENODEV) {
+			z2->sync_active = NULL;
+		} else if (IS_ERR(z2->sync_active)) {
+			return dev_err_probe(dev, PTR_ERR(z2->sync_active),
+					     "missing display-sync-active state\n");
+		} else {
+			z2->sync_inactive =
+				pinctrl_lookup_state(z2->sync_pinctrl,
+						     "display-sync-inactive");
+			if (IS_ERR(z2->sync_inactive))
+				return dev_err_probe(dev, PTR_ERR(z2->sync_inactive),
+						     "missing display-sync-inactive state\n");
+		}
 	}
 
 	z2->power_ana_gpio =
@@ -2302,7 +4200,10 @@ static int apple_z2_probe(struct spi_device *spi)
 		return dev_err_probe(dev, PTR_ERR(z2->display_sync1_gpio),
 				     "unable to get display-sync1 GPIO\n");
 
-	z2->clk = devm_clk_get_optional(dev, NULL);
+	if (apple_z2_is_n61(z2))
+		z2->clk = devm_clk_get(dev, NULL);
+	else
+		z2->clk = devm_clk_get_optional(dev, NULL);
 	if (IS_ERR(z2->clk))
 		return dev_err_probe(dev, PTR_ERR(z2->clk),
 				     "unable to get clock\n");
@@ -2342,6 +4243,29 @@ static int apple_z2_probe(struct spi_device *spi)
 		}
 	}
 
+	/* The bootloader copies the unit's calibration from the ADT. */
+	if (info->n1) {
+		cal_size = device_property_count_u8(dev, CAL_PROP_NAME);
+		if (cal_size != info->n1->cal_size)
+			return dev_err_probe(dev, -EINVAL,
+					     "invalid calibration size %d\n",
+					     cal_size);
+
+		u8 *cal __free(kfree) = kmalloc(cal_size, GFP_KERNEL);
+		if (!cal)
+			return -ENOMEM;
+		error = device_property_read_u8_array(dev, CAL_PROP_NAME, cal,
+						      cal_size);
+		if (error)
+			return dev_err_probe(dev, error,
+					     "unable to read calibration\n");
+		/* An erased or unset record is not a calibration. */
+		if (!memchr_inv(cal, 0, cal_size) ||
+		    !memchr_inv(cal, 0xff, cal_size))
+			return dev_err_probe(dev, -EINVAL,
+					     "blank calibration\n");
+	}
+
 	z2->input_dev = devm_input_allocate_device(dev);
 	if (!z2->input_dev)
 		return -ENOMEM;
@@ -2359,9 +4283,12 @@ static int apple_z2_probe(struct spi_device *spi)
 	input_set_abs_params(z2->input_dev, ABS_MT_ORIENTATION, -32768, 32767,
 			     0, 0);
 
-	if (apple_z2_is_j172(z2)) {
+	if (apple_z2_uses_ipad_protocol(z2)) {
 		slots = APPLE_Z2_J172_MAX_CONTACTS;
-	} else if (apple_z2_is_iphone7_plus(z2)) {
+	} else if (apple_z2_is_j71t(z2)) {
+		slots = APPLE_Z2_CLASSIC_MAX_CONTACTS;
+		mt_flags |= INPUT_MT_DROP_UNUSED;
+	} else if (apple_z2_is_iphone7_plus(z2) || apple_z2_is_n61(z2)) {
 		slots = 10;
 		if (apple_z2_is_d11(z2))
 			mt_flags |= INPUT_MT_DROP_UNUSED;
@@ -2383,7 +4310,22 @@ static int apple_z2_probe(struct spi_device *spi)
 
 static void apple_z2_stop(struct apple_z2 *z2)
 {
-	disable_irq(z2->spidev->irq);
+	bool irq_on;
+
+	if (apple_z2_is_j71t(z2)) {
+		mutex_lock(&z2->io_lock);
+		z2->stopping = true;
+		mutex_unlock(&z2->io_lock);
+		cancel_delayed_work_sync(&z2->rearm_work);
+	}
+
+	/* The iPad 5 interrupt thread may mask the interrupt itself. */
+	mutex_lock(&z2->io_lock);
+	irq_on = z2->irq_on;
+	z2->irq_on = false;
+	mutex_unlock(&z2->io_lock);
+	if (irq_on)
+		disable_irq(z2->spidev->irq);
 	gpiod_direction_output(z2->reset_gpio, 1);
 	z2->booted = false;
 	apple_z2_platform_power_off(z2);
@@ -2406,6 +4348,7 @@ static int apple_z2_resume(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
+	z2->stopping = false;
 	return apple_z2_boot(z2);
 }
 
@@ -2414,9 +4357,13 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_z2_pm, apple_z2_suspend, apple_z2_resume);
 static const struct of_device_id apple_z2_of_match[] = {
 	{ .compatible = "apple,j293-touchbar", .data = &apple_z2_j293_info },
 	{ .compatible = "apple,j493-touchbar", .data = &apple_z2_j493_info },
+	{ .compatible = "apple,j71b-touchscreen", .data = &apple_z2_j71b_info },
+	{ .compatible = "apple,j71t-touchscreen", .data = &apple_z2_j71t_info },
+	{ .compatible = "apple,j81-touchscreen", .data = &apple_z2_j81_info },
 	{ .compatible = "apple,j172-touchscreen", .data = &apple_z2_j172_info },
 	{ .compatible = "apple,d11-touchscreen", .data = &apple_z2_d11_info },
 	{ .compatible = "apple,d111-touchscreen", .data = &apple_z2_d111_info },
+	{ .compatible = "apple,n61-touchscreen", .data = &apple_z2_n61_info },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_z2_of_match);
@@ -2424,9 +4371,13 @@ MODULE_DEVICE_TABLE(of, apple_z2_of_match);
 static struct spi_device_id apple_z2_of_id[] = {
 	{ .name = "j293-touchbar", .driver_data = (kernel_ulong_t)&apple_z2_j293_info },
 	{ .name = "j493-touchbar", .driver_data = (kernel_ulong_t)&apple_z2_j493_info },
+	{ .name = "j71b-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j71b_info },
+	{ .name = "j71t-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j71t_info },
+	{ .name = "j81-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j81_info },
 	{ .name = "j172-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j172_info },
 	{ .name = "d11-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d11_info },
 	{ .name = "d111-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d111_info },
+	{ .name = "n61-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n61_info },
 	{}
 };
 MODULE_DEVICE_TABLE(spi, apple_z2_of_id);
