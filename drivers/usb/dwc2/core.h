@@ -867,6 +867,10 @@ struct dwc2_hregs_backup {
  * @role_sw:		usb_role_switch handle
  * @role_sw_default_mode: default operation mode of controller while usb role
  *			is USB_ROLE_NONE
+ * @role_sw_lock:	Serializes role changes against the fallback
+ * @role_sw_fallback:	Connects a peripheral-only controller as a device if
+ *			nothing sets a role in time
+ * @role_sw_driven:	A role has been set through the role switch
  * @hcd_enabled:	Host mode sub-driver initialization indicator.
  * @gadget_enabled:	Peripheral mode sub-driver initialization indicator.
  * @ll_hw_enabled:	Status of low-level hardware resources.
@@ -1069,6 +1073,9 @@ struct dwc2_hsotg {
 	enum usb_dr_mode dr_mode;
 	struct usb_role_switch *role_sw;
 	enum usb_dr_mode role_sw_default_mode;
+	struct mutex role_sw_lock;
+	struct delayed_work role_sw_fallback;
+	bool role_sw_driven;
 	unsigned int hcd_enabled:1;
 	unsigned int gadget_enabled:1;
 	unsigned int ll_hw_enabled:1;

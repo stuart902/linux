@@ -13,6 +13,14 @@
 #include <linux/usb/role.h>
 #include "core.h"
 
+/*
+ * A peripheral-only controller whose role switch has no default mode stays
+ * disconnected until a connector driver sets a role. If none has within this
+ * time (missing, deferred or stuck), connect as a device anyway so that the
+ * gadget stays reachable.
+ */
+#define DWC2_ROLE_SW_FALLBACK_MS	1000
+
 #define dwc2_ovr_gotgctl(gotgctl) \
 	((gotgctl) |= GOTGCTL_BVALOEN | GOTGCTL_AVALOEN | GOTGCTL_VBVALOEN | \
 	 GOTGCTL_DBNCE_FLTR_BYPASS)
@@ -83,9 +91,8 @@ static int dwc2_ovr_bvalid(struct dwc2_hsotg *hsotg, bool valid)
 	return 0;
 }
 
-static int dwc2_drd_role_sw_set(struct usb_role_switch *sw, enum usb_role role)
+static int dwc2_drd_set_role(struct dwc2_hsotg *hsotg, enum usb_role role)
 {
-	struct dwc2_hsotg *hsotg = usb_role_switch_get_drvdata(sw);
 	unsigned long flags;
 	int already = 0;
 
@@ -170,6 +177,33 @@ static int dwc2_drd_role_sw_set(struct usb_role_switch *sw, enum usb_role role)
 	return 0;
 }
 
+static int dwc2_drd_role_sw_set(struct usb_role_switch *sw, enum usb_role role)
+{
+	struct dwc2_hsotg *hsotg = usb_role_switch_get_drvdata(sw);
+	int ret;
+
+	mutex_lock(&hsotg->role_sw_lock);
+	hsotg->role_sw_driven = true;
+	ret = dwc2_drd_set_role(hsotg, role);
+	mutex_unlock(&hsotg->role_sw_lock);
+	return ret;
+}
+
+static void dwc2_drd_role_sw_fallback(struct work_struct *work)
+{
+	struct dwc2_hsotg *hsotg = container_of(to_delayed_work(work),
+						struct dwc2_hsotg,
+						role_sw_fallback);
+
+	mutex_lock(&hsotg->role_sw_lock);
+	if (!hsotg->role_sw_driven) {
+		dev_warn(hsotg->dev, "no role set within %u ms, connecting as a device\n",
+			 DWC2_ROLE_SW_FALLBACK_MS);
+		dwc2_drd_set_role(hsotg, USB_ROLE_DEVICE);
+	}
+	mutex_unlock(&hsotg->role_sw_lock);
+}
+
 int dwc2_drd_init(struct dwc2_hsotg *hsotg)
 {
 	struct usb_role_switch_desc role_sw_desc = {0};
@@ -180,6 +214,8 @@ int dwc2_drd_init(struct dwc2_hsotg *hsotg)
 		return 0;
 
 	hsotg->role_sw_default_mode = usb_get_role_switch_default_mode(hsotg->dev);
+	mutex_init(&hsotg->role_sw_lock);
+	INIT_DELAYED_WORK(&hsotg->role_sw_fallback, dwc2_drd_role_sw_fallback);
 	role_sw_desc.driver_data = hsotg;
 	role_sw_desc.fwnode = dev_fwnode(hsotg->dev);
 	role_sw_desc.set = dwc2_drd_role_sw_set;
@@ -197,6 +233,11 @@ int dwc2_drd_init(struct dwc2_hsotg *hsotg)
 
 	/* Enable override and initialize values */
 	dwc2_ovr_init(hsotg);
+
+	if (hsotg->dr_mode == USB_DR_MODE_PERIPHERAL &&
+	    hsotg->role_sw_default_mode == USB_DR_MODE_UNKNOWN)
+		schedule_delayed_work(&hsotg->role_sw_fallback,
+				      msecs_to_jiffies(DWC2_ROLE_SW_FALLBACK_MS));
 
 	return 0;
 }
@@ -254,6 +295,8 @@ void dwc2_drd_resume(struct dwc2_hsotg *hsotg)
 
 void dwc2_drd_exit(struct dwc2_hsotg *hsotg)
 {
-	if (hsotg->role_sw)
+	if (hsotg->role_sw) {
+		cancel_delayed_work_sync(&hsotg->role_sw_fallback);
 		usb_role_switch_unregister(hsotg->role_sw);
+	}
 }
