@@ -136,6 +136,13 @@
 				     <77 IRQ_TYPE_EDGE_RISING>;
 			apple,tristar = <&tristar>;
 			input-current-limit-microamp = <2400000>;
+
+			/* The charger decides when USB data may come on. */
+			port {
+				tristar_charger_usb: endpoint {
+					remote-endpoint = <&usbdev_role>;
+				};
+			};
 		};
 
 		nvmem@5000 {
@@ -274,9 +281,19 @@
 	status = "okay";
 };
 
-/* Tell the Lightning charger what the USB host allows. */
+/*
+ * The Lightning charger sets the data role: USB data stays off until the
+ * source is identified. It is told what the USB host allows.
+ */
 &usbdev {
 	usb-psy-name = "lightning";
+	usb-role-switch;
+
+	port {
+		usbdev_role: endpoint {
+			remote-endpoint = <&tristar_charger_usb>;
+		};
+	};
 };
 
 &wlan_uart2 {

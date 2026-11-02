@@ -25,6 +25,8 @@
 
 &usbdev {
 	/delete-property/ usb-psy-name;
+	/delete-property/ usb-role-switch;
+	/delete-node/ port;
 };
 
 /* The PMU event line of the iPad 7 is not described yet. */
