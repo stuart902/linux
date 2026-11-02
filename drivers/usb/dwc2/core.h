@@ -867,6 +867,12 @@ struct dwc2_hregs_backup {
  * @role_sw:		usb_role_switch handle
  * @role_sw_default_mode: default operation mode of controller while usb role
  *			is USB_ROLE_NONE
+ * @role_sw_lock:	Serializes role changes against the fallback
+ * @role_sw_fallback:	Connects a peripheral-only controller as a device if
+ *			nothing sets a role in time
+ * @role_sw_driven:	A role has been set through the role switch
+ * @role_sw_hold:	A peripheral-only controller without a default mode
+ *			holds its pull-up off: no role, or no device role, set
  * @hcd_enabled:	Host mode sub-driver initialization indicator.
  * @gadget_enabled:	Peripheral mode sub-driver initialization indicator.
  * @ll_hw_enabled:	Status of low-level hardware resources.
@@ -1052,6 +1058,10 @@ struct dwc2_hregs_backup {
  * @new_connection:	Used in host mode. True if there are new connected
  *			device
  * @enabled:		Indicates the enabling state of controller
+ * @usb_psy_name:	Name of the power supply told what the host allows
+ *			the device to draw (vbus_draw), or NULL
+ * @vbus_draw_work:	Work passing @vbus_draw_ma to that power supply
+ * @vbus_draw_ma:	Current the gadget may draw, from vbus_draw
  *
  */
 struct dwc2_hsotg {
@@ -1065,6 +1075,10 @@ struct dwc2_hsotg {
 	enum usb_dr_mode dr_mode;
 	struct usb_role_switch *role_sw;
 	enum usb_dr_mode role_sw_default_mode;
+	struct mutex role_sw_lock;
+	struct delayed_work role_sw_fallback;
+	bool role_sw_driven;
+	bool role_sw_hold;
 	unsigned int hcd_enabled:1;
 	unsigned int gadget_enabled:1;
 	unsigned int ll_hw_enabled:1;
@@ -1225,6 +1239,9 @@ struct dwc2_hsotg {
 	unsigned int remote_wakeup_allowed:1;
 	struct dwc2_hsotg_ep *eps_in[MAX_EPS_CHANNELS];
 	struct dwc2_hsotg_ep *eps_out[MAX_EPS_CHANNELS];
+	const char *usb_psy_name;
+	struct work_struct vbus_draw_work;
+	unsigned int vbus_draw_ma;
 #endif /* CONFIG_USB_DWC2_PERIPHERAL || CONFIG_USB_DWC2_DUAL_ROLE */
 };
 

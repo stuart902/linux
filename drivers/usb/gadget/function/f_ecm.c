@@ -371,6 +371,7 @@ static void ecm_do_notify(struct f_ecm *ecm)
 	struct usb_cdc_notification	*event;
 	struct usb_composite_dev	*cdev = ecm->port.func.config->cdev;
 	__le32				*data;
+	u8				state = ecm->notify_state;
 	int				status;
 
 	/* notification already in flight? */
@@ -417,6 +418,11 @@ static void ecm_do_notify(struct f_ecm *ecm)
 	status = usb_ep_queue(ecm->notify, req, GFP_ATOMIC);
 	if (status < 0) {
 		atomic_dec(&ecm->notify_count);
+		/*
+		 * Keep the notification pending: a suspended UDC rejects the
+		 * request (e.g. with -EAGAIN), and ecm_resume() sends it then.
+		 */
+		ecm->notify_state = state;
 		DBG(cdev, "notify --> %d\n", status);
 	}
 }
@@ -625,6 +631,7 @@ static void ecm_disable(struct usb_function *f)
 
 	usb_ep_disable(ecm->notify);
 	ecm->notify->desc = NULL;
+	ecm->notify_state = ECM_NOTIFY_NONE;
 }
 
 /*-------------------------------------------------------------------------*/
@@ -886,6 +893,9 @@ static void ecm_resume(struct usb_function *f)
 	DBG(cdev, "ECM Resume\n");
 
 	gether_resume(&ecm->port);
+
+	/* Send a notification that could not be queued while suspended */
+	ecm_do_notify(ecm);
 }
 
 static int ecm_get_status(struct usb_function *f)

@@ -390,11 +390,11 @@ void dwc2_wakeup_from_lpm_l1(struct dwc2_hsotg *hsotg, bool remotewakeup)
 			return;
 		}
 
-		/* Inform gadget to exit from L1 */
-		call_gadget(hsotg, resume);
-		/* Change to L0 state */
+		/* Change to L0 state before informing the gadget */
 		hsotg->lx_state = DWC2_L0;
 		hsotg->bus_suspended = false;
+		/* Inform gadget to exit from L1 */
+		call_gadget(hsotg, resume);
 fail:		dwc2_gadget_init_lpm(hsotg);
 	} else {
 		/* TODO */
