@@ -392,6 +392,8 @@ properties:
           - national,lm92
             # Nuvoton Temperature Sensor
           - nuvoton,w83773g
+            # NXP CBTL1610 (Apple Tristar) Lightning port controller
+          - nxp,cbtl1610
             # NXP ISP1301 USB transceiver
           - nxp,isp1301
             # OKI ML86V7667 video decoder

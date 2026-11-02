@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/apple,tristar-charger.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Tristar Lightning charging
+
+maintainers:
+  - Henrik Klee <henrik@goat-code.com>
+
+description: |
+  Charging on Apple devices whose Lightning port uses a Tristar (NXP CBTL1610)
+  port controller and a D2365-family PMIC, such as the iPad 5 and iPad 6. The
+  node is a child of the PMIC. It identifies the attached source through the
+  Tristar and the PMIC ADC and sets the PMIC input-current limit, which iBoot
+  leaves at 100 mA. PMU events come from the PMIC's event interrupt
+  controller (the PMIC GPIO node).
+
+  The Tristar mux shares the USB data lines, and the USB device controller
+  cannot sense VBUS. The charger is therefore the port's attach detector: it
+  sets the data role of the USB controller linked through its port, holding
+  USB data off from attach until the source is identified.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,j71b-tristar-charger
+          - apple,j71t-tristar-charger
+      - const: apple,tristar-charger
+
+  reg:
+    items:
+      - description: Charger status register bank.
+      - description: Charger control register bank.
+      - description: ADC register bank.
+
+  reg-names:
+    items:
+      - const: status
+      - const: control
+      - const: adc
+
+  interrupts:
+    minItems: 3
+    maxItems: 16
+    description: |
+      From the PMIC's event interrupt controller. The first is the PMU event
+      line itself, which runs before the events are read: the charger
+      withdraws a grant there, before it knows which event it was. The
+      second is ADC conversion complete. Every further entry is an event
+      that can signal a change of the attached source (attach, detach,
+      charger state); any of them starts a new identification.
+
+  apple,tristar:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The Tristar (CBTL1610) port controller on its I2C bus.
+
+  input-current-limit-microamp:
+    description: Board maximum input current.
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: Link to the USB controller whose role this charger sets.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - apple,tristar
+  - input-current-limit-microamp
+  - port
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    usb {
+        usb-role-switch;
+
+        port {
+            usb_role: endpoint {
+                remote-endpoint = <&charger_usb>;
+            };
+        };
+    };
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        tristar: port-controller@1a {
+            compatible = "nxp,cbtl1610";
+            reg = <0x1a>;
+        };
+    };
+
+    pmic {
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        pmu_gpio: gpio {
+            compatible = "apple,d2365-pmic-gpio";
+            gpio-controller;
+            #gpio-cells = <2>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+            interrupts = <38 IRQ_TYPE_LEVEL_LOW>;
+        };
+
+        charger@180 {
+            compatible = "apple,j71b-tristar-charger", "apple,tristar-charger";
+            reg = <0x180 0x10>, <0xa00 0x04>, <0x4000 0x03>;
+            reg-names = "status", "control", "adc";
+            interrupt-parent = <&pmu_gpio>;
+            interrupts = <240 IRQ_TYPE_EDGE_RISING>,
+                         <176 IRQ_TYPE_EDGE_RISING>,
+                         <16 IRQ_TYPE_EDGE_RISING>,
+                         <40 IRQ_TYPE_EDGE_RISING>,
+                         <41 IRQ_TYPE_EDGE_RISING>,
+                         <42 IRQ_TYPE_EDGE_RISING>,
+                         <43 IRQ_TYPE_EDGE_RISING>,
+                         <72 IRQ_TYPE_EDGE_RISING>,
+                         <77 IRQ_TYPE_EDGE_RISING>;
+            apple,tristar = <&tristar>;
+            input-current-limit-microamp = <2400000>;
+
+            port {
+                charger_usb: endpoint {
+                    remote-endpoint = <&usb_role>;
+                };
+            };
+        };
+    };
+...
