@@ -91,10 +91,46 @@ static int dwc2_ovr_bvalid(struct dwc2_hsotg *hsotg, bool valid)
 	return 0;
 }
 
+/*
+ * A peripheral-only controller without a default mode: no session override.
+ * Forcing B-valid low on the Apple A10's controller left an interrupt
+ * pending that nothing cleared, and CPU 0 never left its handler. A role is
+ * the pull-up instead: held off (DCTL.SFTDISCON) until the device role.
+ */
+static bool dwc2_drd_soft_role(struct dwc2_hsotg *hsotg)
+{
+	return hsotg->dr_mode == USB_DR_MODE_PERIPHERAL &&
+	       hsotg->role_sw_default_mode == USB_DR_MODE_UNKNOWN;
+}
+
+static int dwc2_drd_set_soft_role(struct dwc2_hsotg *hsotg, enum usb_role role)
+{
+	unsigned long flags;
+
+	if (role == USB_ROLE_HOST)
+		return -EINVAL;
+
+	spin_lock_irqsave(&hsotg->lock, flags);
+	hsotg->role_sw_hold = role != USB_ROLE_DEVICE;
+	if (dwc2_is_device_enabled(hsotg)) {
+		if (hsotg->role_sw_hold)
+			dwc2_hsotg_core_disconnect(hsotg);
+		else
+			dwc2_hsotg_core_connect(hsotg);
+	}
+	spin_unlock_irqrestore(&hsotg->lock, flags);
+
+	dev_dbg(hsotg->dev, "pull-up %s\n", hsotg->role_sw_hold ? "held off" : "released");
+	return 0;
+}
+
 static int dwc2_drd_set_role(struct dwc2_hsotg *hsotg, enum usb_role role)
 {
 	unsigned long flags;
 	int already = 0;
+
+	if (dwc2_drd_soft_role(hsotg))
+		return dwc2_drd_set_soft_role(hsotg, role);
 
 	/* Skip session not in line with dr_mode */
 	if ((role == USB_ROLE_DEVICE && hsotg->dr_mode == USB_DR_MODE_HOST) ||
@@ -231,8 +267,13 @@ int dwc2_drd_init(struct dwc2_hsotg *hsotg)
 
 	hsotg->role_sw = role_sw;
 
-	/* Enable override and initialize values */
-	dwc2_ovr_init(hsotg);
+	if (dwc2_drd_soft_role(hsotg)) {
+		/* No session yet: the pull-up stays off until the device role */
+		hsotg->role_sw_hold = true;
+	} else {
+		/* Enable override and initialize values */
+		dwc2_ovr_init(hsotg);
+	}
 
 	if (hsotg->dr_mode == USB_DR_MODE_PERIPHERAL &&
 	    hsotg->role_sw_default_mode == USB_DR_MODE_UNKNOWN)

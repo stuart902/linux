@@ -871,6 +871,8 @@ struct dwc2_hregs_backup {
  * @role_sw_fallback:	Connects a peripheral-only controller as a device if
  *			nothing sets a role in time
  * @role_sw_driven:	A role has been set through the role switch
+ * @role_sw_hold:	A peripheral-only controller without a default mode
+ *			holds its pull-up off: no role, or no device role, set
  * @hcd_enabled:	Host mode sub-driver initialization indicator.
  * @gadget_enabled:	Peripheral mode sub-driver initialization indicator.
  * @ll_hw_enabled:	Status of low-level hardware resources.
@@ -1076,6 +1078,7 @@ struct dwc2_hsotg {
 	struct mutex role_sw_lock;
 	struct delayed_work role_sw_fallback;
 	bool role_sw_driven;
+	bool role_sw_hold;
 	unsigned int hcd_enabled:1;
 	unsigned int gadget_enabled:1;
 	unsigned int ll_hw_enabled:1;

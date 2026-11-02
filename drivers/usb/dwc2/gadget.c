@@ -4706,7 +4706,9 @@ static int dwc2_hsotg_pullup(struct usb_gadget *gadget, int is_on)
 		dwc2_hsotg_core_init_disconnected(hsotg, false);
 		/* Enable ACG feature in device mode,if supported */
 		dwc2_enable_acg(hsotg);
-		dwc2_hsotg_core_connect(hsotg);
+		/* A held role switch connects it later (drd.c) */
+		if (!hsotg->role_sw_hold)
+			dwc2_hsotg_core_connect(hsotg);
 	} else {
 		dwc2_hsotg_core_disconnect(hsotg);
 		dwc2_hsotg_disconnect(hsotg);
