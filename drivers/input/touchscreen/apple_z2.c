@@ -850,6 +850,7 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 {
 	struct spi_transfer xfer = { };
 	bool strict_counter;
+	bool resynced = false;
 	int error;
 	size_t pkt_len;
 	size_t wire_len;
@@ -891,6 +892,7 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	}
 
 	payload_len = get_unaligned_le16(z2->rx_buf + 1);
+data_phase:
 	if (apple_z2_uses_gen1_data(z2) && !payload_len) {
 		z2->runtime_queue_empty = true;
 		if (apple_z2_is_n61(z2))
@@ -960,6 +962,22 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	    (!z2->rx_buf[0] ||
 	     (wire_len >= 16 && z2->rx_buf[0] == APPLE_Z2_CMD_LAST &&
 	      apple_z2_z2_checksum_valid(z2->rx_buf, 16)))) {
+		/*
+		 * J71b: a header (interrupt data and its length) answering the
+		 * data phase means the controller and this driver are a transfer
+		 * apart. Ignored, every later read got a header back and touch
+		 * stayed dead until the controller was rebooted. Take it as the
+		 * next frame's header and read that frame.
+		 */
+		if (apple_z2_is_j71b(z2) && !resynced &&
+		    z2->rx_buf[0] == APPLE_Z2_REPLY_INTERRUPT_DATA) {
+			resynced = true;
+			payload_len = get_unaligned_le16(z2->rx_buf + 1);
+			dev_dbg(&z2->spidev->dev,
+				"header in the data phase (%u bytes pending): resynchronising\n",
+				payload_len);
+			goto data_phase;
+		}
 		z2->runtime_control_reply = true;
 		return 0;
 	}
