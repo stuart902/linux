@@ -11,4 +11,75 @@
 / {
 	compatible = "apple,j71b", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 6 (Wi-Fi)";
+
+	/* One logical codec models the amplifier bank's shared SD_MODE line. */
+	speaker_amps: amplifier {
+		compatible = "maxim,max98357a";
+		#sound-dai-cells = <0>;
+		sdmode-gpios = <&pinctrl_ap 20 GPIO_ACTIVE_HIGH>;
+	};
+
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "J71b Speakers";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&speaker_cpu>;
+		simple-audio-card,frame-master = <&speaker_cpu>;
+		simple-audio-card,widgets = "Speaker", "Speakers";
+		simple-audio-card,routing = "Speakers", "Speaker";
+		simple-audio-card,pin-switches = "Speakers";
+
+		speaker_cpu: simple-audio-card,cpu {
+			sound-dai = <&mca2>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&speaker_amps>;
+		};
+	};
+};
+
+&wifi {
+	brcm,board-type = "apple,j71b";
+};
+
+&aop {
+	firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+/*
+ * The AOP reports the accelerometer in the device frame with y up when the
+ * iPad is upright; desktops (iio-sensor-proxy) take upright as y down and
+ * left/right accordingly, with z unchanged.
+ */
+&aop_accel {
+	mount-matrix = "-1", "0", "0",
+		       "0", "-1", "0",
+		       "0", "0", "1";
+};
+
+&touchscreen {
+	firmware-name = "apple/j71b-fwstart.z2fw";
+};
+
+&mca2 {
+	apple,i2s-switch = <&i2s_switch 2 2>;
+	status = "okay";
+};
+
+&i2s_switch {
+	status = "okay";
+};
+
+&nco_clkref {
+	clock-frequency = <800000000>;
+};
+
+&nco {
+	status = "okay";
 };
