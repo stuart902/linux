@@ -17,6 +17,11 @@ description: |
   leaves at 100 mA. PMU events come from the PMIC's event interrupt
   controller (the PMIC GPIO node).
 
+  The Tristar mux shares the USB data lines, and the USB device controller
+  cannot sense VBUS. The charger is therefore the port's attach detector: it
+  sets the data role of the USB controller linked through its port, holding
+  USB data off from attach until the source is identified.
+
 allOf:
   - $ref: power-supply.yaml#
 
@@ -58,6 +63,10 @@ properties:
   input-current-limit-microamp:
     description: Board maximum input current.
 
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: Link to the USB controller whose role this charger sets.
+
 required:
   - compatible
   - reg
@@ -65,12 +74,23 @@ required:
   - interrupts
   - apple,tristar
   - input-current-limit-microamp
+  - port
 
 unevaluatedProperties: false
 
 examples:
   - |
     #include <dt-bindings/interrupt-controller/irq.h>
+
+    usb {
+        usb-role-switch;
+
+        port {
+            usb_role: endpoint {
+                remote-endpoint = <&charger_usb>;
+            };
+        };
+    };
 
     i2c {
         #address-cells = <1>;
@@ -111,6 +131,12 @@ examples:
                          <77 IRQ_TYPE_EDGE_RISING>;
             apple,tristar = <&tristar>;
             input-current-limit-microamp = <2400000>;
+
+            port {
+                charger_usb: endpoint {
+                    remote-endpoint = <&usb_role>;
+                };
+            };
         };
     };
 ...
