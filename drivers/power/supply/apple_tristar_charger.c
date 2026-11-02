@@ -12,9 +12,15 @@
  *   USB host: what the USB device controller reports through vbus_draw
  *             above 500 mA (an Apple host's current grant)
  * Anything unidentified gets the fallback, the 500 mA of a USB 2.0 port.
- * The mux is not sampled while a USB session is active: mux changes have
- * stalled USB data. A host's own advertisement (CDP, USB-C current) measured
- * after attach but before its session began is kept for that session.
+ *
+ * The mux shares the USB data lines, and mux changes have stalled USB data.
+ * The USB device controller cannot see VBUS, so this driver is the port's
+ * attach detector and owns its data role: USB data stays off from attach
+ * until the source is identified, at most TRISTAR_HOLD_MS. A host's
+ * advertisement (CDP, USB-C current) is therefore measured before its
+ * session begins, and the mux is never sampled while USB data is on. A source event during a session re-reads only
+ * the capability frame: the same cable in the same orientation keeps its
+ * identification.
  *
  * A source change does not reset the limit in hardware. The PMIC's event
  * controller runs the handler of its PMU line before it reads the event
@@ -31,6 +37,7 @@
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
@@ -44,6 +51,7 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/string.h>
+#include <linux/usb/role.h>
 #include <linux/workqueue.h>
 
 /* PMIC registers, relative to their banks */
@@ -71,15 +79,15 @@
 #define CBTL_CAP_LEN			8
 
 #define TRISTAR_POLL_MS			100
-#define TRISTAR_SETTLE_MS		1000
-/* First look at the source, before a host has started its USB session. */
-#define TRISTAR_EARLY_MS		300
+/* Identify this long after an attach or a source event. */
+#define TRISTAR_LOOK_MS			300
+/*
+ * USB data waits at most this long for an identification. A half-inserted
+ * plug reads as no signature, so until then a missing one is looked for again.
+ */
+#define TRISTAR_HOLD_MS			1000
 #define TRISTAR_RAMP_STEP_MS		500
 #define TRISTAR_RAMP_STEP_MA		500
-#define TRISTAR_MAX_REDETECT		3
-/* A half-inserted plug reads as no signature. */
-#define TRISTAR_UNIDENTIFIED_RETRIES	2
-#define TRISTAR_RETRY_MS		3000
 /* More source events than this per second means something is stuck. */
 #define TRISTAR_IRQ_STORM		200
 /* After a line withdrawal, the time its events take to be dispatched. */
@@ -108,6 +116,7 @@ struct tristar_charger {
 	struct regmap *regmap;
 	struct i2c_client *tristar;
 	struct power_supply *psy;
+	struct usb_role_switch *role_sw;
 	struct delayed_work poll_work;
 	struct completion adc_done;
 	int irqs[TRISTAR_IRQS_MAX];
@@ -140,21 +149,21 @@ struct tristar_charger {
 	unsigned int code;	/* last verified input limit */
 	unsigned int target_code;
 	unsigned int source_ma;
+	/* USB data is on for this attachment: the mux must stay untouched. */
+	bool usb_on;
 	/* What the USB host allows (vbus_draw), valid for usb_epoch only. */
 	unsigned int usb_ma;
 	unsigned int usb_epoch;
-	/* A host's advertisement measured before its USB session began. */
-	bool early_done;
-	unsigned int early_epoch;
-	unsigned int early_ma;
-	enum power_supply_usb_type early_type;
 	enum power_supply_usb_type usb_type;
+	/* The identified cable, to recognize it after a source event. */
+	bool cable_known;
+	bool usbc;
+	unsigned int orientation;
 	char source[96];
-	u64 attach_ns;
+	u64 attach_ns;		/* next identification at attach_ns + LOOK_MS */
+	u64 hold_ns;		/* identification round started */
 	u64 step_ns;
 	u64 guard_ns;
-	unsigned int redetects;
-	unsigned int retries;
 	unsigned int epoch_seen;
 };
 
@@ -474,6 +483,8 @@ struct tristar_ident {
 	unsigned int ma;		/* the source's advertisement, 0: none */
 	enum power_supply_usb_type type;
 	bool sampled;			/* the mux was used */
+	bool usbc;			/* capability frame, valid if sampled */
+	unsigned int orientation;
 	char what[96];
 };
 
@@ -616,6 +627,8 @@ static int tristar_identify(struct tristar_charger *chg, struct tristar_ident *i
 		return 0;
 	}
 	id->sampled = true;
+	id->usbc = usbc;
+	id->orientation = orientation;
 	if (usbc)
 		return tristar_identify_usbc(chg, orientation, epoch, id);
 	return tristar_identify_usba(chg, orientation, epoch, id);
@@ -633,13 +646,19 @@ static unsigned int tristar_usb_ma(struct tristar_charger *chg)
 }
 
 /*
- * The device controller reported a host and no disconnect since, in any
- * epoch: a PMU event ends a host's allowance, not its data session, so the
- * mux stays untouched until the session ends. Caller holds lock.
+ * Turn USB data on or hold it off. A failed hold counts as on: the mux is
+ * then left alone. Caller holds lock.
  */
-static bool tristar_usb_session(struct tristar_charger *chg)
+static void tristar_set_usb(struct tristar_charger *chg, bool on)
 {
-	return chg->usb_ma;
+	int ret = usb_role_switch_set_role(chg->role_sw,
+					   on ? USB_ROLE_DEVICE : USB_ROLE_NONE);
+
+	if (ret)
+		dev_err(chg->dev, "cannot turn USB data %s (%d)\n", on ? "on" : "off", ret);
+	chg->usb_on = on || ret;
+	if (!chg->usb_on)
+		chg->usb_ma = 0;
 }
 
 /* The highest grant the source allows, up to the board maximum. */
@@ -667,29 +686,26 @@ static void tristar_update_target(struct tristar_charger *chg)
 	}
 }
 
+/* Caller holds lock. */
 static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 {
+	/* Before anything else: a host must not start a session yet. */
+	tristar_set_usb(chg, false);
 	chg->present = true;
 	chg->phase = TRISTAR_SETTLING;
 	chg->attach_ns = now;
+	chg->hold_ns = now;
 	chg->source[0] = '\0';
 	chg->source_ma = 0;
 	chg->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
-	chg->early_done = false;
-	chg->redetects = 0;
-	chg->retries = 0;
+	chg->cable_known = false;
 	chg->epoch_seen = READ_ONCE(chg->epoch);
 	if (tristar_set_code(chg, TRISTAR_CHG_FALLBACK_CODE))
 		dev_crit(chg->dev, "Fallback write failed; input limit unverified\n");
 	dev_dbg(chg->dev, "power connected, identifying source\n");
 }
 
-/* The early look happened in this epoch. Caller holds lock. */
-static bool tristar_early_done(struct tristar_charger *chg)
-{
-	return chg->early_done && chg->early_epoch == READ_ONCE(chg->epoch);
-}
-
+/* Caller holds lock. */
 static void tristar_mux_fault(struct tristar_charger *chg)
 {
 	chg->phase = TRISTAR_FAULT;
@@ -698,93 +714,103 @@ static void tristar_mux_fault(struct tristar_charger *chg)
 	dev_err(chg->dev, "Tristar mux restore unverified; holding the fallback until reboot\n");
 }
 
-/*
- * Look at the source once while settling, before a host starts its USB
- * session. The identification after the settle time must not sample during
- * that session, so a host's own advertisement (CDP, USB-C current) is kept
- * from here for it; everything else is measured again after settling.
- */
-static void tristar_early_identification(struct tristar_charger *chg)
+/* Start the grant for the identified source. Caller holds lock. */
+static void tristar_grant(struct tristar_charger *chg)
 {
-	unsigned int epoch = READ_ONCE(chg->epoch);
+	chg->target_code = tristar_target_code(chg);
+	if (chg->target_code <= TRISTAR_CHG_FALLBACK_CODE) {
+		chg->phase = TRISTAR_CHARGING;
+		dev_dbg(chg->dev, "%s: %u mA\n", chg->source,
+			tristar_code_ma(TRISTAR_CHG_FALLBACK_CODE));
+	} else {
+		chg->phase = TRISTAR_RAMPING;
+		chg->step_ns = 0;
+		dev_dbg(chg->dev, "%s: up to %u mA\n", chg->source,
+			tristar_code_ma(chg->target_code));
+	}
+}
+
+/*
+ * Take an identification and turn USB data on. Even a charger signature does
+ * not rule out a host: some ports show one until a device draws current.
+ * Caller holds lock.
+ */
+static void tristar_accept(struct tristar_charger *chg, const struct tristar_ident *id)
+{
+	strscpy(chg->source, id->what, sizeof(chg->source));
+	chg->source_ma = id->ma;
+	chg->usb_type = id->type;
+	chg->cable_known = id->sampled;
+	chg->usbc = id->usbc;
+	chg->orientation = id->orientation;
+	tristar_set_usb(chg, true);
+	tristar_grant(chg);
+}
+
+/*
+ * A source event while USB data is on. The mux must stay untouched, but the
+ * capability frame can be read: the same cable in the same orientation means
+ * the same source, and its identification still applies. A source swapped
+ * between two cables of one kind faster than the poll is not told apart, and
+ * neither is a USB-C source lowering its Rp without a detach (usb-c.md).
+ * Anything else is a new attachment. Caller holds lock.
+ */
+static void tristar_reconfirm(struct tristar_charger *chg, u64 now, bool expired)
+{
+	unsigned int orientation;
+	bool usbc;
+	int ret;
+
+	if (!chg->cable_known) {
+		/* Nothing to compare with: keep the session at the fallback. */
+		tristar_grant(chg);
+		return;
+	}
+	ret = cbtl_capability(chg, &usbc, &orientation);
+	if (!ret && READ_ONCE(chg->epoch) == chg->epoch_seen &&
+	    usbc == chg->usbc && orientation == chg->orientation) {
+		dev_dbg(chg->dev, "same cable after the source event\n");
+		tristar_grant(chg);
+		return;
+	}
+	chg->epoch_seen = READ_ONCE(chg->epoch);
+	if (!expired)
+		return;		/* look again on the next poll */
+	dev_dbg(chg->dev, "cable changed during the USB session (%d)\n", ret);
+	tristar_new_attachment(chg, now);
+}
+
+static void tristar_run_identification(struct tristar_charger *chg, u64 now)
+{
+	bool expired = (s64)(now - chg->hold_ns) >= (s64)TRISTAR_HOLD_MS * NSEC_PER_MSEC;
 	struct tristar_ident id;
 	int ret;
 
+	if (chg->usb_on) {
+		tristar_reconfirm(chg, now, expired);
+		return;
+	}
 	ret = tristar_identify(chg, &id);
 	if (ret == -EUCLEAN) {
 		tristar_mux_fault(chg);
 		return;
 	}
-	if (!id.sampled)
-		return;		/* cable not ready yet: try again next poll */
-	chg->early_done = true;
-	chg->early_epoch = epoch;
-	chg->early_ma = 0;
-	chg->early_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
-	if (ret || READ_ONCE(chg->epoch) != epoch || tristar_usb_session(chg))
-		return;
-	if (id.type == POWER_SUPPLY_USB_TYPE_CDP ||
-	    (id.type == POWER_SUPPLY_USB_TYPE_C && id.ma)) {
-		chg->early_ma = id.ma;
-		chg->early_type = id.type;
-		dev_dbg(chg->dev, "before USB: %s\n", id.what);
-	}
-}
-
-static void tristar_run_identification(struct tristar_charger *chg, u64 now)
-{
-	unsigned int fallback_ma = tristar_code_ma(TRISTAR_CHG_FALLBACK_CODE);
-	struct tristar_ident id;
-	bool usb = tristar_usb_session(chg);
-	int ret = 0;
-
-	if (usb) {
-		/* A USB session is active: do not disturb its data lines. */
-		id.ma = tristar_early_done(chg) ? chg->early_ma : 0;
-		id.type = id.ma ? chg->early_type : POWER_SUPPLY_USB_TYPE_UNKNOWN;
-		snprintf(id.what, sizeof(id.what), "USB host%s",
-			 id.type == POWER_SUPPLY_USB_TYPE_CDP ? ", charging downstream port" :
-			 id.type == POWER_SUPPLY_USB_TYPE_C ? ", USB-C current advertised" : "");
-	} else {
-		ret = tristar_identify(chg, &id);
-	}
-	if (ret == -EUCLEAN) {
-		tristar_mux_fault(chg);
-		return;
-	}
 	if (ret || READ_ONCE(chg->epoch) != chg->epoch_seen) {
-		/* The source changed while identifying: retry on a stable epoch. */
+		/* The source changed while identifying: look again once it settles. */
 		chg->epoch_seen = READ_ONCE(chg->epoch);
-		if (++chg->redetects > TRISTAR_MAX_REDETECT) {
-			chg->phase = TRISTAR_CHARGING;
-			strscpy(chg->source, "unstable source", sizeof(chg->source));
-			dev_dbg(chg->dev, "source unstable during identification (%d)\n", ret);
-		} else {
+		if (!expired) {
 			chg->attach_ns = now;
+			return;
 		}
-		return;
+		dev_dbg(chg->dev, "source unstable during identification (%d)\n", ret);
+		id.ma = 0;
+		id.type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+		id.sampled = false;
+		strscpy(id.what, "unstable source", sizeof(id.what));
+	} else if (!id.ma && !expired) {
+		return;		/* no signature yet: look again on the next poll */
 	}
-	if (!id.ma && !usb && chg->retries < TRISTAR_UNIDENTIFIED_RETRIES) {
-		chg->retries++;
-		/* The settle check fires SETTLE_MS after attach_ns. */
-		chg->attach_ns = now + (TRISTAR_RETRY_MS - TRISTAR_SETTLE_MS) * NSEC_PER_MSEC;
-		dev_dbg(chg->dev, "no charger signature yet (%s), retry %u/%u\n",
-			id.what, chg->retries, TRISTAR_UNIDENTIFIED_RETRIES);
-		return;
-	}
-	strscpy(chg->source, id.what, sizeof(chg->source));
-	chg->source_ma = id.ma;
-	chg->usb_type = id.type;
-	chg->target_code = tristar_target_code(chg);
-	if (chg->target_code <= TRISTAR_CHG_FALLBACK_CODE) {
-		chg->phase = TRISTAR_CHARGING;
-		dev_dbg(chg->dev, "%s: %u mA\n", id.what, fallback_ma);
-	} else {
-		chg->phase = TRISTAR_RAMPING;
-		chg->step_ns = 0;
-		dev_dbg(chg->dev, "%s: up to %u mA\n", id.what,
-			tristar_code_ma(chg->target_code));
-	}
+	tristar_accept(chg, &id);
 }
 
 static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
@@ -883,6 +909,7 @@ static void tristar_poll(struct work_struct *work)
 	chg->online = status != 0;
 	if (!status) {
 		if (chg->present) {
+			tristar_set_usb(chg, false);
 			chg->present = false;
 			chg->phase = TRISTAR_EMPTY;
 			chg->source[0] = '\0';
@@ -905,14 +932,19 @@ static void tristar_poll(struct work_struct *work)
 		tristar_new_attachment(chg, now);
 		goto again;
 	}
-	if (chg->phase == TRISTAR_FAULT)
+	if (chg->phase == TRISTAR_FAULT) {
+		/* USB data must not depend on charging working. */
+		if (!chg->usb_on)
+			tristar_set_usb(chg, true);
 		goto again;
+	}
 	if (READ_ONCE(chg->epoch) != chg->epoch_seen && chg->phase != TRISTAR_SETTLING) {
 		/* The event handler already withdrew any grant. */
 		chg->epoch_seen = READ_ONCE(chg->epoch);
 		chg->line_seen = READ_ONCE(chg->line_ns);
 		chg->phase = TRISTAR_SETTLING;
 		chg->attach_ns = now;
+		chg->hold_ns = now;
 		dev_dbg(chg->dev, "source event, re-identifying\n");
 		goto again;
 	}
@@ -933,11 +965,8 @@ static void tristar_poll(struct work_struct *work)
 	}
 	switch (chg->phase) {
 	case TRISTAR_SETTLING:
-		if ((s64)(now - chg->attach_ns) >= (s64)TRISTAR_SETTLE_MS * NSEC_PER_MSEC)
+		if ((s64)(now - chg->attach_ns) >= (s64)TRISTAR_LOOK_MS * NSEC_PER_MSEC)
 			tristar_run_identification(chg, now);
-		else if (!tristar_early_done(chg) && !tristar_usb_session(chg) &&
-			 (s64)(now - chg->attach_ns) >= (s64)TRISTAR_EARLY_MS * NSEC_PER_MSEC)
-			tristar_early_identification(chg);
 		break;
 	case TRISTAR_RAMPING:
 		tristar_ramp_step(chg, now);
@@ -1027,7 +1056,11 @@ static void tristar_source_event(struct tristar_charger *chg)
 
 static irqreturn_t tristar_source_irq(int irq, void *data)
 {
-	tristar_source_event(data);
+	struct tristar_charger *chg = data;
+
+	dev_dbg(chg->dev, "PMU source event %lu\n",
+		irqd_to_hwirq(irq_get_irq_data(irq)));
+	tristar_source_event(chg);
 	return IRQ_HANDLED;
 }
 
@@ -1066,7 +1099,7 @@ static int tristar_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		val->intval = chg->usb_type;
-		if (val->intval == POWER_SUPPLY_USB_TYPE_UNKNOWN && tristar_usb_session(chg))
+		if (val->intval == POWER_SUPPLY_USB_TYPE_UNKNOWN && chg->usb_on)
 			val->intval = POWER_SUPPLY_USB_TYPE_SDP;
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
@@ -1088,7 +1121,9 @@ static int tristar_get_property(struct power_supply *psy,
  * The USB device controller reports what the host allows the device to draw
  * (vbus_draw) as the input current limit: 0 without a session, 100 mA
  * unconfigured, the configuration's bMaxPower, 2 mA suspended, or more after
- * an Apple host's current grant. Not writable from user space.
+ * an Apple host's current grant. Not writable from user space. Only a
+ * session this driver turned on counts: without VBUS sensing the controller
+ * keeps reporting bus suspend and resume after its host is gone.
  */
 static int tristar_set_property(struct power_supply *psy,
 				enum power_supply_property psp,
@@ -1102,12 +1137,7 @@ static int tristar_set_property(struct power_supply *psy,
 
 	mutex_lock(&chg->lock);
 	old_code = chg->code;
-	/*
-	 * With nothing attached there is no session: a late report (the
-	 * suspend draw after a disconnect) must not make the next source look
-	 * like a USB host.
-	 */
-	chg->usb_ma = chg->present ? max(val->intval, 0) / 1000 : 0;
+	chg->usb_ma = chg->present && chg->usb_on ? max(val->intval, 0) / 1000 : 0;
 	chg->usb_epoch = READ_ONCE(chg->epoch);
 	dev_dbg(chg->dev, "USB host allows %u mA\n", chg->usb_ma);
 	if (!chg->stopping) {
@@ -1168,6 +1198,11 @@ static void tristar_put_client(void *data)
 	put_device(&((struct i2c_client *)data)->dev);
 }
 
+static void tristar_put_role_switch(void *data)
+{
+	usb_role_switch_put(data);
+}
+
 /* Leave the limit as iBoot did, so a reboot or a kexec'd kernel starts safe. */
 static void tristar_stop(struct tristar_charger *chg, const char *reason)
 {
@@ -1182,6 +1217,8 @@ static void tristar_stop(struct tristar_charger *chg, const char *reason)
 	mutex_lock(&chg->lock);
 	if (tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE))
 		dev_crit(chg->dev, "%s: handoff restore failed\n", reason);
+	/* Without this driver nothing holds USB data off. */
+	tristar_set_usb(chg, true);
 	mutex_unlock(&chg->lock);
 }
 
@@ -1235,6 +1272,16 @@ static int tristar_probe(struct platform_device *pdev)
 	if (!i2c_check_functionality(chg->tristar->adapter, I2C_FUNC_I2C))
 		return dev_err_probe(dev, -EOPNOTSUPP, "Tristar bus lacks plain I2C\n");
 
+	chg->role_sw = usb_role_switch_get(dev);
+	if (IS_ERR(chg->role_sw))
+		return dev_err_probe(dev, PTR_ERR(chg->role_sw),
+				     "USB role switch not available\n");
+	if (!chg->role_sw)
+		return dev_err_probe(dev, -EINVAL, "missing USB role switch connection\n");
+	ret = devm_add_action_or_reset(dev, tristar_put_role_switch, chg->role_sw);
+	if (ret)
+		return ret;
+
 	ret = platform_irq_count(pdev);
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "failed to count the PMU event interrupts\n");
@@ -1287,6 +1334,11 @@ static int tristar_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, tristar_stop_action, chg);
 	if (ret)
 		return ret;
+
+	/* Whatever is attached gets identified before USB data comes on. */
+	mutex_lock(&chg->lock);
+	tristar_set_usb(chg, false);
+	mutex_unlock(&chg->lock);
 
 	mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
 	return 0;
