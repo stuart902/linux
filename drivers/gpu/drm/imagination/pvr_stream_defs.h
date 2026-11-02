@@ -12,5 +12,7 @@ extern const struct pvr_stream_cmd_defs pvr_cmd_compute_stream;
 extern const struct pvr_stream_cmd_defs pvr_cmd_transfer_stream;
 extern const struct pvr_stream_cmd_defs pvr_static_render_context_state_stream;
 extern const struct pvr_stream_cmd_defs pvr_static_compute_context_state_stream;
+extern const struct pvr_stream_cmd_defs pvr_apple_cmd_geom_stream;
+extern const struct pvr_stream_cmd_defs pvr_apple_cmd_frag_stream;
 
 #endif /* PVR_STREAM_DEFS_H */

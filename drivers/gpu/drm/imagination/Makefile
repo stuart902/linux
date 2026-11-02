@@ -29,6 +29,11 @@ powervr-y := \
 	pvr_vm.o \
 	pvr_vm_mips.o
 
+powervr-$(CONFIG_DRM_POWERVR_APPLE) += \
+	pvr_apple.o \
+	pvr_apple_layout.o \
+	pvr_apple_queue.o
+
 powervr-$(CONFIG_DEBUG_FS) += \
 	pvr_debugfs.o
 

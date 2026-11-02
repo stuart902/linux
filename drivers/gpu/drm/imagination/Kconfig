@@ -19,6 +19,18 @@ config DRM_POWERVR
 
 	  If "M" is selected, the module will be called powervr.
 
+config DRM_POWERVR_APPLE
+	bool "Apple A10 (T8010) GPU support"
+	depends on DRM_POWERVR
+	depends on APPLE_RTKIT && (ARCH_APPLE || COMPILE_TEST)
+	depends on DRM_POWERVR=m || APPLE_RTKIT=y
+	help
+	  Support the Rogue-based GPU of the Apple A10 (T8010), which runs
+	  Apple's GFX firmware on an RTKit coprocessor instead of
+	  Imagination's firmware.
+
+	  If in doubt, say "N".
+
 config DRM_POWERVR_KUNIT_TEST
 	tristate "KUnit tests for the drm powervr driver" if !KUNIT_ALL_TESTS
 	depends on DRM_POWERVR && KUNIT

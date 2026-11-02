@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_cccb.h"
 #include "pvr_context.h"
 #include "pvr_device.h"
@@ -290,6 +291,11 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
 	if (args->flags)
 		return -EINVAL;
 
+	/* Apple's firmware runs render and compute jobs (see pvr_apple_queue.c). */
+	if (pvr_device_is_apple(pvr_dev) && args->type != DRM_PVR_CTX_TYPE_COMPUTE &&
+	    args->type != DRM_PVR_CTX_TYPE_RENDER)
+		return -EOPNOTSUPP;
+
 	ctx_size = get_fw_obj_size(args->type);
 	if (ctx_size < 0)
 		return ctx_size;
@@ -328,14 +334,23 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
 	if (err)
 		goto err_free_ctx_id;
 
-	err = init_fw_objs(ctx, args, ctx->data);
-	if (err)
-		goto err_destroy_queues;
+	/*
+	 * Apple's firmware has no IMG context object and takes the context
+	 * switch registers with each job: static state is optional there and
+	 * only validated.
+	 */
+	if (!pvr_device_is_apple(pvr_dev) || args->static_context_state_len) {
+		err = init_fw_objs(ctx, args, ctx->data);
+		if (err)
+			goto err_destroy_queues;
+	}
 
-	err = pvr_fw_object_create(pvr_dev, ctx_size, PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
-				   ctx_fw_data_init, ctx, &ctx->fw_obj);
-	if (err)
-		goto err_destroy_queues;
+	if (!pvr_device_is_apple(pvr_dev)) {
+		err = pvr_fw_object_create(pvr_dev, ctx_size, PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+					   ctx_fw_data_init, ctx, &ctx->fw_obj);
+		if (err)
+			goto err_destroy_queues;
+	}
 
 	err = xa_alloc(&pvr_file->ctx_handles, &args->handle, ctx, xa_limit_32b, GFP_KERNEL);
 	if (err)
@@ -348,7 +363,8 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
 	return 0;
 
 err_destroy_fw_obj:
-	pvr_fw_object_destroy(ctx->fw_obj);
+	if (ctx->fw_obj)
+		pvr_fw_object_destroy(ctx->fw_obj);
 
 err_destroy_queues:
 	pvr_context_destroy_queues(ctx, true);
@@ -374,6 +390,20 @@ err_free_ctx:
 }
 
 static void
+pvr_context_release_work(struct work_struct *work)
+{
+	struct pvr_context *ctx =
+		container_of(work, struct pvr_context, release_work);
+
+	pvr_context_destroy_queues(ctx, false);
+	if (ctx->fw_obj)
+		pvr_fw_object_destroy(ctx->fw_obj);
+	kfree(ctx->data);
+	pvr_vm_context_put(ctx->vm_ctx);
+	kfree(ctx);
+}
+
+static void
 pvr_context_release(struct kref *ref_count)
 {
 	struct pvr_context *ctx =
@@ -386,11 +416,14 @@ pvr_context_release(struct kref *ref_count)
 	spin_unlock(&pvr_dev->ctx_list_lock);
 
 	xa_erase(&pvr_dev->ctx_ids, ctx->ctx_id);
-	pvr_context_destroy_queues(ctx, false);
-	pvr_fw_object_destroy(ctx->fw_obj);
-	kfree(ctx->data);
-	pvr_vm_context_put(ctx->vm_ctx);
-	kfree(ctx);
+
+	/*
+	 * Destroying the queues runs drm_sched_fini(), which must not run from
+	 * the scheduler's own free_job work. pvr_queue_device_fini() drains
+	 * sched_wq, so no release outlives the device.
+	 */
+	INIT_WORK(&ctx->release_work, pvr_context_release_work);
+	queue_work(pvr_dev->sched_wq, &ctx->release_work);
 }
 
 /**
@@ -448,6 +481,13 @@ void pvr_destroy_contexts_for_file(struct pvr_file *pvr_file)
 
 	xa_for_each(&pvr_file->ctx_handles, handle, ctx)
 		pvr_context_destroy(pvr_file, handle);
+
+	/*
+	 * Apple's firmware stops for good on a fault: the jobs it was given
+	 * retire before their mappings go (a client exiting mid-frame).
+	 */
+	if (pvr_device_is_apple(pvr_dev))
+		pvr_apple_wait_file_jobs(pvr_dev);
 
 	spin_lock(&pvr_dev->ctx_list_lock);
 	ctx = list_first_entry(&pvr_file->contexts, struct pvr_context, file_link);

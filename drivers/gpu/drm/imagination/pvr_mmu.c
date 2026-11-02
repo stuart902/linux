@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_mmu.h"
 
 #include "pvr_ccb.h"
@@ -132,6 +133,13 @@ int pvr_mmu_flush_exec(struct pvr_device *pvr_dev, bool wait)
 
 	if (!drm_dev_enter(from_pvr_device(pvr_dev), &idx))
 		return -EIO;
+
+	/* Apple's firmware invalidates on a context generation change instead. */
+	if (pvr_device_is_apple(pvr_dev)) {
+		if (atomic_xchg(&pvr_dev->mmu_flush_cache_flags, 0))
+			pvr_apple_mmu_flush(pvr_dev);
+		goto err_drm_dev_exit;
+	}
 
 	/* Can't flush MMU if the firmware hasn't been initialised yet. */
 	if (!READ_ONCE(pvr_dev->fw_dev.initialised))

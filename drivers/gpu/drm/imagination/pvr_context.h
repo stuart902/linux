@@ -10,6 +10,7 @@
 #include <linux/dma-fence.h>
 #include <linux/kref.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 #include <linux/xarray.h>
 #include <uapi/drm/pvr_drm.h>
 
@@ -88,6 +89,14 @@ struct pvr_context {
 
 	/** @file_link: pvr_file PVR context list link. */
 	struct list_head file_link;
+
+	/**
+	 * @release_work: Destroys the queues once the last reference is gone.
+	 *
+	 * The last reference can be dropped by a job freed from a queue's own
+	 * drm_sched free_job work, which drm_sched_fini() cannot wait for.
+	 */
+	struct work_struct release_work;
 };
 
 static __always_inline struct pvr_queue *

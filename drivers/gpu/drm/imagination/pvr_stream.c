@@ -163,7 +163,8 @@ pvr_stream_process_ext_stream(struct pvr_device *pvr_dev,
 			if (!(ext_header & ext_def->header_mask))
 				continue;
 
-			if (!pvr_device_has_uapi_quirk(pvr_dev, ext_def->quirk))
+			/* Quirk 0: the extension is not tied to a hardware quirk. */
+			if (ext_def->quirk && !pvr_device_has_uapi_quirk(pvr_dev, ext_def->quirk))
 				return -EINVAL;
 
 			err = pvr_stream_process_1(pvr_dev, ext_def->stream, ext_def->stream_len,
@@ -269,6 +270,13 @@ pvr_stream_create_musthave_masks(struct pvr_device *pvr_dev)
 	if (pvr_device_has_uapi_quirk(pvr_dev, 47217))
 		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_FRAG][0] |=
 			PVR_STREAM_EXTHDR_FRAG0_BRN47217;
+
+	if (pvr_device_is_apple(pvr_dev)) {
+		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_GEOM][PVR_STREAM_EXTHDR_TYPE_GEOM_APPLE] |=
+			PVR_STREAM_EXTHDR_GEOM_APPLE_REGS;
+		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_FRAG][PVR_STREAM_EXTHDR_TYPE_FRAG_APPLE] |=
+			PVR_STREAM_EXTHDR_FRAG_APPLE_REGS;
+	}
 
 	if (pvr_device_has_uapi_quirk(pvr_dev, 49927)) {
 		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_GEOM][0] |=

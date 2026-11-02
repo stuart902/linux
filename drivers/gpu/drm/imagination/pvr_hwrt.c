@@ -86,7 +86,8 @@ hwrt_fini_kernel_structure(struct pvr_hwrt_dataset *hwrt)
 static void
 hwrt_fini_common_fw_structure(struct pvr_hwrt_dataset *hwrt)
 {
-	pvr_fw_object_destroy(hwrt->common_fw_obj);
+	if (hwrt->common_fw_obj)
+		pvr_fw_object_destroy(hwrt->common_fw_obj);
 }
 
 static int
@@ -335,6 +336,10 @@ hwrt_init_common_fw_structure(struct pvr_file *pvr_file,
 
 	hwrt->common.rgn_header_size = args->region_header_size;
 
+	/* Apple's firmware takes these values in each job's register block. */
+	if (pvr_device_is_apple(pvr_dev))
+		return 0;
+
 	err = pvr_fw_object_create(pvr_dev, sizeof(struct rogue_fwif_hwrtdata_common),
 				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED, hwrtdata_common_init, hwrt,
 				   &hwrt->common_fw_obj);
@@ -361,6 +366,28 @@ hwrt_data_init_fw_structure(struct pvr_file *pvr_file,
 	struct pvr_device *pvr_dev = pvr_file->pvr_dev;
 	struct rogue_fwif_rta_ctl *rta_ctl;
 	int err;
+
+	if (pvr_device_is_apple(pvr_dev)) {
+		/* Single-layer render targets only, so far */
+		if (args->layers > 1)
+			return -EOPNOTSUPP;
+
+		hwrt_data->data.tail_ptrs_dev_addr = geom_data_args->tpc_dev_addr;
+		hwrt_data->data.vheap_table_dev_addr = geom_data_args->vheap_table_dev_addr;
+		hwrt_data->data.rtc_dev_addr = geom_data_args->rtc_dev_addr;
+		hwrt_data->data.pm_mlist_dev_addr = rt_data_args->pm_mlist_dev_addr;
+		hwrt_data->data.macrotile_array_dev_addr = rt_data_args->macrotile_array_dev_addr;
+		hwrt_data->data.rgn_header_dev_addr = rt_data_args->region_header_dev_addr;
+
+		hwrt_data->sync_obj = pvr_gem_object_create(pvr_dev, PAGE_SIZE, 0);
+		if (IS_ERR(hwrt_data->sync_obj)) {
+			err = PTR_ERR(hwrt_data->sync_obj);
+			hwrt_data->sync_obj = NULL;
+			return err;
+		}
+		pvr_free_list_add_hwrt(hwrt->free_lists[0], hwrt_data);
+		return 0;
+	}
 
 	pvr_fw_object_get_fw_addr(hwrt->common_fw_obj,
 				  &hwrt_data->data.hwrt_data_common_fw_addr);
@@ -432,12 +459,31 @@ hwrt_data_fini_fw_structure(struct pvr_hwrt_dataset *hwrt, int hwrt_nr)
 
 	pvr_free_list_remove_hwrt(hwrt->free_lists[0], hwrt_data);
 
+	if (hwrt_data->sync_obj) {
+		pvr_gem_object_put(hwrt_data->sync_obj);
+		return;
+	}
+
 	if (hwrt->max_rts > 1) {
 		pvr_fw_object_destroy(hwrt_data->raa_obj);
 		pvr_fw_object_destroy(hwrt_data->srtc_obj);
 	}
 
 	pvr_fw_object_destroy(hwrt_data->fw_obj);
+}
+
+/**
+ * pvr_hwrt_data_resv_obj() - Object whose reservation orders jobs on @hwrt_data
+ * @hwrt_data: HWRT data.
+ *
+ * The geometry job writes the region headers the fragment job reads; both
+ * synchronise through this object's reservation.
+ */
+struct drm_gem_object *pvr_hwrt_data_resv_obj(struct pvr_hwrt_data *hwrt_data)
+{
+	if (hwrt_data->fw_obj)
+		return gem_from_pvr_gem(hwrt_data->fw_obj->gem);
+	return gem_from_pvr_gem(hwrt_data->sync_obj);
 }
 
 /**
@@ -503,8 +549,10 @@ pvr_hwrt_dataset_release(struct kref *ref_count)
 		container_of(ref_count, struct pvr_hwrt_dataset, ref_count);
 
 	for (int i = ARRAY_SIZE(hwrt->data) - 1; i >= 0; i--) {
-		WARN_ON(pvr_fw_structure_cleanup(hwrt->pvr_dev, ROGUE_FWIF_CLEANUP_HWRTDATA,
-						 hwrt->data[i].fw_obj, 0));
+		if (hwrt->data[i].fw_obj)
+			WARN_ON(pvr_fw_structure_cleanup(hwrt->pvr_dev,
+							 ROGUE_FWIF_CLEANUP_HWRTDATA,
+							 hwrt->data[i].fw_obj, 0));
 		hwrt_data_fini_fw_structure(hwrt, i);
 	}
 
