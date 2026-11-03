@@ -14,6 +14,7 @@ static void reset(void)
     mutate_pairs = false;
     logs[0] = 0;
     pmic = (struct apple_d2365_poweroff){ .data = &apple_d2365_data, .restart = true };
+    memset(memory + 0x0140, 0x55, 30);
     memory[0x0400] = 0xa4;
     memory[0x500f] = 0xff;
     for (unsigned i = 0; i < 18; i++) {
@@ -59,6 +60,7 @@ static void check_order(void)
             event_count++; last_events = i;
         }
     }
+    for (unsigned i = 0; i < 30; i++) assert(!memory[0x0140 + i]);
     assert(event_count == 2 && last_events > gpio && last_events < standby);
     assert(source_reads >= 2 && online_reads >= 2);
     /* Request must be forced, not optimized away when the bit is already set. */
@@ -196,6 +198,10 @@ static void check_restart(void)
                    operations[1].value == 0);
             assert(memory[0x5001] == (failure == 2 && !effect ? 0xa5 : 0));
             assert(!standby_attempts && !standby_writes && !sleeps && !restart_calls);
+            unsigned consumed = failure != 1 || effect == 1 ? 30 :
+                                effect == 2 ? 15 : 0;
+            for (unsigned i = 0; i < 30; i++)
+                assert(memory[0x0140 + i] == (i < consumed ? 0 : 0x55));
             assert(log_count == !!failure);
             if (failure) assert(strstr(logs, failure == 1 ?
                 "restart event acknowledgement failed" : "restart boot-stage clear failed"));

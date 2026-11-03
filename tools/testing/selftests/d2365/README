@@ -9,8 +9,8 @@ Python 3 and an existing host C compiler (cc or clang) are required. The
 suite compiles the actual driver algorithms against an in-memory regmap
 and power-supply shim. It does not execute firmware, access devices, call
 a reboot syscall, build a kernel, or prove electrical power-off. This is
-a source-tree test: an installed selftests bundle without the matching
-kernel sources is not sufficient.
+a source-tree test. For an installed selftests bundle, set D2365_KERNEL_SRC
+to the matching kernel checkout; without sources the runner exits SKIP.
 
 Coverage
 --------
@@ -27,7 +27,8 @@ Coverage
   state, and source attachment during each live recheck window.
 * Every transaction error on five source routes, with failed writes that
   commit nothing, commit before returning an error, or partially commit a
-  bulk transfer. The driver stops without retry, reports unknown outcomes
+  bulk transfer. Event reads model read-to-clear effects, including partial
+  consumption before an error. The driver stops without retry, reports unknown outcomes
   for attempted standby transactions, and never records an acknowledged
   standby on an error. The mock separately counts attempted and committed
   bus writes; a regmap transaction attempt includes its internal read.

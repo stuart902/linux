@@ -73,20 +73,22 @@ static int regmap_write(struct regmap *map, unsigned reg, unsigned value)
 static int regmap_bulk_read(struct regmap *map, unsigned reg, void *data, unsigned size)
 {
     int ret = record('R', reg, size, 0);
-    if (ret) return ret;
+    if (ret && !error_effect) return ret;
     if (reg == 0x0900 && ++pair_reads == 2 && mutate_pairs)
         for (unsigned i = 0; i < 18; i++) {
             memory[0x0900 + 2 * i] = 0xfe; /* New config must not replace snapshot. */
             memory[0x0901 + 2 * i] = 0x40 + i;
         }
     memcpy(data, memory + reg, size);
+    if (reg == 0x0140)
+        memset(memory + reg, 0, ret && error_effect == 2 ? size / 2 : size);
     if (reg == 0x0140 && final_event_change) {
         unsigned event_reads = 0;
         for (unsigned i = 0; i < count; i++)
             event_reads += operations[i].kind == 'R' && operations[i].reg == 0x0140;
         if (event_reads == 2) source_value = 1;
     }
-    return 0;
+    return ret;
 }
 static int regmap_bulk_write(struct regmap *map, unsigned reg, const void *data, unsigned size)
 {

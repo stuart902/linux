@@ -5,14 +5,18 @@ Compile the driver's actual prepare/final functions against an in-memory bus.
 These tests establish software contracts, not PMIC electrical behavior.
 """
 from pathlib import Path
+import os
+import sys
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 
-ROOT = Path(__file__).resolve().parents[4]
 DRIVER = 'drivers/power/reset/apple-d2365-poweroff.c'
+ROOT = Path(os.environ['D2365_KERNEL_SRC']) if 'D2365_KERNEL_SRC' in os.environ else next(
+    (parent for parent in Path(__file__).resolve().parents if (parent / DRIVER).is_file()),
+    Path(__file__).resolve().parent)
 
 
 def driver_source():
@@ -158,4 +162,7 @@ int main(void)
 
 
 if __name__ == '__main__':
+    if not (ROOT / DRIVER).is_file():
+        print('SKIP: matching kernel sources required; set D2365_KERNEL_SRC')
+        sys.exit(4)
     unittest.main()
