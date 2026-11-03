@@ -25,4 +25,26 @@ config SND_SOC_APPLE_S8000_MCA
 
 	  Say Y or M here if you have an Apple A9 device such as the iPad 5 or iPad 6.
 
+config SND_SOC_APPLE_J71B_DIGITAL
+	tristate "Apple J71b reset-held digital audio reference"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && GPIOLIB && COMMON_CLK && EXPERT
+	select SND_SOC_APPLE_S8000_MCA
+	help
+	  Enable the recovered four-channel, eight-slot J71b MCA2 reference
+	  profile and a qualification card that keeps the speaker amplifiers
+	  in reset. No board node is enabled. This is not acoustic playback
+	  support; electrical timing, channel routing and speaker protection
+	  remain unqualified. If unsure, say N.
+
+config SND_SOC_APPLE_T8010_MCA_REFERENCE_KUNIT_TEST
+	tristate "Tests for the J71b MCA reference profile" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the fixed profile's parameter restrictions and register values.
+	  The cases cover invalid masks, widths, channels and rates, as well
+	  as the recovered frame and serializer register encoding.
+	  No hardware or firmware files are accessed.
+
 endmenu

@@ -38,6 +38,8 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 
+#include "t8010-mca-reference.h"
+
 #define MCA_VERSION		0x00
 #define MCA_FIFO_SIZE		0x04
 #define  MCA_FIFO_SIZE_TX	GENMASK(9, 0)
@@ -133,6 +135,7 @@
 struct s8000_mca_hw {
 	u32 version;
 	bool clock_provider;
+	bool reference_capable;
 	/* AppleAE2MCA _getMCLKClkCon: nclk / 2 (0x18) | output enable (0x40) */
 	u32 mclk_ctl;
 	unsigned long mclk_rate;
@@ -156,6 +159,9 @@ struct s8000_mca {
 	struct clk_hw mclk_hw;
 	struct clk *bitclk;
 	bool bitclk_enabled;
+	bool format_set, reference_profile, reference_faulted;
+	struct snd_pcm_hardware pcm_hw;
+	struct snd_dmaengine_pcm_config pcm_config;
 
 	struct regmap *sw;	/* i2s-switch, NULL if not routed */
 	u32 sw_aud;
@@ -270,6 +276,12 @@ static int mca_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	unsigned int provider = mca->hw->clock_provider ? SND_SOC_DAIFMT_BP_FP :
 						       SND_SOC_DAIFMT_BC_FC;
 
+	/* The reference machine intentionally does not select an ALSA format. */
+	if (mca->reference_faulted)
+		return -EIO;
+	if (mca->reference_profile)
+		return -EINVAL;
+
 	/* S8000 consumes codec clocks; T8010 drives the digital speaker amps. */
 	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != provider)
 		return -EINVAL;
@@ -277,6 +289,40 @@ static int mca_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 		return -EINVAL;
 	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
 		return -EINVAL;
+	mca->format_set = true;
+	return 0;
+}
+
+/* Only the opt-in reset-held J71b machine uses this fixed firmware profile. */
+static int mca_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
+			    unsigned int rx_mask, int slots, int width)
+{
+	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+
+	if (!IS_ENABLED(CONFIG_SND_SOC_APPLE_J71B_DIGITAL))
+		return -EOPNOTSUPP;
+	if (mca->reference_faulted)
+		return -EIO;
+	if (mca->prep_mask || mca->run_mask)
+		return -EBUSY;
+	/* Paired with the reference machine's link exit, including probe failure. */
+	if (!tx_mask && !rx_mask && !slots && !width) {
+		mca->reference_profile = false;
+		mca->format_set = false;
+		mca->dai_drv.playback.channels_max = 2;
+		mca->pcm_hw.channels_max = 2;
+		return 0;
+	}
+	if (!mca->hw->reference_capable || !mca->hw->clock_provider ||
+	    mca->hw->version != 5 ||
+	    mca->sw_aud != 2 || mca->sw_pin != 2 || mca->capture ||
+	    mca->format_set)
+		return -EINVAL;
+	if (!t8010_mca_reference_slots(tx_mask, rx_mask, slots, width))
+		return -EINVAL;
+	mca->reference_profile = true;
+	mca->dai_drv.playback.channels_max = 4;
+	mca->pcm_hw.channels_max = 4;
 	return 0;
 }
 
@@ -311,9 +357,17 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 	unsigned int slots = 2, frame_bits = slot * slots, depth;
 	u32 width_code;
 
-	if (channels != 2)
+	if (mca->reference_profile) {
+		if (!t8010_mca_reference_params(channels, bits, slot,
+						params_rate(params)) ||
+		    substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+			return -EINVAL;
+		slots = 8;
+		frame_bits = 128;
+	} else if (channels != 2) {
 		return -EINVAL;
-	/* Qualify one clock family first; no unverified v5 capture or TDM. */
+	}
+	/* Keep both T8010 profiles within the existing clock family. */
 	if (mca->hw->clock_provider && params_rate(params) != 48000)
 		return -EINVAL;
 
@@ -346,6 +400,13 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 		     FIELD_PREP(MCA_FRAME_MCLK_DIV, 0) |
 		     MCA_FRAME_DUTY | MCA_FRAME_FMT;
 
+	if (mca->reference_profile) {
+		mca->tx_slots = 0xf;
+		mca->rx_slots = 0;
+		mca->tx_cfg = T8010_MCA_REFERENCE_TX;
+		mca->frame = T8010_MCA_REFERENCE_FRAME;
+	}
+
 	if (mca->hw->clock_provider) {
 		unsigned long bitclk = params_rate(params) * frame_bits;
 		int ret;
@@ -355,7 +416,8 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 			return ret;
 		if (clk_get_rate(mca->bitclk) != bitclk)
 			return -EINVAL;
-		mca->frame |= MCA_FRAME_MASTER | MCA_FRAME_PROVIDER_PHASE;
+		if (!mca->reference_profile)
+			mca->frame |= MCA_FRAME_MASTER | MCA_FRAME_PROVIDER_PHASE;
 	}
 
 	dma->addr_width = slot == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
@@ -380,7 +442,8 @@ static void mca_write_rx(struct s8000_mca *mca)
 	mca_write(mca, MCA_RX_FIFO_CFG, MCA_RX_FIFO_CFG_IOS);
 	mca_write(mca, MCA_RX_SLOTS, mca->rx_slots);
 	mca_write(mca, MCA_RX_SLOTS_HI, 0);
-	mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
+	mca_write(mca, MCA_RX_CFG, mca->reference_profile ?
+		  T8010_MCA_REFERENCE_RX : MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
 }
 
 /* The whole block, as _setIISConfig_v4: only while no direction is prepared */
@@ -422,7 +485,8 @@ static int mca_init_block(struct s8000_mca *mca)
 	mca_write(mca, MCA_RX_SLOTS, mca->rx_slots);
 	mca_write(mca, MCA_RX_SLOTS_HI, 0);
 	mca_write(mca, MCA_TX_CFG, mca->tx_cfg & ~MCA_XX_CFG_EN);
-	mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
+	mca_write(mca, MCA_RX_CFG, mca->reference_profile ?
+		  T8010_MCA_REFERENCE_RX : MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
 	return 0;
 }
 
@@ -582,14 +646,35 @@ static int mca_dai_probe(struct snd_soc_dai *dai)
 {
 	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
 
+	if (mca->reference_faulted)
+		return -EIO;
 	snd_soc_dai_init_dma_data(dai, &mca->dma_tx,
 				  mca->capture ? &mca->dma_rx : NULL);
 	return 0;
 }
 
+static int mca_dai_remove(struct snd_soc_dai *dai)
+{
+	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+
+	if (mca->reference_profile && (mca->prep_mask || mca->run_mask)) {
+		/* ASoC cannot veto removal; do not reuse an unquiesced reference. */
+		mca->reference_faulted = true;
+		dev_err(mca->dev, "reference profile removed while active\n");
+		return 0;
+	}
+	mca->format_set = false;
+	mca->reference_profile = false;
+	mca->dai_drv.playback.channels_max = 2;
+	mca->pcm_hw.channels_max = 2;
+	return 0;
+}
+
 static const struct snd_soc_dai_ops mca_dai_ops = {
 	.probe = mca_dai_probe,
+	.remove = mca_dai_remove,
 	.set_fmt = mca_set_fmt,
+	.set_tdm_slot = mca_set_tdm_slot,
 	.hw_params = mca_hw_params,
 	.prepare = mca_prepare,
 	.hw_free = mca_hw_free,
@@ -876,9 +961,13 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to add MCLK provider\n");
 
+	mca->pcm_hw = mca_dma_hw;
+	mca->pcm_config = mca_dma_config;
+	mca->pcm_config.pcm_hardware = &mca->pcm_hw;
 	mca->dai_drv = mca_dai;
 	if (mca->hw->clock_provider)
 		mca->dai_drv.playback.rates = SNDRV_PCM_RATE_48000;
+
 	if (!mca->capture)
 		memset(&mca->dai_drv.capture, 0, sizeof(mca->dai_drv.capture));
 
@@ -887,7 +976,7 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register component\n");
 
-	ret = devm_snd_dmaengine_pcm_register(dev, &mca_dma_config, 0);
+	ret = devm_snd_dmaengine_pcm_register(dev, &mca->pcm_config, 0);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register PCM\n");
 
@@ -917,7 +1006,20 @@ static const struct s8000_mca_hw t8010_mca_hw = {
 	.sio_trigger = 0xcc,
 };
 
+/* Explicit board topology for the optional reset-held reference card. */
+static const struct s8000_mca_hw j71b_mca_hw = {
+	.version = 5,
+	.clock_provider = true,
+	.reference_capable = true,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
+	.sio_fifo = 0x180,
+	.sio_trigger = 0xcc,
+};
+
 static const struct of_device_id s8000_mca_of_match[] = {
+	{ .compatible = "apple,j71b-mca", .data = &j71b_mca_hw },
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
 	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
 	{ }

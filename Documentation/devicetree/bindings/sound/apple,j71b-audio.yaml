@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,j71b-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J71b speaker audio link
+
+maintainers:
+  - Stuart Fraser <stuart902@users.noreply.github.com>
+
+description: |
+  The J71b speaker amplifier bank shares a reset line and receives audio
+  from MCA2. The current qualification driver keeps reset asserted and
+  exposes the recovered four-channel digital transport only. No physical
+  speaker channel positions or acoustic gain policy are implied.
+
+properties:
+  compatible:
+    const: apple,j71b-audio
+
+  audio-cpu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: MCA2 CPU audio interface.
+
+  reset-gpios:
+    maxItems: 1
+    description: Shared active-low amplifier reset on AP GPIO20.
+
+required:
+  - compatible
+  - audio-cpu
+  - reset-gpios
+
+additionalProperties: false
