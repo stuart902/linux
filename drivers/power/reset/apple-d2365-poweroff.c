@@ -4,6 +4,9 @@
 #include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/err.h>
+#include <linux/gpio/apple-d2365.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
@@ -36,6 +39,7 @@ struct apple_d2365_poweroff {
 	struct device *dev;
 	struct regmap *regmap;
 	struct power_supply *supply;
+	struct device *event_dev;
 	const struct apple_d2365_poweroff_data *data;
 	bool restart;
 	bool standby_transaction_attempted;
@@ -194,6 +198,7 @@ static int apple_d2365_restart_prepare(struct sys_off_data *off)
 	u8 events[D2365_EVENT_COUNT];
 	int ret;
 
+	apple_d2365_gpio_quiesce(pmic->event_dev);
 	ret = regmap_bulk_read(pmic->regmap, D2365_EVENTS,
 			       events, sizeof(events));
 	if (ret)
@@ -213,6 +218,8 @@ static int apple_d2365_poweroff_prepare(struct sys_off_data *off)
 	union power_supply_propval online;
 	unsigned int status;
 	int ret;
+
+	apple_d2365_gpio_quiesce(pmic->event_dev);
 
 	/* Unknown source state is never permission to enter standby. */
 	pmic->restart = true;
@@ -281,6 +288,51 @@ static const struct of_device_id apple_d2365_poweroff_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_d2365_poweroff_of_match);
 
+static void apple_d2365_event_device_put(void *data)
+{
+	put_device(data);
+}
+
+/* The GPIO event controller is a sibling under the same PMIC. */
+static int apple_d2365_get_event_provider(struct device *dev,
+					struct apple_d2365_poweroff *pmic)
+{
+	struct device_node *node;
+	struct platform_device *provider;
+	struct device_link *link;
+	int ret;
+
+	node = of_get_compatible_child(dev->parent->of_node,
+				       "apple,d2365-pmic-gpio");
+	if (!node)
+		return dev_err_probe(dev, -ENODEV, "no PMIC event provider\n");
+	provider = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!provider)
+		return -EPROBE_DEFER;
+
+	ret = devm_add_action_or_reset(dev, apple_d2365_event_device_put,
+				       &provider->dev);
+	if (ret)
+		return ret;
+
+	link = device_link_add(dev, &provider->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+	if (!link)
+		return dev_err_probe(dev, -EINVAL, "cannot link PMIC event provider\n");
+
+	/* A link added during probe does not itself guarantee readiness. */
+	device_lock(&provider->dev);
+	if (!device_is_bound(&provider->dev))
+		ret = -EPROBE_DEFER;
+	else if (!apple_d2365_gpio_events_ready(&provider->dev))
+		ret = -ENODEV;
+	device_unlock(&provider->dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "PMIC event provider not ready\n");
+	pmic->event_dev = &provider->dev;
+	return 0;
+}
+
 static int apple_d2365_poweroff_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -296,6 +348,10 @@ static int apple_d2365_poweroff_probe(struct platform_device *pdev)
 	pmic->regmap = dev_get_regmap(dev->parent, NULL);
 	if (!pmic->regmap)
 		return dev_err_probe(dev, -ENODEV, "parent has no register map\n");
+
+	ret = apple_d2365_get_event_provider(dev, pmic);
+	if (ret)
+		return ret;
 
 	pmic->supply = devm_power_supply_get_by_reference(dev, "power-supplies");
 	if (IS_ERR(pmic->supply))

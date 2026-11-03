@@ -17,6 +17,7 @@
 #include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/gpio/driver.h>
+#include <linux/gpio/apple-d2365.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
@@ -542,9 +543,22 @@ static int apple_pmic_event_probe(struct platform_device *pdev,
 	return devm_add_action_or_reset(dev, apple_pmic_event_stop, gpio);
 }
 
-static void apple_pmic_gpio_shutdown(struct platform_device *pdev)
+static struct platform_driver d2365_gpio_driver;
+
+bool apple_d2365_gpio_events_ready(struct device *dev)
 {
-	struct apple_pmic_gpio *gpio = platform_get_drvdata(pdev);
+	struct apple_pmic_gpio *gpio;
+
+	if (dev->driver != &d2365_gpio_driver.driver)
+		return false;
+	gpio = dev_get_drvdata(dev);
+	return gpio && gpio->domain;
+}
+EXPORT_SYMBOL_GPL(apple_d2365_gpio_events_ready);
+
+void apple_d2365_gpio_quiesce(struct device *dev)
+{
+	struct apple_pmic_gpio *gpio = dev_get_drvdata(dev);
 
 	if (!gpio->domain)
 		return;
@@ -560,6 +574,7 @@ static void apple_pmic_gpio_shutdown(struct platform_device *pdev)
 	cancel_delayed_work_sync(&gpio->irq_retry);
 	/* Keep the IRQ allocated: devres still owns its eventual free_irq(). */
 }
+EXPORT_SYMBOL_GPL(apple_d2365_gpio_quiesce);
 
 static int apple_pmic_gpio_suspend(struct device *dev)
 {
@@ -794,7 +809,6 @@ MODULE_DEVICE_TABLE(of, d2365_gpio_of_match);
 
 static struct platform_driver d2365_gpio_driver = {
 	.probe = apple_pmic_gpio_probe,
-	.shutdown = apple_pmic_gpio_shutdown,
 	.driver = {
 		.name = "apple-d2365-pmic-gpio",
 		.of_match_table = d2365_gpio_of_match,

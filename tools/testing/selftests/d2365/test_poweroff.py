@@ -104,9 +104,9 @@ class D2365Poweroff(unittest.TestCase):
 class D2365EventQuiesce(unittest.TestCase):
     def test_shutdown_drains_irq_and_retry_after_closing_gate(self):
         post = (ROOT / 'drivers/gpio/gpio-apple-d2365.c').read_text()
-        start = post.index('static void apple_pmic_gpio_shutdown(')
+        start = post.index('void apple_d2365_gpio_quiesce(')
         shutdown = post[start:post.index('\n}', start) + 2]
-        self.assertIn('.shutdown = apple_pmic_gpio_shutdown', post)
+        self.assertNotIn('.shutdown = apple_pmic_gpio_shutdown', post)
         self.assertIn('if (!retry || gpio->shutting_down)', post)
         self.assertIn('!gpio->removing && !gpio->shutting_down &&', post)
         self.assertIn('if (gpio->removing || gpio->shutting_down)', post)
@@ -127,9 +127,9 @@ struct apple_pmic_gpio {
     bool shutting_down;
     int irq_lock, parent_irq, irq_retry;
 };
-struct platform_device { struct apple_pmic_gpio *data; };
+struct device { struct apple_pmic_gpio *data; };
 static unsigned step;
-static struct apple_pmic_gpio *platform_get_drvdata(struct platform_device *p)
+static struct apple_pmic_gpio *dev_get_drvdata(struct device *p)
 { return p->data; }
 static void mutex_lock(int *lock) { assert(step++ == 0 && !*lock); *lock = 1; }
 static void apple_pmic_irq_hold(struct apple_pmic_gpio *gpio, bool retry)
@@ -142,11 +142,11 @@ static void cancel_delayed_work_sync(int *work) { assert(step++ == 4); }
 int main(void)
 {
     struct apple_pmic_gpio gpio = { .parent_irq = 7 };
-    struct platform_device pdev = { &gpio };
-    apple_pmic_gpio_shutdown(&pdev);
+    struct device dev = { &gpio };
+    apple_d2365_gpio_quiesce(&dev);
     assert(!step && !gpio.shutting_down);
     gpio.domain = &gpio;
-    apple_pmic_gpio_shutdown(&pdev);
+    apple_d2365_gpio_quiesce(&dev);
     assert(step == 5 && gpio.shutting_down && !gpio.irq_lock);
     return 0;
 }

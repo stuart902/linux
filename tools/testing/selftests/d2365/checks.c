@@ -5,7 +5,7 @@ static void reset(void)
 {
     memset(memory, 0, sizeof(memory));
     memset(operations, 0, sizeof(operations));
-    count = fail_at = source_reads = online_reads = 0;
+    count = fail_at = source_reads = online_reads = quiesce_calls = 0;
     standby_attempts = standby_writes = restart_calls = sleeps = 0;
     source_change_at = online_change_at = final_event_change = 0;
     source_value = online_value = 0;
@@ -23,7 +23,7 @@ static void reset(void)
     }
     for (unsigned i = 0; i < 6; i++) memory[0x0929 + 6 * i] = i % 2 ? 0xff : 0x01;
 }
-static void prepare(void) { assert(apple_d2365_poweroff_prepare(&off) == NOTIFY_DONE); }
+static void prepare(void) { assert(apple_d2365_poweroff_prepare(&off) == NOTIFY_DONE); assert(quiesce_calls == 1); }
 static void rejected(void)
 {
     assert(pmic.restart && !pmic.standby_acknowledged);
@@ -191,6 +191,7 @@ static void check_restart(void)
             reset(); fail_at = failure; error_effect = effect;
             memory[0x5001] = 0xa5;
             assert(apple_d2365_restart_prepare(&off) == NOTIFY_DONE);
+            assert(quiesce_calls == 1);
             assert(count == 2);
             assert(operations[0].kind == 'R' && operations[0].reg == 0x0140 &&
                    operations[0].size == 30);

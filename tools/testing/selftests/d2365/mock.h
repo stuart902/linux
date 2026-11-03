@@ -28,6 +28,7 @@ static void log_message(void *dev, const char *format, ...)
 #define dev_err log_message
 #define dev_emerg log_message
 struct device { int unused; };
+static unsigned quiesce_calls;
 struct regmap { int unused; };
 struct power_supply { int unused; };
 union power_supply_propval { int intval; };
@@ -35,6 +36,7 @@ struct sys_off_data { void *cb_data; };
 struct operation { char kind; unsigned reg, size, value; };
 static struct operation operations[128];
 static unsigned count, fail_at, source_reads, online_reads;
+static void apple_d2365_gpio_quiesce(struct device *dev) { assert(count == 0); quiesce_calls++; }
 static unsigned standby_attempts, standby_writes, restart_calls, sleeps;
 static unsigned source_change_at, online_change_at, final_event_change;
 static int source_value, online_value;
