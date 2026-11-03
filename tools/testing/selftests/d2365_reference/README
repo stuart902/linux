@@ -1,14 +1,45 @@
-J71b Apple-derived power reference (offline, not a loadable driver)
+J71b Apple-derived power reference (unwired kernel adapter)
 ================================================================
 
 This is the first separately implemented core for the requested second power
 approach. It starts from upstream df7c930, independently of the existing
 j71b/power-validation driver. It is NOT a second bootable image or a completed
-Apple-equivalent Linux driver. Nothing registers a device, poweroff callback,
-I2C transaction, firmware execution, or platform reset. The only adapter here
-is an in-memory test backend. Do not wire it to hardware as-is.
+Apple-equivalent Linux driver. The kernel-compatible core and default-off
+POWER_RESET_APPLE_D2365_REFERENCE adapter now exist, but no platform driver,
+DT node or board calls the registration API. It is built-in only because
+ARM64's terminal machine_restart entry point is not exported to modules.
+Compilation alone registers
+nothing. Do not wire it to hardware as-is.
 
-Run ./run.sh. Requires an existing C compiler. CFLAGS may enable sanitizers.
+The registration API requires a probing consumer, an 8-bit regmap, same-PMIC
+event owner, explicit source snapshot provider and established ordinary-path
+configuration. It pins bound provider modules/devices while creating managed
+links and rolls back handlers/pins on failure. A failed caller probe lets driver
+core clean managed links; callbacks must belong to the pinned provider modules.
+Providers must be fully bound, not already entering teardown even if their
+driver remains attached. This is checked while holding each provider's lock.
+Lock acquisition is nonblocking: a locked provider causes probe deferral,
+including a parent that synchronously populates children from its own probe.
+The caller must still have a reprobe path: arbitrary lock release alone does
+not retrigger deferred probing, whereas a parent's successful probe does.
+The PMIC transport must still be operational after device_shutdown(), and its
+regmap must bypass caching for events, status and commands and never be in
+cache-only mode during callbacks. These transport properties are caller
+contracts, not properties established by device links or the 8-bit check.
+The adapter checks existing poweroff handlers and uses unique HIGH priority.
+This does NOT guarantee global exclusivity: board integration must exclude both
+the existing driver and later competing handlers.
+
+The event owner must stop/drain IRQ/work and transfer read-to-clear ownership.
+Failure prevents all core PMIC operations. Normal restart then leaves reset to
+the existing platform driver. Poweroff remains unresolved and holds instead.
+Source sampling and bus transactions run only in sleepable prepare; final
+handling resets or waits without further PMIC access. The final wait spins with
+IRQs disabled, unlike Apple's sleep loop: it is a Linux terminal adaptation,
+not proof of electrical off or a justified power-consumption policy. The
+adapter's unresolved-state hold is containment, not identical Apple behavior.
+
+Run ./run.sh and python3 test_adapter.py. Requires an existing C compiler. CFLAGS may enable sanitizers.
 The runner uses a temporary executable and removes it on exit. No firmware
 bytes are distributed or required to run tests.
 
@@ -47,8 +78,8 @@ No return value means electrical-off success. A successful I2C write would
 not prove that either. GPIO and event errors may make continued standby unsafe
 for a live Linux system; this model does not authorize that policy on hardware.
 
-Before a hardware adapter
--------------------------
+Before hardware activation
+--------------------------
 1. Establish actual J71b producers and semantics for BOTH Apple source
    properties, including absence, stale state, teardown, and cable transitions.
    Current Linux Tristar ONLINE is only cached 0x018a != 0, not a mapped source.
@@ -58,8 +89,29 @@ Before a hardware adapter
 4. Decide and document live read-error policy and nonreturning terminal handling.
    Do not silently import a one-second wait or fail-to-reset behavior and call
    that Apple-equivalent. Do not blindly copy unchecked Apple reads either.
-5. Add a reviewed Linux adapter/bindings only once those contracts are grounded;
-   then compile, run kernel integration tests, and request a bounded device test.
+5. Finish review of the unwired adapter, compile it against the real kernel,
+   add providers/bindings only once their contracts are grounded, then run
+   kernel integration tests and request a bounded device test.
+
+Additional source-contract evidence
+-----------------------------------
+The D2365 source dictionary's 0x189 bit-1 requirement is state-dependent:
+the charger passes inverse previous source status to the backend getter
+(0x5f161e4-0x5f16204; D2365 selection at 0x6b85294). It is not a fixed mask.
+The immediate charger USB override is function-usb_det, not the separate
+function-usb_dmonitor facility (0x5f15b30-0x5f15b9c, 0x5f163b4-0x5f163e4).
+AppleUSBCableDetect is published from a cached IOAccessoryUSBPower-derived
+value (0x5ed36c0-0x5ed37fc), not a fresh shutdown-time PMIC read. Source
+selection, all update paths and teardown/staleness guarantees remain unproven.
+
+Ordinary-mode inputs also require runtime evidence: upo-shutdown-delay
+(0x6b7e514-0x6b7e5a8), pmu-chargetrap or resolved software-behavior bit 6
+(0x6b7e744-0x6b7e7ec), function-external_shutdown (0x6b7e8cc-0x6b7e8e8),
+mutable RTC alarm state (0x6b87118-0x6b87164) and debug configuration
+(0x6b7c030-0x6b7c0bc). The supplied firmware DeviceTree's software-behavior
+is a syscfg substitution descriptor, not resolved runtime bytes. It cannot
+establish the ordinary-path precondition just because the board is J71b.
+These facts narrow the missing contracts; they do not implement a provider.
 
 Evidence provenance (facts/algorithm, no proprietary code)
 ---------------------------------------------------------
@@ -83,3 +135,12 @@ all GPIO configuration bytes with asynchronously refreshed pairs, each ordinary
 sequence transaction failure (including partial and complete-before-error commitment), unsupported
 mode rejection, and normal restart error continuation. They test our model,
 not the original executable, kernel lifecycle, bus framing, or physical IRQs.
+
+Adapter tests compile the actual C adapter against a host lifecycle shim.
+They inject failure at every modeled allocation/link/action/handler operation,
+check rollback of pins and handlers, reject unbound/unbinding/locked/missing
+providers and wide-regmap inputs, check shared providers and both source reset
+branches,
+and check quiesce failures and bus-free terminal callbacks. The shim models
+probe cleanup but cannot prove kernel unbind/shutdown races, PMGR/I2C lifetime,
+or actual IRQ ownership. A real ARM64 kernel object build remains required.

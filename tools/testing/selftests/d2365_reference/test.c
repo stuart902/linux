@@ -3,7 +3,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include "reference.h"
+#include <linux/power/apple-d2365-reference.h>
 
 struct transaction { unsigned int reg; size_t len; bool write; };
 struct mock {

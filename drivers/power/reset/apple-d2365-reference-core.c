@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Independent implementation of the verified J71b ordinary-path operations.
- * This offline core deliberately has no registered hardware entry point.
+ * Terminal results describe required actions; this core does not perform them.
  */
+#ifdef __KERNEL__
+#include <linux/errno.h>
+#else
 #include <errno.h>
-#include "reference.h"
+#endif
+#include <linux/power/apple-d2365-reference.h>
 
 static void record_error(struct d2365_result *r, int error)
 {
@@ -12,7 +16,7 @@ static void record_error(struct d2365_result *r, int error)
 }
 
 static int read_bytes(const struct d2365_io *io, struct d2365_result *r,
-		      unsigned int reg, uint8_t *data, size_t len)
+		      unsigned int reg, u8 *data, size_t len)
 {
 	int error = io->read(io->context, reg, data, len);
 
@@ -21,7 +25,7 @@ static int read_bytes(const struct d2365_io *io, struct d2365_result *r,
 }
 
 static int write_bytes(const struct d2365_io *io, struct d2365_result *r,
-		       unsigned int reg, const uint8_t *data, size_t len)
+		       unsigned int reg, const u8 *data, size_t len)
 {
 	int error = io->write(io->context, reg, data, len);
 
@@ -31,7 +35,7 @@ static int write_bytes(const struct d2365_io *io, struct d2365_result *r,
 
 static void gpio_prepare(const struct d2365_io *io, struct d2365_result *r)
 {
-	uint8_t initial[36], pairs[36], config[24];
+	u8 initial[36], pairs[36], config[24];
 	unsigned int i;
 
 	if (read_bytes(io, r, 0x900, initial, sizeof(initial)))
@@ -65,7 +69,7 @@ struct d2365_result d2365_reference_shutdown(const struct d2365_io *io,
 {
 	struct d2365_result r = { .terminal = D2365_UNRESOLVED };
 	struct d2365_sources sources;
-	uint8_t events[30], mask[30], value;
+	u8 events[30], mask[30], value;
 	bool standby;
 	unsigned int i;
 	int error;
@@ -131,7 +135,7 @@ struct d2365_result d2365_reference_shutdown(const struct d2365_io *io,
 struct d2365_result d2365_reference_restart(const struct d2365_io *io)
 {
 	struct d2365_result r = { .terminal = D2365_UNRESOLVED };
-	uint8_t events[30], zero = 0;
+	u8 events[30], zero = 0;
 
 	if (!valid_io(io)) {
 		r.first_error = -EINVAL;

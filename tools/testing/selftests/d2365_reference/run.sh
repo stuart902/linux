@@ -4,5 +4,6 @@ set -eu
 cd "$(dirname "$0")"
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT HUP INT TERM
-${CC:-cc} -std=c11 -Wall -Wextra -Werror ${CFLAGS:-} reference.c test.c -o "$out/test"
+core=../../../../drivers/power/reset
+${CC:-cc} -std=c11 -Wall -Wextra -Werror ${CFLAGS:-} -I../../../../include "$core/apple-d2365-reference-core.c" test.c -o "$out/test"
 "$out/test"
