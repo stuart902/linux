@@ -82,7 +82,7 @@ int main(void)
 		m.sources = (struct d2365_sources){a, b};
 		m.memory[0x500f] = v;
 		r = d2365_reference_shutdown(&io, true);
-		if (a == 3 || b == 3) {
+		if ((a == 3 || b == 3) && a != 2 && b != 2) {
 			assert(r.terminal == D2365_UNRESOLVED);
 			assert(r.first_error == -ENODATA && m.count == 5);
 		} else {
@@ -107,8 +107,21 @@ int main(void)
 			assert(m.memory[0x929 + i * 6] == (v <= 0x3f ? (v & 0xfe) : v));
 	}
 	reset(&m); m.property_error = -EIO;
+	m.sources = (struct d2365_sources){D2365_PROPERTY_TRUE, D2365_PROPERTY_TRUE};
 	r = d2365_reference_shutdown(&io, true);
 	assert(r.terminal == D2365_UNRESOLVED && r.first_error == -EIO && m.count == 5);
+	/* A known true does not excuse malformed enum values in the snapshot. */
+	for (int invalid = -1; invalid <= 4; invalid += 5)
+	for (unsigned int slot = 0; slot < 2; slot++) {
+		reset(&m);
+		m.sources = (struct d2365_sources){
+			slot ? D2365_PROPERTY_TRUE : invalid,
+			slot ? invalid : D2365_PROPERTY_TRUE,
+		};
+		r = d2365_reference_shutdown(&io, true);
+		assert(r.terminal == D2365_UNRESOLVED &&
+		       r.first_error == -ENODATA && m.count == 5);
+	}
 	r = d2365_reference_shutdown(NULL, true);
 	assert(r.terminal == D2365_UNRESOLVED && r.first_error == -EINVAL);
 	r = d2365_reference_restart(NULL);

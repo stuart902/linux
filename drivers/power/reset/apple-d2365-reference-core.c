@@ -99,8 +99,8 @@ struct d2365_result d2365_reference_shutdown(const struct d2365_io *io,
 		record_error(&r, error);
 		return r;
 	}
-	if (sources.raw_external > D2365_PROPERTY_TRUE ||
-	    sources.usb_cable > D2365_PROPERTY_TRUE ||
+	if (sources.raw_external > D2365_PROPERTY_UNRESOLVED ||
+	    sources.usb_cable > D2365_PROPERTY_UNRESOLVED ||
 	    sources.raw_external < D2365_PROPERTY_ABSENT ||
 	    sources.usb_cable < D2365_PROPERTY_ABSENT) {
 		record_error(&r, -ENODATA);
@@ -108,6 +108,15 @@ struct d2365_result d2365_reference_shutdown(const struct d2365_io *io,
 	}
 	standby = sources.raw_external != D2365_PROPERTY_TRUE &&
 		  sources.usb_cable != D2365_PROPERTY_TRUE;
+	/* Either independently valid true property determines Apple's reset
+	 * branch. Do not require an unrelated unknown value or invent false
+	 * for it. Standby still needs both properties independently resolved.
+	 */
+	if (standby && (sources.raw_external == D2365_PROPERTY_UNRESOLVED ||
+			sources.usb_cable == D2365_PROPERTY_UNRESOLVED)) {
+		record_error(&r, -ENODATA);
+		return r;
+	}
 	/* Apple continues on read errors with its existing scratch value. The
 	 * model refuses an undefined/stale-value RMW rather than inventing data.
 	 */

@@ -25,6 +25,12 @@ enum d2365_terminal {
 };
 
 struct d2365_sources {
+	/* Each TRUE must be independently valid in this coherent snapshot.
+	 * A successful callback may leave the other property UNRESOLVED:
+	 * TRUE determines reset without assigning a value to that property.
+	 * Standby requires neither property to be unresolved. A callback error
+	 * invalidates the entire snapshot, including any TRUE it filled in.
+	 */
 	enum d2365_property raw_external;
 	enum d2365_property usb_cable;
 };

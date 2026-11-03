@@ -73,8 +73,12 @@ Distinct behavior implemented
 Limits and deliberately non-identical cases
 ------------------------------------------
 No hardware source-property producer is implemented. ABSENT means an observed
-absent Apple property/object, not a missing Linux provider. UNRESOLVED prevents
-a branch decision; it must not be mapped to ABSENT to make a device boot.
+absent Apple property/object, not a missing Linux provider. A successful coherent
+snapshot with either independently valid TRUE determines the reset branch even
+if the other property is UNRESOLVED; it does not invent that property's value.
+Standby requires both properties resolved. Callback errors invalidate the whole
+snapshot, and malformed values are rejected even alongside TRUE. UNRESOLVED
+must not be mapped to ABSENT or FALSE to make a device boot or shut down.
 Source resolution happens at the corresponding point in the modeled sequence;
 so it can return unresolved after earlier simulated writes. Hardware integration
 must validate the entire producer contract before registering any callback.
