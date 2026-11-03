@@ -58,7 +58,9 @@
 		sdmode-gpios = <&pinctrl_ap 20 GPIO_ACTIVE_HIGH>;
 	};
 
+	/* Test-only: no playback card before the desktop session starts. */
 	sound {
+		status = "disabled";
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "J71b Speakers";
 		simple-audio-card,format = "i2s";
@@ -113,7 +115,7 @@
 
 &mca2 {
 	apple,i2s-switch = <&i2s_switch 2 2>;
-	status = "okay";
+	status = "disabled";
 };
 
 &i2s_switch {
