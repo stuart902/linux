@@ -146,6 +146,11 @@ struct apple_aop_call {
 	u32 retcode;
 	void *reply;
 	size_t reply_len;
+	size_t reply_actual;
+	u32 channel;
+	u16 tag;
+	int error;
+	bool strict;
 };
 
 struct apple_aop_ep {
@@ -160,6 +165,8 @@ struct apple_aop_ep {
 
 	struct mutex lock; /* tx ring, seq and calls */
 	u16 seq;
+	/* Strict calls never reuse a tag, including after an uncertain send. */
+	u32 next_inline_tag;
 	struct apple_aop_call *calls[APPLE_AOP_MAX_CALLS];
 };
 
@@ -493,26 +500,55 @@ static void apple_aop_report(struct apple_aop_ep *ep, u32 channel, u16 subtype,
 	}
 }
 
-static void apple_aop_reply(struct apple_aop_ep *ep, u16 tag, const void *data, size_t len)
+static void apple_aop_reply(struct apple_aop_ep *ep, u32 channel,
+			    const struct epic_header *hdr, const void *data, size_t len)
 {
-	struct apple_aop_call *call;
-
-	if (len < sizeof(u32))
-		return;
+	struct apple_aop_call *call = NULL;
+	u16 tag = le16_to_cpu(hdr->tag);
+	u16 subtype = le16_to_cpu(hdr->subtype);
+	int slot;
 
 	mutex_lock(&ep->lock);
-	if (!tag || tag > APPLE_AOP_MAX_CALLS || !ep->calls[tag - 1]) {
+	for (slot = 0; slot < APPLE_AOP_MAX_CALLS; slot++) {
+		if (ep->calls[slot] && ep->calls[slot]->tag == tag) {
+			call = ep->calls[slot];
+			break;
+		}
+	}
+	if (!call) {
 		mutex_unlock(&ep->lock);
 		dev_err(ep->aop->dev, "endpoint 0x%02x: reply with unknown tag %u\n",
 			ep->index, tag);
 		return;
 	}
-	call = ep->calls[tag - 1];
-	ep->calls[tag - 1] = NULL;
+	/* Preserve legacy subtype filtering and undersized-reply handling. */
+	if (!call->strict && (hdr->category != EPIC_CATEGORY_REPLY ||
+			     (subtype != EPIC_SUBTYPE_RETCODE &&
+			      subtype != EPIC_SUBTYPE_STRING &&
+			      subtype != EPIC_SUBTYPE_RETCODE_PAYLOAD) ||
+			     len < sizeof(u32))) {
+		mutex_unlock(&ep->lock);
+		return;
+	}
+	ep->calls[slot] = NULL;
+	if (call->strict && (channel != call->channel || hdr->version != 2 ||
+			     hdr->sub_version != 2 ||
+			     le32_to_cpu(hdr->length) != len || len < sizeof(u32))) {
+		call->error = -EPROTO;
+		goto done;
+	}
 	call->retcode = get_unaligned_le32(data);
-	call->reply_len = min(call->reply_len, len - sizeof(u32));
+	call->reply_actual = len - sizeof(u32);
+	if (call->strict && call->retcode)
+		goto done;
+	if (call->strict && call->reply_actual > call->reply_len) {
+		call->error = -EMSGSIZE;
+		goto done;
+	}
 	if (call->reply)
-		memcpy(call->reply, data + sizeof(u32), call->reply_len);
+		memcpy(call->reply, data + sizeof(u32),
+		       min(call->reply_len, call->reply_actual));
+done:
 	complete(&call->done);
 	mutex_unlock(&ep->lock);
 }
@@ -529,6 +565,12 @@ static void apple_aop_handle(struct apple_aop_ep *ep, u32 channel, const void *m
 	len -= sizeof(*hdr);
 	subtype = le16_to_cpu(hdr->subtype);
 
+	/* Inline audio matches category and tag, not a fixed reply subtype. */
+	if ((hdr->category & 0xf0) == EPIC_CATEGORY_REPLY) {
+		apple_aop_reply(ep, channel, hdr, data, len);
+		return;
+	}
+
 	switch (hdr->category) {
 	case EPIC_CATEGORY_REPORT:
 		if (subtype == EPIC_SUBTYPE_STD_SERVICE)
@@ -539,11 +581,6 @@ static void apple_aop_handle(struct apple_aop_ep *ep, u32 channel, const void *m
 		else
 			dev_dbg(ep->aop->dev, "endpoint 0x%02x: report subtype 0x%x\n",
 				ep->index, subtype);
-		break;
-	case EPIC_CATEGORY_REPLY:
-		if (subtype == EPIC_SUBTYPE_RETCODE || subtype == EPIC_SUBTYPE_STRING ||
-		    subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD)
-			apple_aop_reply(ep, le16_to_cpu(hdr->tag), data, len);
 		break;
 	default:
 		dev_dbg(ep->aop->dev, "endpoint 0x%02x: category 0x%x subtype 0x%x\n",
@@ -711,7 +748,7 @@ void apple_aop_unlisten(const struct apple_aop_service *service)
 EXPORT_SYMBOL_GPL(apple_aop_unlisten);
 
 static int apple_aop_send_epic(struct apple_aop_ep *ep, u32 channel, u16 subtype, u16 tag,
-			       const void *data, size_t len)
+			       const void *data, size_t len, u32 inline_len)
 {
 	struct afk_ring *ring = &ep->tx;
 	struct afk_qe_header qe;
@@ -723,6 +760,7 @@ static int apple_aop_send_epic(struct apple_aop_ep *ep, u32 channel, u16 subtype
 		.category = EPIC_CATEGORY_NOTIFY,
 		.subtype = cpu_to_le16(subtype),
 		.tag = cpu_to_le16(tag),
+		.inline_len = cpu_to_le32(inline_len),
 	};
 	size_t base, rptr, wptr, total = sizeof(hdr) + len, used;
 
@@ -758,44 +796,89 @@ static int apple_aop_send_epic(struct apple_aop_ep *ep, u32 channel, u16 subtype
 	return apple_aop_send(ep, AFK_OPC_SEND, FIELD_PREP(AFK_MSG_WPTR, wptr));
 }
 
-int apple_aop_call(const struct apple_aop_service *service, u16 subtype, const void *data,
-		   size_t len, void *reply, size_t reply_len)
+static int apple_aop_do_call(const struct apple_aop_service *service, u16 subtype,
+			     const void *data, size_t len, void *reply,
+			     size_t reply_len, size_t *actual_len)
 {
 	struct apple_aop_ep *ep = apple_aop_ep(service->aop, service->endpoint);
-	struct apple_aop_call call = { .reply = reply, .reply_len = reply_len };
-	int tag, ret;
+	struct apple_aop_call call = {
+		.reply = reply,
+		.reply_len = reply_len,
+		.channel = service->channel,
+		.strict = actual_len != NULL,
+	};
+	int slot, ret;
 
-	if (!ep)
+	if (actual_len)
+		*actual_len = 0;
+	if (!ep || len > U32_MAX || reply_len > U32_MAX ||
+	    (len && !data) || (actual_len && reply_len && !reply))
 		return -EINVAL;
 	init_completion(&call.done);
 
 	mutex_lock(&ep->lock);
-	for (tag = 0; tag < APPLE_AOP_MAX_CALLS && ep->calls[tag]; tag++)
+	for (slot = 0; slot < APPLE_AOP_MAX_CALLS && ep->calls[slot]; slot++)
 		;
-	if (tag == APPLE_AOP_MAX_CALLS) {
-		mutex_unlock(&ep->lock);
-		return -EBUSY;
+	if (slot == APPLE_AOP_MAX_CALLS) {
+		ret = -EBUSY;
+		goto unlock;
 	}
-	ret = apple_aop_send_epic(ep, service->channel, subtype, tag + 1, data, len);
+	if (call.strict) {
+		/* Tags 1..MAX_CALLS remain reserved for the legacy API. */
+		if (!ep->next_inline_tag)
+			ep->next_inline_tag = APPLE_AOP_MAX_CALLS + 1;
+		if (ep->next_inline_tag > U16_MAX) {
+			ret = -EOVERFLOW;
+			goto unlock;
+		}
+		call.tag = ep->next_inline_tag++;
+	} else {
+		call.tag = slot + 1;
+	}
+	ret = apple_aop_send_epic(ep, service->channel, subtype, call.tag, data, len,
+				 call.strict ? reply_len : 0);
 	if (!ret)
-		ep->calls[tag] = &call;
+		ep->calls[slot] = &call;
+unlock:
 	mutex_unlock(&ep->lock);
 	if (ret)
 		return ret;
 
 	if (!wait_for_completion_timeout(&call.done, APPLE_AOP_CALL_TIMEOUT)) {
 		mutex_lock(&ep->lock);
-		if (ep->calls[tag] == &call) {
-			ep->calls[tag] = NULL;
+		if (ep->calls[slot] == &call) {
+			ep->calls[slot] = NULL;
 			mutex_unlock(&ep->lock);
 			return -ETIMEDOUT;
 		}
 		mutex_unlock(&ep->lock);
 	}
 
+	if (actual_len)
+		*actual_len = call.reply_actual;
+	if (call.error)
+		return call.error;
 	return call.retcode > INT_MAX ? -EIO : call.retcode;
 }
+
+int apple_aop_call(const struct apple_aop_service *service, u16 subtype, const void *data,
+		   size_t len, void *reply, size_t reply_len)
+{
+	return apple_aop_do_call(service, subtype, data, len, reply, reply_len, NULL);
+}
 EXPORT_SYMBOL_GPL(apple_aop_call);
+
+int apple_aop_call_inline(const struct apple_aop_service *service, u16 subtype,
+			  const void *data, size_t len, void *reply, size_t reply_len,
+			  size_t *actual_len)
+{
+	if (actual_len)
+		*actual_len = 0;
+	if (!actual_len || len > 0xe4 || reply_len > 0xe4)
+		return -EINVAL;
+	return apple_aop_do_call(service, subtype, data, len, reply, reply_len, actual_len);
+}
+EXPORT_SYMBOL_GPL(apple_aop_call_inline);
 
 /* Driver */
 
