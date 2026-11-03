@@ -5,6 +5,7 @@
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/gpio/apple-d2365.h>
+#include <linux/i2c.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/module.h>
@@ -333,6 +334,64 @@ static int apple_d2365_get_event_provider(struct device *dev,
 	return 0;
 }
 
+/* Test-only: compare the two normal I2C read forms for charger status. */
+static int apple_d2365_test_status_read(struct i2c_client *client, bool split,
+					 u8 *value)
+{
+	u8 addr[] = { 0x01, 0x8a };
+	struct i2c_msg msgs[] = {
+		{ .addr = client->addr, .len = sizeof(addr), .buf = addr },
+		{ .addr = client->addr, .flags = I2C_M_RD, .len = 1, .buf = value },
+	};
+	int ret;
+
+	i2c_lock_bus(client->adapter, I2C_LOCK_SEGMENT);
+	if (split) {
+		ret = __i2c_transfer(client->adapter, &msgs[0], 1);
+		if (ret == 1)
+			ret = __i2c_transfer(client->adapter, &msgs[1], 1);
+		if (ret == 1)
+			ret = 0;
+		else if (ret >= 0)
+			ret = -EIO;
+	} else {
+		ret = __i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+		if (ret == ARRAY_SIZE(msgs))
+			ret = 0;
+		else if (ret >= 0)
+			ret = -EIO;
+	}
+	i2c_unlock_bus(client->adapter, I2C_LOCK_SEGMENT);
+	return ret;
+}
+
+static void apple_d2365_test_status_compare(struct device *dev)
+{
+	struct i2c_client *client = i2c_verify_client(dev->parent);
+	u8 combined, split;
+	int a, b, i;
+
+	if (!client || !i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+		dev_warn(dev, "018a test: I2C client or raw transfers unavailable\n");
+		return;
+	}
+	/* Bounded diagnostic: leave the cable/source unchanged during boot. */
+	for (i = 0; i < 3; i++) {
+		a = apple_d2365_test_status_read(client, false, &combined);
+		if (a) {
+			dev_warn(dev, "018a test %d: repeated-start failed: %d\n", i + 1, a);
+			break;
+		}
+		b = apple_d2365_test_status_read(client, true, &split);
+		if (b) {
+			dev_warn(dev, "018a test %d: stop-separated failed: %d\n", i + 1, b);
+			break;
+		}
+		dev_info(dev, "018a test %d: repeated-start=%02x stop-separated=%02x\n",
+			 i + 1, combined, split);
+	}
+}
+
 static int apple_d2365_poweroff_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -374,9 +433,13 @@ static int apple_d2365_poweroff_probe(struct platform_device *pdev)
 		return ret;
 
 	/* Also required for kernel_can_power_off() to recognize this driver. */
-	return devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF,
-					     SYS_OFF_PRIO_DEFAULT,
-					     apple_d2365_poweroff_final, pmic);
+	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF,
+					    SYS_OFF_PRIO_DEFAULT,
+					    apple_d2365_poweroff_final, pmic);
+	if (ret)
+		return ret;
+	apple_d2365_test_status_compare(dev);
+	return 0;
 }
 
 static struct platform_driver apple_d2365_poweroff_driver = {
