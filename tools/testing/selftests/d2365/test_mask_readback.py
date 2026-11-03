@@ -30,7 +30,7 @@ struct apple_pmic_event_info {unsigned int mask_base, bytes;};
 struct info {const struct apple_pmic_event_info *events;};
 struct apple_pmic_gpio {bool mask_test; unsigned int mask_test_samples;
  void *regmap; const struct info *info; u8 mask[30],boot_mask[30];};
-static u8 hw[30];
+static u8 hw[30], read_zero[30];
 static int reads,writes,logs,read_error,write_error,ignore_write,last_match;
 static void *regmap_get_device(void *map) {return map;}
 static int regmap_bulk_read(void *map,unsigned int reg,u8 *buf,unsigned int len) {
@@ -41,7 +41,7 @@ static int regmap_bulk_read(void *map,unsigned int reg,u8 *buf,unsigned int len)
 static int regmap_write(void *map,unsigned int reg,u8 value) {
  (void)map; assert(reg>=0x1c0 && reg<0x1de); writes++;
  if(write_error) return write_error;
- if(!ignore_write) hw[reg-0x1c0]=value;
+ if(!ignore_write) hw[reg-0x1c0]=value & ~read_zero[reg-0x1c0];
  return 0;
 }
 static void dev_info(void *dev,const char *format,...) {
@@ -106,7 +106,39 @@ int main(void) {
  g.mask_test=false; enabled[0]=31;
  assert(apple_pmic_event_sync(&g,enabled,true)==0);
  assert(writes==6 && reads==7 && g.mask[0]==0xe0);
- puts("observer and sync cases passed");
+ /* Synthetic read-as-zero bits: a raw mismatch is not a write error.
+  * Fixtures exercise the observed pattern, not a silicon validity table.
+  */
+ const struct {unsigned int byte; u8 zero_bits,requested,observed;} cases[]={
+  {2,0xfe,0xfe,0x00}, {5,0x00,0xfe,0xfe}, {5,0x00,0xfc,0xfc},
+  {5,0x00,0xf8,0xf8}, {5,0x00,0xf0,0xf0},
+  {9,0x84,0xfe,0x7a}, {9,0x84,0xde,0x5a}, {22,0x0c,0xfe,0xf2},
+ };
+ for(unsigned int n=0;n<sizeof(cases)/sizeof(cases[0]);n++) {
+  unsigned int byte=cases[n].byte;
+  memset(enabled,0,sizeof(enabled)); memset(g.mask,0xff,30);
+  memset(hw,0xff,30); memset(read_zero,0,30);
+  read_zero[byte]=cases[n].zero_bits;
+  hw[byte]&=~read_zero[byte];
+  g.mask_test=true; g.mask_test_samples=0; reads=0; writes=0;
+  for(unsigned int bit=0;bit<8;bit++)
+   if(!(cases[n].requested & BIT(bit)))
+    enabled[(byte*8+bit)/64]|=BIT((byte*8+bit)%64);
+  assert(apple_pmic_event_sync(&g,enabled,true)==0);
+  assert(writes==1 && reads==1 && g.mask_test);
+  assert(hw[byte]==cases[n].observed);
+  assert(g.mask[byte]==cases[n].requested);
+  assert(last_match==(cases[n].requested==cases[n].observed));
+  /* Keep the requested shadow: unchanged requests must not retry. */
+  assert(apple_pmic_event_sync(&g,enabled,true)==0);
+  assert(writes==1 && reads==1);
+  /* Remasking still writes ones to the requested bits, without readback fixes. */
+  memset(enabled,0,sizeof(enabled));
+  assert(apple_pmic_event_sync(&g,enabled,true)==0);
+  assert(writes==2 && reads==2 && g.mask_test);
+  assert(g.mask[byte]==0xff && hw[byte]==(u8)~read_zero[byte]);
+ }
+ puts("observer, sync and read-as-zero cases passed");
 }
 '''
         with tempfile.TemporaryDirectory() as d:
