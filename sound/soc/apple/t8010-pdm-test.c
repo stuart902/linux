@@ -2,6 +2,7 @@
 #include <kunit/test.h>
 #include <linux/unaligned.h>
 #include "t8010-pdm.h"
+#include "t8010-pdm-adt.h"
 
 static struct pdm_filter pdm_test_filter(void)
 {
@@ -87,7 +88,128 @@ static void pdm_coalesced_position_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pdm_position_bytes(0, 0, &position), -EINVAL);
 }
 
+static struct pdm_adt pdm_test_adt(struct kunit *test, const u8 *bytes, size_t size)
+{
+	return (struct pdm_adt) {
+		.data = bytes,
+		.size = size,
+		.nodes = kunit_kcalloc(test, PDM_ADT_MAX_NODES,
+				       sizeof(struct pdm_adt_node), GFP_KERNEL),
+	};
+}
+
+static void pdm_adt_bounds_test(struct kunit *test)
+{
+	u8 bytes[8] = {};
+	struct pdm_adt tree = pdm_test_adt(test, bytes, sizeof(bytes));
+
+	KUNIT_ASSERT_NOT_NULL(test, tree.nodes);
+	KUNIT_ASSERT_EQ(test, pdm_adt_parse(&tree), 0);
+	KUNIT_EXPECT_EQ(test, tree.count, 1U);
+	tree.size = 7;
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+	tree.size = PDM_ADT_MAX_BYTES + 1;
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+	tree.size = sizeof(bytes);
+	put_unaligned_le32(PDM_ADT_MAX_PROPERTIES + 1, bytes);
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+}
+
+static void pdm_adt_property_bounds_test(struct kunit *test)
+{
+	u8 bytes[44] = {};
+	struct pdm_adt tree = pdm_test_adt(test, bytes, sizeof(bytes));
+
+	KUNIT_ASSERT_NOT_NULL(test, tree.nodes);
+	put_unaligned_le32(1, bytes);
+	memcpy(bytes + 8, "name", 5);
+	KUNIT_ASSERT_EQ(test, pdm_adt_parse(&tree), 0);
+	put_unaligned_le32(1, bytes + 40);
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+	put_unaligned_le32(0xffffff, bytes + 40);
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+	put_unaligned_le32(0, bytes + 40);
+	memset(bytes + 8, 'x', 32);
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+}
+
+static void pdm_adt_duplicate_property_test(struct kunit *test)
+{
+	u8 bytes[80] = {};
+	struct pdm_adt tree = pdm_test_adt(test, bytes, sizeof(bytes));
+
+	KUNIT_ASSERT_NOT_NULL(test, tree.nodes);
+	put_unaligned_le32(2, bytes);
+	memcpy(bytes + 8, "name", 5);
+	memcpy(bytes + 44, "name", 5);
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+}
+
+static void pdm_adt_rate_records_test(struct kunit *test)
+{
+	u8 bytes[60] = {};
+	u32 rates[2];
+	struct pdm_adt tree = pdm_test_adt(test, bytes, sizeof(bytes));
+
+	KUNIT_ASSERT_NOT_NULL(test, tree.nodes);
+	put_unaligned_le32(1, bytes);
+	memcpy(bytes + 8, "rates", 6);
+	put_unaligned_le32(16, bytes + 40);
+	put_unaligned_le32(48000, bytes + 48);
+	put_unaligned_le32(44100, bytes + 56);
+	KUNIT_ASSERT_EQ(test, pdm_adt_parse(&tree), 0);
+	KUNIT_ASSERT_EQ(test, pdm_adt_rates(&tree, 0, "rates", rates, 2), 2);
+	KUNIT_EXPECT_EQ(test, rates[0], 48000U);
+	KUNIT_EXPECT_EQ(test, rates[1], 44100U);
+	KUNIT_EXPECT_EQ(test, pdm_adt_rates(&tree, 0, "rates", rates, 1), -E2BIG);
+	put_unaligned_le32(48000, bytes + 56);
+	KUNIT_EXPECT_EQ(test, pdm_adt_rates(&tree, 0, "rates", rates, 2), -EINVAL);
+	put_unaligned_le32(1, bytes + 44);
+	KUNIT_EXPECT_EQ(test, pdm_adt_rates(&tree, 0, "rates", rates, 2), -EINVAL);
+}
+
+static void pdm_adt_duplicate_phandle_test(struct kunit *test)
+{
+	u8 bytes[104] = {};
+	struct pdm_adt tree = pdm_test_adt(test, bytes, sizeof(bytes));
+
+	KUNIT_ASSERT_NOT_NULL(test, tree.nodes);
+	put_unaligned_le32(2, bytes + 4);
+	put_unaligned_le32(1, bytes + 8);
+	memcpy(bytes + 16, "AAPL,phandle", 13);
+	put_unaligned_le32(4, bytes + 48);
+	put_unaligned_le32(149, bytes + 52);
+	put_unaligned_le32(1, bytes + 56);
+	memcpy(bytes + 64, "AAPL,phandle", 13);
+	put_unaligned_le32(4, bytes + 96);
+	put_unaligned_le32(149, bytes + 100);
+	KUNIT_ASSERT_EQ(test, pdm_adt_parse(&tree), 0);
+	KUNIT_EXPECT_EQ(test, pdm_adt_phandle(&tree, 149), -EINVAL);
+	put_unaligned_le32(150, bytes + 100);
+	KUNIT_EXPECT_EQ(test, pdm_adt_phandle(&tree, 149), 1);
+	KUNIT_EXPECT_EQ(test, pdm_adt_phandle(&tree, 150), 2);
+}
+
+static void pdm_adt_depth_test(struct kunit *test)
+{
+	u8 bytes[(PDM_ADT_MAX_DEPTH + 2) * 8] = {};
+	struct pdm_adt tree = pdm_test_adt(test, bytes, sizeof(bytes));
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, tree.nodes);
+	for (i = 0; i < PDM_ADT_MAX_DEPTH + 1; i++)
+		put_unaligned_le32(1, bytes + i * 8 + 4);
+	KUNIT_EXPECT_EQ(test, pdm_adt_parse(&tree), -EINVAL);
+}
+
 static struct kunit_case pdm_cases[] = {
+	KUNIT_CASE(pdm_adt_bounds_test),
+	KUNIT_CASE(pdm_adt_property_bounds_test),
+	KUNIT_CASE(pdm_adt_duplicate_property_test),
+	KUNIT_CASE(pdm_adt_rate_records_test),
+	KUNIT_CASE(pdm_adt_duplicate_phandle_test),
+	KUNIT_CASE(pdm_adt_depth_test),
+
 	KUNIT_CASE(pdm_valid_filter_test),
 	KUNIT_CASE(pdm_bad_bounds_test),
 	KUNIT_CASE(pdm_priming_test),
