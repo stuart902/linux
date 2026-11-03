@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/sio.h>
 #include <linux/xarray.h>
+#include <linux/wait.h>
 
 #define APPLE_SIO_REMAP_AP_LO		0x0008
 #define APPLE_SIO_REMAP_AP_HI		0x0010
@@ -106,6 +107,7 @@ struct apple_sio_async {
 	int status;
 	u64 response;
 	bool active;
+	bool owned;
 };
 
 struct apple_sio {
@@ -133,6 +135,8 @@ struct apple_sio {
 		void *data;
 	} notify[APPLE_SIO_MAX_ENDPOINTS];
 	struct xarray pending;
+	atomic_t owned_pending;
+	wait_queue_head_t owned_drained;
 	struct apple_sio_region ep0_general;
 	struct apple_sio_region ep0_spi;
 	struct apple_sio_region ep3_aux;
@@ -160,7 +164,8 @@ static struct apple_sio_async *
 apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 			       u8 parameter, u32 data, u8 expected_opcode,
 			       apple_sio_async_callback_t callback,
-			       void *callback_data, bool atomic, int fixed_tag);
+			       void *callback_data, bool atomic, int fixed_tag,
+			       bool owned);
 
 static void apple_sio_submit_setup(struct apple_sio *sio);
 
@@ -219,6 +224,8 @@ void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
 {
 	unsigned long flags;
 
+	might_sleep();
+
 	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS)
 		return;
 
@@ -226,6 +233,10 @@ void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
 	sio->notify[endpoint].fn = notify;
 	sio->notify[endpoint].data = data;
 	xa_unlock_irqrestore(&sio->pending, flags);
+
+	/* Dispatch may have copied the previous callback before the update. */
+	if (sio->irq_requested)
+		synchronize_irq(sio->irq);
 }
 EXPORT_SYMBOL_GPL(apple_sio_set_notify);
 
@@ -327,8 +338,9 @@ static void apple_sio_dispatch(struct apple_sio *sio, u64 message)
 	if (tagged)
 		request = xa_load(&sio->pending, key);
 	if (request && (opcode == request->expected_opcode ||
-			opcode == APPLE_SIO_OP_ERROR ||
-			opcode == APPLE_SIO_OP_DMA_ERROR)) {
+			(!request->owned &&
+			 (opcode == APPLE_SIO_OP_ERROR ||
+			  opcode == APPLE_SIO_OP_DMA_ERROR)))) {
 		__xa_erase(&sio->pending, key);
 		request->active = false;
 		request->response = message;
@@ -353,6 +365,8 @@ static void apple_sio_dispatch(struct apple_sio *sio, u64 message)
 		request->callback(request->callback_data, request->status,
 				  request->response);
 	complete_all(&request->done);
+	if (request->owned && atomic_dec_and_test(&sio->owned_pending))
+		wake_up_all(&sio->owned_drained);
 	apple_sio_async_put(request);
 }
 
@@ -471,6 +485,8 @@ static void apple_sio_async_finish(struct apple_sio_async *request,
 	if (notify && request->callback)
 		request->callback(request->callback_data, status, response);
 	complete_all(&request->done);
+	if (request->owned && atomic_dec_and_test(&sio->owned_pending))
+		wake_up_all(&sio->owned_drained);
 	apple_sio_async_put(request);
 }
 
@@ -478,7 +494,8 @@ static struct apple_sio_async *
 apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 			       u8 parameter, u32 data, u8 expected_opcode,
 			       apple_sio_async_callback_t callback,
-			       void *callback_data, bool atomic, int fixed_tag)
+			       void *callback_data, bool atomic, int fixed_tag,
+			       bool owned)
 {
 	struct apple_sio_async *request;
 	gfp_t gfp = atomic ? GFP_ATOMIC : GFP_KERNEL;
@@ -513,10 +530,26 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 	request->expected_opcode = expected_opcode;
 	request->status = -EINPROGRESS;
 	request->active = true;
+	request->owned = owned;
+
+	/* Admission and teardown are serialized, including not-yet-sent requests. */
+	xa_lock_irqsave(&sio->pending, flags);
+	if (sio->stopping) {
+		xa_unlock_irqrestore(&sio->pending, flags);
+		apple_sio_tag_free(sio, endpoint, tag);
+		apple_sio_async_put(request);
+		apple_sio_async_put(request);
+		return ERR_PTR(-ESHUTDOWN);
+	}
+	if (owned)
+		atomic_inc(&sio->owned_pending);
+	xa_unlock_irqrestore(&sio->pending, flags);
 
 	ret = xa_insert(&sio->pending, request->key, request, gfp);
 	if (ret) {
 		apple_sio_tag_free(sio, endpoint, tag);
+		if (owned && atomic_dec_and_test(&sio->owned_pending))
+			wake_up_all(&sio->owned_drained);
 		apple_sio_async_put(request);
 		apple_sio_async_put(request);
 		return ERR_PTR(ret);
@@ -566,7 +599,7 @@ apple_sio_request_async(struct apple_sio *sio, u8 endpoint, u8 opcode,
 {
 	return apple_sio_request_async_common(sio, endpoint, opcode, parameter,
 					      data, expected_opcode, callback,
-					      callback_data, false, -1);
+					      callback_data, false, -1, false);
 }
 EXPORT_SYMBOL_GPL(apple_sio_request_async);
 
@@ -578,9 +611,35 @@ apple_sio_request_async_atomic(struct apple_sio *sio, u8 endpoint, u8 opcode,
 {
 	return apple_sio_request_async_common(sio, endpoint, opcode, parameter,
 					      data, expected_opcode, callback,
-					      callback_data, true, -1);
+					      callback_data, true, -1, false);
 }
 EXPORT_SYMBOL_GPL(apple_sio_request_async_atomic);
+
+/* A published owned request is retired only by its expected response. */
+struct apple_sio_async *
+apple_sio_request_async_owned(struct apple_sio *sio, u8 endpoint, u8 opcode,
+			     u8 parameter, u32 data, u8 expected_opcode,
+			     apple_sio_async_callback_t callback,
+			     void *callback_data)
+{
+	return apple_sio_request_async_common(sio, endpoint, opcode, parameter,
+					      data, expected_opcode, callback,
+					      callback_data, false, -1, true);
+}
+EXPORT_SYMBOL_GPL(apple_sio_request_async_owned);
+
+int apple_sio_async_wait(struct apple_sio_async *request,
+			 unsigned long timeout, u64 *response)
+{
+	if (!timeout)
+		wait_for_completion(&request->done);
+	else if (!wait_for_completion_timeout(&request->done, timeout))
+		return -ETIME;
+	if (response)
+		*response = request->response;
+	return request->status;
+}
+EXPORT_SYMBOL_GPL(apple_sio_async_wait);
 
 static void apple_sio_setup_done(void *data, int status, u64 response)
 {
@@ -659,7 +718,7 @@ static void apple_sio_submit_setup(struct apple_sio *sio)
 	request = apple_sio_request_async_common(sio, endpoints[index], 0x03,
 						 parameters[index], value, 0x65,
 						 apple_sio_setup_done, sio, true,
-						 tags[index]);
+						 tags[index], false);
 	if (IS_ERR(request)) {
 		sio->setup_status = PTR_ERR(request);
 		complete_all(&sio->setup_done);
@@ -678,6 +737,10 @@ int apple_sio_async_cancel(struct apple_sio_async *request)
 	xa_lock_irqsave(&sio->pending, flags);
 	if (request->active &&
 	    xa_load(&sio->pending, request->key) == request) {
+		if (request->owned) {
+			xa_unlock_irqrestore(&sio->pending, flags);
+			return -EBUSY;
+		}
 		__xa_erase(&sio->pending, request->key);
 		request->active = false;
 		cancelled = true;
@@ -703,7 +766,7 @@ void apple_sio_cancel_endpoint(struct apple_sio *sio, u8 endpoint)
 
 	xa_lock_irqsave(&sio->pending, flags);
 	xa_for_each(&sio->pending, index, request) {
-		if (request->endpoint != endpoint)
+		if (request->owned || request->endpoint != endpoint)
 			continue;
 		__xa_erase(&sio->pending, index);
 		request->active = false;
@@ -773,10 +836,16 @@ static void apple_sio_fail_pending(struct apple_sio *sio)
 
 static void apple_sio_stop(struct apple_sio *sio)
 {
+	unsigned long flags;
 	u32 control;
 
+	xa_lock_irqsave(&sio->pending, flags);
 	WRITE_ONCE(sio->running, false);
 	WRITE_ONCE(sio->stopping, true);
+	xa_unlock_irqrestore(&sio->pending, flags);
+
+	/* Keep RX alive: cancelling software state cannot revoke firmware DMA. */
+	wait_event(sio->owned_drained, !atomic_read(&sio->owned_pending));
 
 	/* Quiesce the handler before stopping the CPU and freeing its state. */
 	if (sio->irq_enabled) {
@@ -959,6 +1028,8 @@ static int apple_sio_probe(struct platform_device *pdev)
 	spin_lock_init(&sio->tx_hw_lock);
 	spin_lock_init(&sio->tag_lock);
 	xa_init(&sio->pending);
+	atomic_set(&sio->owned_pending, 0);
+	init_waitqueue_head(&sio->owned_drained);
 	spin_lock_init(&sio->desc0_lock);
 	platform_set_drvdata(pdev, sio);
 
