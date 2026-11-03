@@ -75,7 +75,10 @@ void apple_sio_cancel_endpoint(struct apple_sio *sio, u8 endpoint);
 
 /*
  * Pass messages on @endpoint that match no pending request to @notify.
- * Called from the interrupt handler.
+ * The callback runs in interrupt context. Registration, replacement and
+ * removal must run in sleepable context, never from the callback itself.
+ * On return the previous callback is no longer running; callers must
+ * serialize updates for an endpoint and retain data until removal returns.
  */
 void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
 			  apple_sio_notify_t notify, void *data);

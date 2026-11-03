@@ -219,6 +219,8 @@ void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
 {
 	unsigned long flags;
 
+	might_sleep();
+
 	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS)
 		return;
 
@@ -226,6 +228,10 @@ void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
 	sio->notify[endpoint].fn = notify;
 	sio->notify[endpoint].data = data;
 	xa_unlock_irqrestore(&sio->pending, flags);
+
+	/* Dispatch may have copied the previous callback before the update. */
+	if (sio->irq_requested)
+		synchronize_irq(sio->irq);
 }
 EXPORT_SYMBOL_GPL(apple_sio_set_notify);
 
