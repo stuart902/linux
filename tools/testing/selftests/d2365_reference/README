@@ -271,8 +271,9 @@ the documented alternate RX count. A timer is armed only after successful start.
 Failed starts may have committed and require abort/reset/drain before reuse.
 Read/CRC failures never publish response bytes. The hardware recovery callback
 must perform both abort and the controller reset/stale-IRQ drain; its success
-cannot mean only that the abort register was written. The reset helper's time
-unit is not established, so this code does not invent a physical reset delay.
+cannot mean only that the abort register was written. Follow-on symbol resolution establishes IOSleep(500), a 500 ms reset delay.
+Register 05 ownership and physical IRQ drain semantics remain unimplemented;
+this core still delegates recovery rather than issuing an unqualified reset.
 All entry points require the same external serialization. Token checks are NOT
 a substitute for draining hardware status before admitting the next job.
 
@@ -326,3 +327,75 @@ When canceling a transport owner, its consumer first invalidates the exact Dock
 pending token with cbtl_dock_cancel under the shared lock. This retains already
 produced events and acknowledgements while allowing a reopened owner to proceed;
 it does not require an unrelated full cable reset.
+
+Bounded owned USBHost source reducer
+-----------------------------------
+The default-off kernel object now links apple-d2365-source.c to the existing
+Dock event and shutdown cores. It implements a restricted source-policy
+component, not a registered device provider or proof of full Apple parity.
+No hardware caller, board activation, new I/O, or default config is added.
+
+Its caller contract requires one selected ordinary USB source, one owned
+USBHost current-grant producer, the exact initialized D2365 backend with zero
+backoff, and no unsupported current/base/offset/flag/capability events or other
+source classifications. The profile enum asserts a contract the owner must
+actually establish; it does not discover the event universe. In this subset a
+qualified USB=false sample establishes battery classification, while effective
+cable status may remain true under a Dock deadline. Other classifications or
+unresolved producer history must invalidate readiness, never become false.
+
+Binding requires established complete Dock event/deadline history, explicit
+effective and requested states/timestamps, a separate physical event watermark,
+pending
+transition, existing host event/current/sequence, initialized reject latch,
+actual allocated backend current and actual protection deadline. It does not
+invent an empty event set or no pending transition. One host identity is
+supported, not arbitrary multiple grant producers. Production-stamped source
+generation, effective epoch and strictly increasing grant sequence reject late
+or reordered grants. Effective epoch changes prune the old grant; a zero grant
+replaces its contribution without claiming cable detach. Unchanged status
+preserves a nonzero effective epoch and its grant.
+
+The reducer consumes the existing Dock max-deadline state, retains a pending
+status until expiration, and advances the Dock source epoch only with the
+corresponding effective source timestamp. Epoch-bound events are then pruned;
+persistent handshake deadlines survive cable detach. Source history remains
+effective status OR nonzero effective timestamp for an eventual command-policy
+consumer; it is not a raw physical-online replacement.
+
+Raw-external uses current>100 on the sampled ordinary USB classification and
+keeps the proven low-current reject latch sticky. Feedback uses the supplied
+actual allocated current, not host grant, ramp current, measured current or
+PMIC code. Allocated 100..299 may set rejection only after the actual backend
+protection deadline. No synthetic 500 ms timer begins on a host grant. Reset
+is a separate source-epoch-checked explicit operation after the owner actually reset its latches;
+a false sample alone does not claim that happened. Unsupported live current
+values invalidate readiness; stale old-generation callbacks leave new state
+intact.
+
+All source, Dock, grant, backend, timer and publication operations require the
+same external lock. Refresh follows every producer transaction and the next
+returned deadline. Freeze recomputes one coherent terminal snapshot only after
+the owner has excluded and drained all those producers and notifications; it
+does not perform that kernel lifecycle work itself. Snapshot refuses live,
+uninitialized or invalidated state and leaves both properties UNRESOLVED on
+failure. The frozen values directly match the shutdown core source interface.
+Source invalidation after freeze still revokes the snapshot.
+
+Tests execute the production C reducer and existing Dock/core together. They
+cover 123,201 grant/allocated-current pairs, initial pending state, prolonged
+and canceled debounce, zero-current grants, source epoch expiration, reordered
+and stale callbacks, current/protection boundaries, sticky rejection/reset,
+unsupported-input invalidation, generation exhaustion and terminal freeze.
+An end-to-end fake-transport test feeds these actual source snapshots into the
+actual shutdown core for reset, standby and unresolved outcomes. This verifies
+software policy only, not producer completeness, Linux callback lifetime,
+physical transport, charging control or electrical shutdown.
+
+Evidence is the same hashed J71b image documented above: source state/debounce
+5efc3d0/5efbda8, USBHost grant/reducer 5ed311c/5e6790c, raw USB calculation
+5f1706c and backend feedback 5f115a4/5f117a8. No proprietary source is copied.
+Remaining production gates are the real shared Tristar register/IRQ/work owner,
+complete accessory command policy, typed UDC event production and backend
+ownership, terminal runtime-option provider, board integration and kernel/
+hardware qualification. This component closes only the bounded source reducer.
