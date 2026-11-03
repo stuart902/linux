@@ -210,7 +210,7 @@ static int pdm_stop_receiver(struct t8010_pdm *pdm)
 {
 	u32 status;
 
-	if (!pdm->clocked)
+	if (!pdm->powered || !pdm->clocked)
 		return 0;
 	writel(0x38, pdm->base + 0x20);
 	writel(0x0a, pdm->base + 0x10);
@@ -255,15 +255,31 @@ static void __noreturn pdm_retain_fault(struct t8010_pdm *pdm, const char *what,
 static void pdm_power_down(struct t8010_pdm *pdm)
 {
 	unsigned int i;
-	int ret;
+	int ret, dma_ret;
 
+	/* Every caller, including prepare unwind, must establish quiescence. */
+	ret = pdm_stop_receiver(pdm);
+	dma_ret = dmaengine_terminate_sync(pdm->dma);
+	if (dma_ret)
+		pdm_retain_fault(pdm, "DMA termination", dma_ret);
+	if (ret)
+		pdm_retain_fault(pdm, "PDM receiver stop", ret);
 	if (pdm->irq_enabled) {
 		disable_irq(pdm->irq);
 		pdm->irq_enabled = false;
 	}
-	if (pdm->clocked) {
+	if (pdm->powered && pdm->clocked)
 		for (i = 0; i < PDM_DECIMATORS; i++)
 			writel(0x1111, pdm->dec[i].base + 0x10);
+	if (pdm->powered) {
+		ret = pm_runtime_put_sync(pdm->dev);
+		if (ret < 0)
+			pdm_retain_fault(pdm, "PDM runtime power release unresolved", ret);
+		/* The runtime PM vote is released, not a physical-off readback. */
+		pdm->powered = false;
+	}
+	/* AP receiver/DMA are quiescent before releasing the host HP request. */
+	if (pdm->clocked) {
 		ret = apple_aop_pdm_clock_stop(pdm->clock);
 		if (ret)
 			pdm_retain_fault(pdm, "PDM clock STOP", ret);
@@ -271,10 +287,6 @@ static void pdm_power_down(struct t8010_pdm *pdm)
 	}
 	if (apple_aop_pdm_clock_needs_retention(pdm->clock))
 		pdm_retain_fault(pdm, "PDM clock ownership", -EIO);
-	if (pdm->powered) {
-		pm_runtime_put_sync(pdm->dev);
-		pdm->powered = false;
-	}
 	pdm->prepared = false;
 }
 
@@ -465,16 +477,8 @@ static int pdm_sync_stop_locked(struct snd_soc_component *component, struct snd_
 static int pdm_hw_free_locked(struct snd_soc_component *component, struct snd_pcm_substream *s)
 {
 	struct t8010_pdm *pdm = snd_soc_component_get_drvdata(component);
-	int ret, dma_ret;
 
 	pdm_mark_stopped(pdm);
-	/* The paired SmartIO provider must retain ownership on timeout. */
-	ret = pdm_stop_receiver(pdm);
-	dma_ret = dmaengine_terminate_sync(pdm->dma);
-	if (dma_ret)
-		pdm_retain_fault(pdm, "DMA termination", dma_ret);
-	if (ret)
-		pdm_retain_fault(pdm, "PDM receiver stop", ret);
 	pdm_power_down(pdm);
 	if (pdm->discard) {
 		dma_free_coherent(pdm->dma->device->dev, pdm->discard_bytes,
@@ -496,15 +500,8 @@ static int pdm_prepare_locked(struct snd_soc_component *component, struct snd_pc
 	if (pdm->shutting_down || !filter || !pdm->discard)
 		return -EINVAL;
 	pdm_mark_stopped(pdm);
-	ret = dmaengine_terminate_sync(pdm->dma);
-	if (ret)
-		pdm_retain_fault(pdm, "DMA termination", ret);
 	pdm_power_down(pdm);
-	ret = pm_runtime_resume_and_get(pdm->dev);
-	if (ret < 0)
-		return ret;
-	pdm->powered = true;
-	/* Board enablement must establish exclusive pdm0 ownership first. */
+	/* Board enablement must establish exclusive host HP ownership first. */
 	ret = apple_aop_pdm_clock_stop(pdm->clock);
 	if (ret) {
 		if (apple_aop_pdm_clock_needs_retention(pdm->clock))
@@ -517,8 +514,12 @@ static int pdm_prepare_locked(struct snd_soc_component *component, struct snd_pc
 			pdm_retain_fault(pdm, "PDM clock START", ret);
 		goto power_down;
 	}
+	ret = pm_runtime_resume_and_get(pdm->dev);
+	if (ret < 0)
+		pdm_retain_fault(pdm, "PDM runtime power acquisition unresolved", ret);
+	pdm->powered = true;
 	pdm->clocked = true;
-	/* No MMIO above this point: both power and firmware clock are owned. */
+	/* No MMIO above this point: both power and firmware request are owned. */
 	writel(0x38, pdm->base + 0x20);
 	ret = pdm_reset(pdm);
 	if (ret)
@@ -540,13 +541,8 @@ static int pdm_prepare_locked(struct snd_soc_component *component, struct snd_pc
 	for (i = 0; i < PDM_DECIMATORS; i++)
 		pdm_program_decimator(&pdm->dec[i], pdm_find_filter(&pdm->dec[i], pdm->rate), i);
 	ret = pdm_queue_dma(pdm, s);
-	if (ret) {
-		int dma_ret = dmaengine_terminate_sync(pdm->dma);
-
-		if (dma_ret)
-			pdm_retain_fault(pdm, "DMA termination", dma_ret);
+	if (ret)
 		goto power_down;
-	}
 	pdm->position = 0;
 	pdm->prepared = true;
 	writel(0x18, pdm->base + 0x1c);
@@ -653,21 +649,8 @@ static irqreturn_t pdm_irq(int irq, void *data)
 static int pdm_component_suspend_locked(struct snd_soc_component *component)
 {
 	struct t8010_pdm *pdm = snd_soc_component_get_drvdata(component);
-	u32 status;
-	int ret;
 
 	pdm_mark_stopped(pdm);
-	if (pdm->clocked) {
-		writel(0x38, pdm->base + 0x20);
-		writel(0x0a, pdm->base + 0x10);
-		ret = readl_poll_timeout(pdm->base + 0x18, status,
-					 !(status & BIT(28)), 10, 10000);
-		if (ret)
-			pdm_retain_fault(pdm, "PDM receiver stop", ret);
-	}
-	ret = dmaengine_terminate_sync(pdm->dma);
-	if (ret)
-		pdm_retain_fault(pdm, "DMA termination", ret);
 	pdm_power_down(pdm);
 	return 0;
 }
@@ -675,21 +658,8 @@ static int pdm_component_suspend_locked(struct snd_soc_component *component)
 static void pdm_cleanup_locked(void *data)
 {
 	struct t8010_pdm *pdm = data;
-	u32 status;
-	int ret;
 
 	pdm_mark_stopped(pdm);
-	if (pdm->clocked) {
-		writel(0x38, pdm->base + 0x20);
-		writel(0x0a, pdm->base + 0x10);
-		if (readl_poll_timeout(pdm->base + 0x18, status,
-				       !(status & BIT(28)), 10, 10000))
-			pdm_retain_fault(pdm, "PDM receiver stop", -ETIMEDOUT);
-	}
-	/* Requires the ownership-preserving SmartIO synchronize contract. */
-	ret = dmaengine_terminate_sync(pdm->dma);
-	if (ret)
-		pdm_retain_fault(pdm, "DMA termination", ret);
 	pdm_power_down(pdm);
 	if (pdm->discard) {
 		dma_free_coherent(pdm->dma->device->dev, pdm->discard_bytes,
@@ -823,6 +793,8 @@ static int pdm_probe(struct platform_device *pdev)
 	unsigned int i;
 	int ret;
 
+	if (!dev->pm_domain)
+		return dev_err_probe(dev, -ENODEV, "PDM power domain unavailable\n");
 	pdm = devm_kzalloc(dev, sizeof(*pdm), GFP_KERNEL);
 	if (!pdm)
 		return -ENOMEM;

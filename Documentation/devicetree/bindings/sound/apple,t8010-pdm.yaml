@@ -16,8 +16,10 @@ description: |
   and both coefficient providers' microphone rates is forwarded. The two
   decimators must have the same rate set and PDM frequency for each rate.
   No calibration blobs or inferred clock frequencies belong in static DTS.
-  The AOP audio service owns the PDM clock. Board integration must establish
-  exclusive host ownership of its pdm0 domain before enabling capture.
+  The AOP audio service manages high-power PDM clock requests. Board
+  integration must establish exclusive host ownership of the high-power
+  request before enabling capture; independent low-power firmware activity
+  may remain after the host releases its request.
 
 allOf:
   - $ref: dai-common.yaml#
@@ -42,6 +44,7 @@ properties:
     description: AOP audio service controlling this PDM clock.
   power-domains:
     maxItems: 1
+    description: AP PDM and high-frequency decimator domain (HFD0 on T8010).
   dmas:
     maxItems: 1
   dma-names:
