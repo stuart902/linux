@@ -61,6 +61,7 @@ static int apple_d2365_boot_state(struct apple_d2365_poweroff *pmic)
 static int apple_d2365_gpio_prepare(struct apple_d2365_poweroff *pmic)
 {
 	u8 pairs[D2365_GPIO_PAIR_COUNT * 2];
+	u8 fresh[D2365_GPIO_PAIR_COUNT * 2];
 	u8 extra[D2365_GPIO_COUNT - D2365_GPIO_PAIR_COUNT];
 	unsigned int value;
 	int i, ret;
@@ -85,6 +86,14 @@ static int apple_d2365_gpio_prepare(struct apple_d2365_poweroff *pmic)
 	for (i = 0; i < ARRAY_SIZE(extra); i++)
 		if (extra[i] <= 0x3f)
 			extra[i] &= ~BIT(0);
+
+	/* Preserve paired bytes from a fresh read, not the initial snapshot. */
+	ret = regmap_bulk_read(pmic->regmap, D2365_GPIO_PAIRS,
+			       fresh, sizeof(fresh));
+	if (ret)
+		return ret;
+	for (i = 1; i < sizeof(pairs); i += 2)
+		pairs[i] = fresh[i];
 
 	ret = regmap_bulk_write(pmic->regmap, D2365_GPIO_PAIRS,
 				pairs, sizeof(pairs));
