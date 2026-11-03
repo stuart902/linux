@@ -50,6 +50,16 @@ config APPLE_AOP_T8010
 
 	  Say 'y' or 'm' here if you have an A10-based iPad or iPhone.
 
+config APPLE_AOP_AUDIO_KUNIT_TEST
+	tristate "Apple AOP audio protocol tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test inline PDM clock property encoding and response decoding,
+	  including wrapped-call checksums and malformed domain replies.
+	  These tests do not access hardware or start audio capture.
+	  If unsure, say N.
+
 config APPLE_PMP_T8015_V1
 	tristate "Apple T8015 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST
