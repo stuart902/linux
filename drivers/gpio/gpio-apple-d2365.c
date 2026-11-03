@@ -25,6 +25,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/property.h>
@@ -126,6 +127,9 @@ struct apple_pmic_gpio {
 	bool irq_held;
 	bool removing;
 	bool shutting_down;
+	/* Experimental observations only; serialized with normal mask writes. */
+	bool mask_test;
+	unsigned int mask_test_samples;
 };
 
 static unsigned int d2207_gpio_config_reg(unsigned int offset)
@@ -157,9 +161,49 @@ static unsigned int d2333_gpio_config_reg(unsigned int offset)
 
 /* ---- PMU event interrupt controller ---- */
 
+/* Test branch only: never change a write, its result, or the mask shadow. */
+static void apple_pmic_mask_observe(struct apple_pmic_gpio *gpio,
+				    unsigned int reg, const u8 *expected,
+				    unsigned int count, int write_ret,
+				    bool probe)
+{
+	u8 actual[APPLE_PMIC_EVENT_BYTES_MAX];
+	int ret;
+
+	if (!gpio->mask_test)
+		return;
+	if (!probe) {
+		if (gpio->mask_test_samples >= 16)
+			return;
+		gpio->mask_test_samples++;
+	}
+	if (write_ret) {
+		gpio->mask_test = false;
+		dev_info(regmap_get_device(gpio->regmap),
+			 "mask-test reg=%#x count=%u write=%d; no read\n",
+			 reg, count, write_ret);
+		return;
+	}
+	ret = regmap_bulk_read(gpio->regmap, reg, actual, count);
+	if (ret) {
+		gpio->mask_test = false;
+		dev_info(regmap_get_device(gpio->regmap),
+			 "mask-test reg=%#x count=%u write=0 read=%d\n",
+			 reg, count, ret);
+		return;
+	}
+	dev_info(regmap_get_device(gpio->regmap),
+		 "mask-test reg=%#x count=%u write=0 read=0 match=%d expected=%*ph actual=%*ph\n",
+		 reg, count, !memcmp(expected, actual, count),
+		 count, expected, count, actual);
+	if (probe)
+		dev_info(regmap_get_device(gpio->regmap), "mask-test boot-mask=%*ph\n",
+			 count, gpio->boot_mask);
+}
+
 /* Write the mask bytes that differ from @unmasked. Caller holds irq_lock. */
 static int apple_pmic_event_sync(struct apple_pmic_gpio *gpio,
-				 const unsigned long *unmasked)
+				 const unsigned long *unmasked, bool observe)
 {
 	const struct apple_pmic_event_info *ev = gpio->info->events;
 	unsigned int byte, bit;
@@ -174,6 +218,9 @@ static int apple_pmic_event_sync(struct apple_pmic_gpio *gpio,
 		if (mask == gpio->mask[byte])
 			continue;
 		ret = regmap_write(gpio->regmap, ev->mask_base + byte, mask);
+		if (observe)
+			apple_pmic_mask_observe(gpio, ev->mask_base + byte,
+					       &mask, 1, ret, false);
 		if (ret)
 			err = ret;
 		else
@@ -203,7 +250,7 @@ static void apple_pmic_irq_bus_sync_unlock(struct irq_data *data)
 	}
 	/* No bus access between our suspend and resume callbacks. */
 	if (!gpio->suspended) {
-		ret = apple_pmic_event_sync(gpio, gpio->enabled);
+		ret = apple_pmic_event_sync(gpio, gpio->enabled, true);
 		if (ret)
 			dev_err_ratelimited(gpio->chip.parent,
 					    "event mask write failed: %d\n", ret);
@@ -507,10 +554,15 @@ static int apple_pmic_event_probe(struct platform_device *pdev,
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read the event mask\n");
 
+	gpio->mask_test = IS_ENABLED(CONFIG_GPIO_APPLE_D2365_MASK_TEST) &&
+			  of_machine_is_compatible("apple,j71b");
+
 	/* As iOS does at probe: mask all, unmask only what has a consumer. */
 	memset(gpio->mask, 0xff, sizeof(gpio->mask));
 	ret = regmap_bulk_write(gpio->regmap, ev->mask_base, gpio->mask,
 				ev->bytes);
+	apple_pmic_mask_observe(gpio, ev->mask_base, gpio->mask,
+			       ev->bytes, ret, true);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to mask the events\n");
 	ret = devm_add_action_or_reset(dev, apple_pmic_event_restore_mask, gpio);
@@ -587,7 +639,7 @@ static int apple_pmic_gpio_suspend(struct device *dev)
 	cancel_delayed_work_sync(&gpio->irq_retry);
 	mutex_lock(&gpio->irq_lock);
 	/* Only wake-enabled events may pull the line while asleep. */
-	ret = apple_pmic_event_sync(gpio, gpio->wake);
+	ret = apple_pmic_event_sync(gpio, gpio->wake, false);
 	if (ret)
 		dev_warn(dev, "event wake mask write failed: %d\n", ret);
 	gpio->suspended = true;
@@ -609,7 +661,7 @@ static int apple_pmic_gpio_resume(struct device *dev)
 	mutex_lock(&gpio->irq_lock);
 	gpio->suspended = false;
 	gpio->retries = 0;
-	ret = apple_pmic_event_sync(gpio, gpio->enabled);
+	ret = apple_pmic_event_sync(gpio, gpio->enabled, false);
 	if (ret)
 		dev_warn(dev, "event mask write failed: %d\n", ret);
 	/* An event that arrived while gated is still latched. */
