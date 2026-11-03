@@ -4,3 +4,6 @@ snd-soc-apple-s8000-mca-y	:= s8000-mca.o
 
 obj-$(CONFIG_SND_SOC_APPLE_MCA)	+= snd-soc-apple-mca.o
 obj-$(CONFIG_SND_SOC_APPLE_S8000_MCA)	+= snd-soc-apple-s8000-mca.o
+
+obj-$(CONFIG_SND_SOC_APPLE_T8010_PDM) += t8010-pdm.o
+obj-$(CONFIG_SND_SOC_APPLE_T8010_PDM_KUNIT_TEST) += t8010-pdm-test.o
