@@ -41,8 +41,12 @@ int apple_aop_call(const struct apple_aop_service *service, u16 subtype,
 		   const void *data, size_t len, void *reply, size_t reply_len);
 
 /*
- * Request up to reply_len inline response bytes (excluding the firmware status).
- * Request and reply capacity must not exceed 228 bytes each.
+ * Advertise requested_len in the outbound EPIC inline_len field (excluding
+ * the firmware status),
+ * independently of the local reply_len receive capacity. Some services return
+ * a bounded opaque payload even when the caller requests no result bytes.
+ * Request and reply capacity must not exceed 228 bytes each; requested_len
+ * must not exceed reply_len. No response bytes are silently truncated.
  * actual_len receives the untruncated payload size. On firmware success, an
  * oversized reply returns -EMSGSIZE. Malformed headers return -EPROTO. Neither
  * these errors nor a nonzero firmware status copies reply data.
@@ -58,6 +62,6 @@ int apple_aop_call(const struct apple_aop_service *service, u16 subtype,
  */
 int apple_aop_call_inline(const struct apple_aop_service *service, u16 subtype,
 			  const void *data, size_t len, void *reply, size_t reply_len,
-			  size_t *actual_len);
+			  size_t requested_len, size_t *actual_len);
 
 #endif /* _LINUX_SOC_APPLE_AOP_H_ */

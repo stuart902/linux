@@ -72,19 +72,30 @@ struct aop_audio_mock {
 
 static int aop_audio_mock_exchange(void *cookie, const void *request,
 				   size_t request_len, void *reply,
-				   size_t capacity, size_t *actual)
+				   size_t capacity, size_t requested_len, size_t *actual)
 {
 	struct aop_audio_mock *mock = cookie;
 
 	mock->calls++;
 	if (mock->calls == mock->fail_call)
 		return mock->error ?: -EIO;
-	if (capacity == AOP_AUDIO_CLOCK_REPLY_SIZE) {
+	if (request_len < 12)
+		return -EINVAL;
+	if (get_unaligned_le32(request + 8) == 0xc3000004) {
+		if (capacity != AOP_AUDIO_CLOCK_REPLY_SIZE || requested_len != capacity)
+			return -EINVAL;
 		put_unaligned_le32(4, reply);
 		put_unaligned_le32(0x1234, reply + 4);
 		*actual = AOP_AUDIO_CLOCK_REPLY_SIZE;
-	} else {
+	} else if (get_unaligned_le32(request + 8) == 0xc3000005) {
+		if (requested_len || capacity != AOP_AUDIO_INLINE_MAX)
+			return -EINVAL;
 		*actual = mock->set_reply_len;
+		if (*actual > capacity)
+			return -EMSGSIZE;
+		memset(reply, 0xa5, *actual);
+	} else {
+		return -EINVAL;
 	}
 	return 0;
 }
@@ -166,12 +177,23 @@ static void aop_audio_clock_rejected_test(struct kunit *test)
 static void aop_audio_clock_set_reply_test(struct kunit *test)
 {
 	struct aop_audio_clock clock = { .state = AOP_AUDIO_CLOCK_OFF };
-	struct aop_audio_mock mock = { .set_reply_len = 1 };
+	struct aop_audio_mock mock = { .set_reply_len = AOP_AUDIO_INLINE_MAX + 1 };
 
 	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 3072000,
-			 aop_audio_mock_exchange, &mock), -EPROTO);
+			 aop_audio_mock_exchange, &mock), -EMSGSIZE);
 	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_FAULTED);
 	KUNIT_EXPECT_EQ(test, mock.calls, 1U);
+}
+
+static void aop_audio_clock_opaque_set_test(struct kunit *test)
+{
+	struct aop_audio_clock clock = {};
+	struct aop_audio_mock mock = { .set_reply_len = AOP_AUDIO_INLINE_MAX };
+
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 0,
+			 aop_audio_mock_exchange, &mock), 0);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_OFF);
+	KUNIT_EXPECT_EQ(test, mock.calls, 2U);
 }
 
 static struct kunit_case aop_audio_cases[] = {
@@ -185,6 +207,7 @@ static struct kunit_case aop_audio_cases[] = {
 	KUNIT_CASE(aop_audio_clock_stop_failure_test),
 	KUNIT_CASE(aop_audio_clock_rejected_test),
 	KUNIT_CASE(aop_audio_clock_set_reply_test),
+	KUNIT_CASE(aop_audio_clock_opaque_set_test),
 	{}
 };
 

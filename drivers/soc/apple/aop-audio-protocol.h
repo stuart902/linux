@@ -8,6 +8,8 @@
 #include <linux/unaligned.h>
 
 #define AOP_AUDIO_SUBTYPE 0x20
+/* Bounded compatibility envelope, not an exact SET reply-size requirement. */
+#define AOP_AUDIO_INLINE_MAX 228
 #define AOP_AUDIO_CLOCK_SET_SIZE 60
 #define AOP_AUDIO_CLOCK_GET_SIZE 52
 #define AOP_AUDIO_CLOCK_REPLY_SIZE 8

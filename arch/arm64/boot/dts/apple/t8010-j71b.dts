@@ -4,6 +4,7 @@
  * Copyright (c) 2022, Konrad Dybcio <konradybcio@kernel.org>
  */
 
+/* Experimental capture only: assumes one Linux host HP requester. */
 /dts-v1/;
 
 #include "t8010-ipad6.dtsi"
@@ -16,13 +17,13 @@
 		compatible = "dmic-codec";
 		#sound-dai-cells = <0>;
 		num-channels = <2>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	microphones {
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "J71b Microphones";
-		status = "disabled";
+		status = "okay";
 
 		simple-audio-card,cpu {
 			sound-dai = <&pdm>;
@@ -46,7 +47,7 @@
 			dma-names = "rx";
 			apple,aop-audio = <&aop_audio>;
 			#sound-dai-cells = <0>;
-			status = "disabled";
+			status = "okay";
 		};
 	};
 
@@ -87,7 +88,7 @@
 
 	aop_audio: aop-audio {
 		compatible = "apple,t8010-aop-audio";
-		status = "disabled";
+		status = "okay";
 	};
 };
 
