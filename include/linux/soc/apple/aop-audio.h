@@ -10,19 +10,24 @@ struct apple_aop_pdm_clock;
 /*
  * Claim the PDM clock through the consumer's apple,aop-audio phandle.
  * Exactly one consumer may own it. This does not send a firmware command.
- * The board integration must establish that pdm0 is exclusively host-owned;
+ * The board integration must establish exclusive host HP-request ownership;
  * discovery of aop-audio alone does not establish that precondition.
  */
 struct apple_aop_pdm_clock *apple_aop_pdm_clock_get(struct device *consumer);
 
 /*
- * All operations sleep. Caller must retain its power and DMA resources until
- * an acknowledged STOP and independent DMA quiescence. STOP is also the explicit
- * initial UNKNOWN -> OFF transition, after exclusive ownership is established.
+ * All operations sleep. ON/OFF describe acknowledged host high-power requests,
+ * not physical clock state: firmware may retain a low-power audio request.
+ * Firmware SET acknowledgement does not report all hardware configuration
+ * failures, and GET returns a domain identifier, not a hardware-state readback.
+ * STOP establishes initial UNKNOWN -> OFF after host ownership is established.
  * START is allowed only after OFF; changing an active rate requires STOP first.
+ *
  * A failure may mean firmware executed the command. If needs_retention() is
- * true, do not release power or buffers, retry a command, or free the handle.
- * Recovery from that state requires a verified device reboot.
+ * true, retain the handle/provider claim and do not retry commands. Independently
+ * stop the receiver and establish actual DMA quiescence before releasing any
+ * AP resources. An acknowledged STOP is not a DMA fence. Recovery from uncertain
+ * request ownership requires a verified device reboot.
  */
 int apple_aop_pdm_clock_start(struct apple_aop_pdm_clock *clock, u32 rate);
 int apple_aop_pdm_clock_stop(struct apple_aop_pdm_clock *clock);

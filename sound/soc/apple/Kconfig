@@ -25,4 +25,28 @@ config SND_SOC_APPLE_S8000_MCA
 
 	  Say Y or M here if you have an Apple A9 device such as the iPad 5 or iPad 6.
 
+config SND_SOC_APPLE_T8010_PDM
+	tristate "Apple T8010 PDM capture (experimental)"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && DMA_ENGINE && EXPERT
+	depends on APPLE_AOP_AUDIO && APPLE_SIO_DMA
+	help
+	  Build the experimental T8010 microphone consumer for development.
+	  This is not microphone enablement: no board node or sound card is
+	  supplied. A firmware-owned PDM clock and live calibration are needed.
+	  Requires ownership-preserving SmartIO drain and exclusive AOP clock
+	  ownership. Faulted teardown may wait until a device reset.
+	  Do not enable a board node until these contracts are verified.
+	  If unsure, say N.
+
+config SND_SOC_APPLE_T8010_PDM_KUNIT_TEST
+	tristate "T8010 PDM calibration arithmetic tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test calibration bounds, register packing and capture discard sizing
+	  using synthetic inputs. The tests do not access hardware or enable
+	  the microphone driver. No firmware or factory calibration is used.
+	  These tests do not establish safe DMA lifetime or audio quality.
+
 endmenu
