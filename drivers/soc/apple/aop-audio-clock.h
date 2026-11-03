@@ -19,12 +19,13 @@ struct aop_audio_clock {
 
 typedef int (*aop_audio_exchange_fn)(void *cookie, const void *request,
 				   size_t request_len, void *reply,
-				   size_t reply_capacity, size_t *reply_len);
+				   size_t reply_capacity, size_t requested_len,
+				   size_t *reply_len);
 
 /*
- * Caller owns the PDM domain exclusively and serializes all transitions.
+ * Caller is the exclusive Linux host requester and serializes all transitions.
  * A zero rate is an explicit OFF command, including initial UNKNOWN -> OFF.
- * SET acknowledgement establishes requested state; GET validates the property
+ * SET acknowledgement establishes host request state; GET validates the property
  * exchange, not measured frequency or hardware state. Any failed exchange
  * makes ownership uncertain and prohibits retries until a verified reboot.
  */
@@ -32,7 +33,7 @@ static inline int aop_audio_clock_program(struct aop_audio_clock *clock, u32 rat
 					 aop_audio_exchange_fn exchange, void *cookie)
 {
 	u8 request[AOP_AUDIO_CLOCK_SET_SIZE];
-	u8 reply[AOP_AUDIO_CLOCK_REPLY_SIZE];
+	u8 reply[AOP_AUDIO_INLINE_MAX];
 	size_t actual, len;
 	u32 domain;
 	int ret;
@@ -48,14 +49,20 @@ static inline int aop_audio_clock_program(struct aop_audio_clock *clock, u32 rat
 	clock->state = AOP_AUDIO_CLOCK_FAULTED;
 	len = aop_audio_clock_request(request, true, rate);
 	actual = 0;
-	ret = exchange(cookie, request, len, NULL, 0, &actual);
+	/*
+	 * SET has no result fields, but firmware can return its opaque inline
+	 * scratch buffer. Keep the advertised result length zero, as on Apple,
+	 * while bounding local storage independently. Never interpret or log it.
+	 */
+	ret = exchange(cookie, request, len, reply, sizeof(reply), 0, &actual);
 	if (ret)
 		return ret < 0 ? ret : -EREMOTEIO;
-	if (actual)
+	if (actual > sizeof(reply))
 		return -EPROTO;
 	len = aop_audio_clock_request(request, false, 0);
 	actual = 0;
-	ret = exchange(cookie, request, len, reply, sizeof(reply), &actual);
+	ret = exchange(cookie, request, len, reply, AOP_AUDIO_CLOCK_REPLY_SIZE,
+		       AOP_AUDIO_CLOCK_REPLY_SIZE, &actual);
 	if (ret)
 		return ret < 0 ? ret : -EREMOTEIO;
 	ret = aop_audio_clock_domain(reply, actual, &domain);

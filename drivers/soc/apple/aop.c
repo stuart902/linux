@@ -798,7 +798,7 @@ static int apple_aop_send_epic(struct apple_aop_ep *ep, u32 channel, u16 subtype
 
 static int apple_aop_do_call(const struct apple_aop_service *service, u16 subtype,
 			     const void *data, size_t len, void *reply,
-			     size_t reply_len, size_t *actual_len)
+			     size_t reply_len, size_t requested_len, size_t *actual_len)
 {
 	struct apple_aop_ep *ep = apple_aop_ep(service->aop, service->endpoint);
 	struct apple_aop_call call = {
@@ -836,7 +836,7 @@ static int apple_aop_do_call(const struct apple_aop_service *service, u16 subtyp
 		call.tag = slot + 1;
 	}
 	ret = apple_aop_send_epic(ep, service->channel, subtype, call.tag, data, len,
-				 call.strict ? reply_len : 0);
+				 call.strict ? requested_len : 0);
 	if (!ret)
 		ep->calls[slot] = &call;
 unlock:
@@ -864,19 +864,21 @@ unlock:
 int apple_aop_call(const struct apple_aop_service *service, u16 subtype, const void *data,
 		   size_t len, void *reply, size_t reply_len)
 {
-	return apple_aop_do_call(service, subtype, data, len, reply, reply_len, NULL);
+	return apple_aop_do_call(service, subtype, data, len, reply, reply_len, 0, NULL);
 }
 EXPORT_SYMBOL_GPL(apple_aop_call);
 
 int apple_aop_call_inline(const struct apple_aop_service *service, u16 subtype,
 			  const void *data, size_t len, void *reply, size_t reply_len,
-			  size_t *actual_len)
+			  size_t requested_len, size_t *actual_len)
 {
 	if (actual_len)
 		*actual_len = 0;
-	if (!actual_len || len > 0xe4 || reply_len > 0xe4)
+	if (!actual_len || len > 0xe4 || reply_len > 0xe4 ||
+	    requested_len > reply_len)
 		return -EINVAL;
-	return apple_aop_do_call(service, subtype, data, len, reply, reply_len, actual_len);
+	return apple_aop_do_call(service, subtype, data, len, reply, reply_len,
+				 requested_len, actual_len);
 }
 EXPORT_SYMBOL_GPL(apple_aop_call_inline);
 

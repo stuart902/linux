@@ -99,12 +99,13 @@ EXPORT_SYMBOL_GPL(apple_aop_pdm_clock_get);
 
 static int apple_aop_audio_exchange(void *cookie, const void *request,
 				    size_t request_len, void *reply,
-				    size_t capacity, size_t *actual)
+				    size_t capacity, size_t requested_len, size_t *actual)
 {
 	struct apple_aop_pdm_clock *clock = cookie;
 
 	return apple_aop_call_inline(&clock->service, AOP_AUDIO_SUBTYPE,
-				     request, request_len, reply, capacity, actual);
+				     request, request_len, reply, capacity,
+				     requested_len, actual);
 }
 
 static int apple_aop_audio_program(struct apple_aop_pdm_clock *clock, u32 rate)
