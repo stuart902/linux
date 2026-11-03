@@ -1,0 +1,76 @@
+D2365 power-off and normal-restart regression checks
+=================================================
+
+Run from this source checkout:
+
+    make -C tools/testing/selftests/d2365 run_tests
+
+Python 3 and an existing host C compiler (cc or clang) are required. The
+suite compiles the actual driver algorithms against an in-memory regmap
+and power-supply shim. It does not execute firmware, access devices, call
+a reboot syscall, build a kernel, or prove electrical power-off. This is
+a source-tree test: an installed selftests bundle without the matching
+kernel sources is not sufficient.
+
+Coverage
+--------
+
+* All 256 GPIO configuration byte values, including the <= 0x3f boundary.
+  Between the initial and final 36-byte reads, the mock changes both even
+  and odd bytes: writes must retain transformed initial configurations and
+  freshly read odd paired bytes. The second read immediately precedes the
+  bulk write. The six extra GPIO registers retain their snapshot behavior.
+* Exact shutdown order, event reads rather than event writes, event masks,
+  RTC value, boot state preservation for all 256 values, and a forced
+  standby write even when its request bit is already set.
+* Every nonzero source-status byte, nonzero supply values, unknown source
+  state, and source attachment during each live recheck window.
+* Every transaction error on five source routes, with failed writes that
+  commit nothing, commit before returning an error, or partially commit a
+  bulk transfer. The driver stops without retry, reports unknown outcomes
+  for attempted standby transactions, and never records an acknowledged
+  standby on an error. The mock separately counts attempted and committed
+  bus writes; a regmap transaction attempt includes its internal read.
+* Ordinary reboot has exactly two transactions: read 30 bytes at 0x0140,
+  then write zero to 0x5001. Either failure is logged, and event-read
+  failure does not suppress the boot-stage write. No power-off-only writes
+  or delays occur. This callback does not perform the watchdog reset.
+* Final power-off performs no bus access or sleep. The restart shim exits
+  via longjmp because arm64 machine_restart never returns, even when reset
+  fails and the architecture halts. Reaching the final callback after an
+  acknowledged standby reports failure, not success.
+* Prepare/final handler registration and the actual GPIO shutdown drain
+  callback, with lock and gate-order assertions. The source assertions are
+  not a substitute for exercising kernel notifier/device lifecycle paths.
+
+Evidence and intentional Linux differences
+-----------------------------------------
+
+The sequence is an independent Linux implementation informed by J71b
+D2365 firmware, not Apple's binary driver and not identical Apple behavior.
+The analyzed kernelcache SHA-256 is:
+5c0822a78a10191b56edd468f100b331b0e86bcafa3fdcc5d974dadc427dbec9
+No firmware bytes or disassembly are included.
+
+The verified GPIO helper refreshes the 36-byte block, overlays the saved
+configuration bytes at even offsets, writes the block, then writes six
+extra registers. Ordinary Apple restart separately acknowledges events and
+clears boot stage before watchdog reset; its failure path still resets.
+
+Linux intentionally rejects unknown source state, rechecks live sources,
+stops the shutdown sequence on transaction errors, keeps a bounded 1000 ms
+grace period, and uses sleepable sys-off preparation. The 0x90 boot-state
+bits belong to the source-status branch, not to ordinary reboot. Scheduled
+RTC/UPO wake, separate external shutdown controllers, and Apple's panic
+or PHRA flows are not implemented here. The existing watchdog is unchanged.
+
+Validation still required
+-------------------------
+
+No full kernel build, olddefconfig resolution, DT schema check, or device
+boot/power test has been performed for this branch. Both Orchard defconfigs
+carry the new driver enable, but only J71b instantiates the power-off child.
+The shared GPIO shutdown change also affects other instantiated D2365 PMU
+event domains; regression testing on other such boards remains necessary.
+An exact-revision J71b hardware run is required before exporting Orchard
+patches or calling the power-off feature validated.
