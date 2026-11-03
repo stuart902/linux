@@ -40,6 +40,11 @@ Coverage
   via longjmp because arm64 machine_restart never returns, even when reset
   fails and the architecture halts. Reaching the final callback after an
   acknowledged standby reports failure, not success.
+* Provider lookup, explicit managed device links, locked readiness checks,
+  rejection of a supplier already unbinding, and reverse-order release of
+  sys-off handlers, the supply reference and provider references. The supply
+  must be a distinct sibling under the same PMIC, as on J71b. These are
+  probe/helper shims, not real driver-core unbind or concurrency tests.
 * Prepare/final handler registration and the actual GPIO shutdown drain
   callback, with lock and gate-order assertions. The source assertions are
   not a substitute for exercising kernel notifier/device lifecycle paths.
@@ -65,13 +70,31 @@ bits belong to the source-status branch, not to ordinary reboot. Scheduled
 RTC/UPO wake, separate external shutdown controllers, and Apple's panic
 or PHRA flows are not implemented here. The existing watchdog is unchanged.
 
-Validation still required
--------------------------
+Validation evidence and remaining scope
+---------------------------------------
 
-No full kernel build, olddefconfig resolution, DT schema check, or device
-boot/power test has been performed for this branch. Both Orchard defconfigs
-carry the new driver enable, but only J71b instantiates the power-off child.
-The shared GPIO shutdown change also affects other instantiated D2365 PMU
-event domains; regression testing on other such boards remains necessary.
-An exact-revision J71b hardware run is required before exporting Orchard
-patches or calling the power-off feature validated.
+The clean 8e7c716 source passed the 12 algorithm/quiesce checks and full
+apple-4k and apple-16k kernel, module and DTB builds in:
+https://github.com/stuart902/orchard/actions/runs/41579299652
+
+That run also checked the resolved GPIO and power-off driver options were
+built in. The PR records the four J71b USB/battery shutdown/reboot observations
+for that exact source:
+https://github.com/stuart902/linux/pull/1
+
+Those observations do not prove electrical power-off, the final PMIC path,
+or mask effectiveness. The supplier-lifetime hardening after 8e7c716 changes
+probe/link handling, not the shutdown or reboot register sequences. Its
+three new offline provider checks do not replace a kernel lifecycle test.
+
+For the lifetime change, the targeted runtime check is provider unbind/rebind
+with fw_devlink=off and fw_devlink=permissive under KASAN/lockdep: the consumer's
+sys-off handlers and power-supply reference must be released before the
+charger's data is freed, and rebinding must restore a usable consumer.
+Also exercise a supplier already unbinding as consumer probe starts. Avoid
+using reboot or shutdown as the first test of an intentionally unbound stack.
+
+DT schema validation is separate from the completed DTB compilation.
+Only J71b instantiates the power-off child; quiescing is explicitly scoped
+to that child's same-PMIC GPIO event provider, not a blanket GPIO shutdown
+callback on other boards.

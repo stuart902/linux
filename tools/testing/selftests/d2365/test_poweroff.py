@@ -161,6 +161,44 @@ int main(void)
                            text=True, timeout=5)
 
 
+class D2365Providers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        compiler = shutil.which('cc') or shutil.which('clang')
+        if compiler is None:
+            raise unittest.SkipTest('A host C compiler is required for provider checks')
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temporary.cleanup)
+        directory = Path(cls.temporary.name)
+        source = driver_source()
+        helpers = source[source.index('static void apple_d2365_device_put('):
+                         source.index('static struct platform_driver apple_d2365_poweroff_driver')]
+        fixture = (Path(__file__).resolve().parent / 'probe.c').read_text()
+        program = directory / 'probe.c'
+        program.write_text(fixture.replace('/* DRIVER */', helpers))
+        cls.binary = directory / 'probe'
+        result = subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra',
+                                 '-Wno-unused-parameter', '-Wno-sign-compare',
+                                 str(program), '-o', str(cls.binary)],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+
+    def check(self, scenario):
+        result = subprocess.run([str(self.binary), scenario], capture_output=True,
+                                text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_supply_is_a_distinct_same_pmic_child(self):
+        self.check('topology')
+
+    def test_probe_failures_release_provider_supply_and_handler_references(self):
+        self.check('failures')
+
+    def test_provider_readiness_rejects_already_unbinding_suppliers(self):
+        self.check('lifetime')
+
+
 if __name__ == '__main__':
     if not (ROOT / DRIVER).is_file():
         print('SKIP: matching kernel sources required; set D2365_KERNEL_SRC')

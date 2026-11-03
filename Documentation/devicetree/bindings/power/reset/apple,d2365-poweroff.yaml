@@ -23,7 +23,9 @@ properties:
   power-supplies:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     maxItems: 1
-    description: External USB or charger power supply.
+    description: |
+      External USB or charger power supply provided by a sibling child of
+      the same PMIC. Its cached state complements the direct PMIC source check.
 
 required:
   - compatible

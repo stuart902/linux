@@ -3,6 +3,7 @@
 
 #include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/err.h>
 #include <linux/gpio/apple-d2365.h>
 #include <linux/of.h>
@@ -288,7 +289,7 @@ static const struct of_device_id apple_d2365_poweroff_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_d2365_poweroff_of_match);
 
-static void apple_d2365_event_device_put(void *data)
+static void apple_d2365_device_put(void *data)
 {
 	put_device(data);
 }
@@ -311,7 +312,7 @@ static int apple_d2365_get_event_provider(struct device *dev,
 	if (!provider)
 		return -EPROBE_DEFER;
 
-	ret = devm_add_action_or_reset(dev, apple_d2365_event_device_put,
+	ret = devm_add_action_or_reset(dev, apple_d2365_device_put,
 				       &provider->dev);
 	if (ret)
 		return ret;
@@ -322,7 +323,8 @@ static int apple_d2365_get_event_provider(struct device *dev,
 
 	/* A link added during probe does not itself guarantee readiness. */
 	device_lock(&provider->dev);
-	if (!device_is_bound(&provider->dev))
+	if (!device_is_bound(&provider->dev) ||
+	    READ_ONCE(link->status) != DL_STATE_CONSUMER_PROBE)
 		ret = -EPROBE_DEFER;
 	else if (!apple_d2365_gpio_events_ready(&provider->dev))
 		ret = -ENODEV;
@@ -330,6 +332,63 @@ static int apple_d2365_get_event_provider(struct device *dev,
 	if (ret)
 		return dev_err_probe(dev, ret, "PMIC event provider not ready\n");
 	pmic->event_dev = &provider->dev;
+	return 0;
+}
+
+/*
+ * The supply and the event controller are children of this same PMIC.
+ * Link before taking a supply reference: that reference alone does not
+ * keep the provider's driver data alive.
+ */
+static int apple_d2365_get_supply(struct device *dev,
+				struct apple_d2365_poweroff *pmic)
+{
+	struct device_node *node;
+	struct device *provider;
+	struct device_link *link;
+	int ret;
+
+	node = of_parse_phandle(dev->of_node, "power-supplies", 0);
+	if (!node)
+		return dev_err_probe(dev, -ENODEV, "no external power supply\n");
+	if (node == dev->of_node || node->parent != dev->parent->of_node) {
+		of_node_put(node);
+		return dev_err_probe(dev, -EINVAL, "power supply must be a PMIC sibling\n");
+	}
+	provider = device_find_child(dev->parent, node, device_match_of_node);
+	of_node_put(node);
+	if (!provider)
+		return -EPROBE_DEFER;
+
+	ret = devm_add_action_or_reset(dev, apple_d2365_device_put, provider);
+	if (ret)
+		return ret;
+
+	link = device_link_add(dev, provider, DL_FLAG_AUTOREMOVE_CONSUMER);
+	if (!link)
+		return dev_err_probe(dev, -EINVAL, "cannot link power supply provider\n");
+
+	device_lock(provider);
+	if (!device_is_bound(provider) ||
+	    READ_ONCE(link->status) != DL_STATE_CONSUMER_PROBE) {
+		ret = -EPROBE_DEFER;
+		goto unlock;
+	}
+
+	pmic->supply = devm_power_supply_get_by_reference(dev, "power-supplies");
+	if (IS_ERR(pmic->supply))
+		ret = PTR_ERR(pmic->supply);
+	else if (!pmic->supply)
+		ret = -EPROBE_DEFER;
+	else if (pmic->supply->dev.parent != provider)
+		ret = -ENODEV;
+	else
+		ret = 0;
+
+unlock:
+	device_unlock(provider);
+	if (ret)
+		return dev_err_probe(dev, ret, "external power supply not ready\n");
 	return 0;
 }
 
@@ -353,12 +412,9 @@ static int apple_d2365_poweroff_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	pmic->supply = devm_power_supply_get_by_reference(dev, "power-supplies");
-	if (IS_ERR(pmic->supply))
-		return dev_err_probe(dev, PTR_ERR(pmic->supply),
-				     "cannot get external power supply\n");
-	if (!pmic->supply)
-		return dev_err_probe(dev, -EPROBE_DEFER, "external power supply not ready\n");
+	ret = apple_d2365_get_supply(dev, pmic);
+	if (ret)
+		return ret;
 
 	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_RESTART_PREPARE,
 					    SYS_OFF_PRIO_DEFAULT,
