@@ -387,10 +387,10 @@ static void sio_dma_block_done(void *data, int status, u64 response)
 
 	if (chan->stopping && !chan->inflight)
 		complete(&chan->drained);
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
+	/* Serialize the kick with the transition to stopping. */
 	if (kick)
 		queue_work(system_highpri_wq, &chan->submit_work);
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static void sio_dma_submit_work(struct work_struct *work)
@@ -478,6 +478,9 @@ static void sio_dma_stop_work(struct work_struct *work)
 	bool busy, issued;
 	int ret;
 
+	/* No earlier submission or configuration may overtake STOP. */
+	flush_work(&chan->submit_work);
+
 	spin_lock_irqsave(&chan->vc.lock, flags);
 	busy = chan->inflight;
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
@@ -508,10 +511,9 @@ static void sio_dma_stop_work(struct work_struct *work)
 	chan->inflight = 0;
 	chan->stopping = false;
 	issued = !list_empty(&chan->vc.desc_issued);
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
 	if (issued)
 		queue_work(system_highpri_wq, &chan->submit_work);
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static void sio_dma_issue_pending(struct dma_chan *c)
@@ -522,10 +524,10 @@ static void sio_dma_issue_pending(struct dma_chan *c)
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
 	issued = vchan_issue_pending(&chan->vc) && !chan->stopping;
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
+	/* A stop must observe this queued work before it flushes. */
 	if (issued)
 		queue_work(system_highpri_wq, &chan->submit_work);
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static int sio_dma_terminate_all(struct dma_chan *c)
@@ -559,7 +561,9 @@ static void sio_dma_synchronize(struct dma_chan *c)
 {
 	struct sio_dma_chan *chan = to_sio_chan(c);
 
-	/* the stop work is bounded by its own timeouts */
+	/* A queued configure may exist even when no descriptor became active. */
+	flush_work(&chan->submit_work);
+	/* The stop work is bounded by its own timeouts. */
 	flush_work(&chan->stop_work);
 	vchan_synchronize(&chan->vc);
 }
