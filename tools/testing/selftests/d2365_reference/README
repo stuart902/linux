@@ -1,0 +1,85 @@
+J71b Apple-derived power reference (offline, not a loadable driver)
+================================================================
+
+This is the first separately implemented core for the requested second power
+approach. It starts from upstream df7c930, independently of the existing
+j71b/power-validation driver. It is NOT a second bootable image or a completed
+Apple-equivalent Linux driver. Nothing registers a device, poweroff callback,
+I2C transaction, firmware execution, or platform reset. The only adapter here
+is an in-memory test backend. Do not wire it to hardware as-is.
+
+Run ./run.sh. Requires an existing C compiler. CFLAGS may enable sanitizers.
+The runner uses a temporary executable and removes it on exit. No firmware
+bytes are distributed or required to run tests.
+
+Distinct behavior implemented
+-----------------------------
+* Separate logical Apple raw-external and USB-cable properties. No 0x018a
+  substitute, charger ONLINE shortcut, or repeated source rechecks.
+* Ordinary sequence: read events, policy mask, RTC/no-alarm, clear boot stage
+  and flags, sample properties, preserve boot-state bits, then either return
+  toward platform reset or prepare GPIOs and request standby.
+* Fresh paired GPIO bytes before writing. GPIO helper failure is recorded
+  and the enclosing standby sequence continues, unlike the existing Linux
+  driver's abort-to-reset policy.
+* Write/event errors are recorded without automatically selecting reset.
+* Terminal actions are values: PLATFORM_RESET and STANDBY_WAIT do not perform
+  a reset or an indefinite wait. A standby write error still leads to Apple's
+  wait terminal, but its transaction outcome is explicitly unacknowledged.
+* Ordinary restart attempts event acknowledgement and boot-stage clear even
+  when the first operation fails, then returns the platform-reset terminal.
+
+Limits and deliberately non-identical cases
+------------------------------------------
+No hardware source-property producer is implemented. ABSENT means an observed
+absent Apple property/object, not a missing Linux provider. UNRESOLVED prevents
+a branch decision; it must not be mapped to ABSENT to make a device boot.
+Source resolution happens at the corresponding point in the modeled sequence;
+so it can return unresolved after earlier simulated writes. Hardware integration
+must validate the entire producer contract before registering any callback.
+
+A normal_path_established input only expresses a test precondition. It does
+not detect the real board's active options. Scheduled RTC/UPO, special shutdown
+mode, an external shutdown controller, and diagnostic reads are excluded.
+Failed 0x500f/0x0400 reads return UNRESOLVED instead of reusing Apple's scratch
+byte. This is an explicit modeling boundary, not a claim that Apple aborts.
+No return value means electrical-off success. A successful I2C write would
+not prove that either. GPIO and event errors may make continued standby unsafe
+for a live Linux system; this model does not authorize that policy on hardware.
+
+Before a hardware adapter
+-------------------------
+1. Establish actual J71b producers and semantics for BOTH Apple source
+   properties, including absence, stale state, teardown, and cable transitions.
+   Current Linux Tristar ONLINE is only cached 0x018a != 0, not a mapped source.
+2. Verify the ordinary-path configuration and reject unsupported runtime modes.
+3. Review provider/IRQ/I2C lifetime during Linux shutdown, including exclusive
+   read-to-clear event ownership. The reference core alone provides none.
+4. Decide and document live read-error policy and nonreturning terminal handling.
+   Do not silently import a one-second wait or fail-to-reset behavior and call
+   that Apple-equivalent. Do not blindly copy unchecked Apple reads either.
+5. Add a reviewed Linux adapter/bindings only once those contracts are grounded;
+   then compile, run kernel integration tests, and request a bounded device test.
+
+Evidence provenance (facts/algorithm, no proprietary code)
+---------------------------------------------------------
+Exact J71b/iPad7,5 T8010 kernel, iPadOS build 21H461; decompressed kernel SHA256:
+5c0822a78a10191b56edd468f100b331b0e86bcafa3fdcc5d974dadc427dbec9
+
+Addresses below are unslid ARM64 virtual addresses with prefix fffffff0.
+006b826c0-006b82774: initial events, 30-byte policy mask, no-alarm RTC and clears.
+006b827b4-006b8287c: AppleARMPMUPowerSource AppleRawExternalConnected and separate
+IOService resource AppleUSBCableDetect, compared with true.
+006b82890-006b828f4: boot state mask 0x27; ordinary non-standby flag 0x90.
+006b8294c-006b82a68: GPIO helper, logged errors, event acknowledgement,
+0x0400 read/bit0/write, then repeated wait.
+006b8206c-006b82208: GPIO write helper refreshes 36 bytes and overlays even
+configuration bytes before the bulk write and six separate writes.
+006b7c794-006b7c7f0: shutdown caller proceeds to PE_halt_restart(1).
+006b7b6e4: restart wrapper; 006b81048-006b81070: boot-stage property write.
+
+Tests enumerate all 4x4 source property combinations and 256 boot-state bytes,
+all GPIO configuration bytes with asynchronously refreshed pairs, each ordinary
+sequence transaction failure (including partial and complete-before-error commitment), unsupported
+mode rejection, and normal restart error continuation. They test our model,
+not the original executable, kernel lifecycle, bus framing, or physical IRQs.
