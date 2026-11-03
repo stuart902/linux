@@ -38,7 +38,7 @@ struct apple_d2365_poweroff {
 	struct power_supply *supply;
 	const struct apple_d2365_poweroff_data *data;
 	bool restart;
-	bool standby_attempted;
+	bool standby_transaction_attempted;
 	bool standby_acknowledged;
 };
 
@@ -178,7 +178,7 @@ static int apple_d2365_shutdown_sequence(struct apple_d2365_poweroff *pmic)
 
 	/* Force the command write even if a previous request bit remains set. */
 	/* A failed transfer can still reach the PMIC; never retry the request. */
-	pmic->standby_attempted = true;
+	pmic->standby_transaction_attempted = true;
 	ret = regmap_write_bits(pmic->regmap, D2365_STANDBY,
 				D2365_STANDBY_REQUEST, D2365_STANDBY_REQUEST);
 	if (!ret)
@@ -216,7 +216,7 @@ static int apple_d2365_poweroff_prepare(struct sys_off_data *off)
 
 	/* Unknown source state is never permission to enter standby. */
 	pmic->restart = true;
-	pmic->standby_attempted = false;
+	pmic->standby_transaction_attempted = false;
 	pmic->standby_acknowledged = false;
 	ret = power_supply_get_property(pmic->supply, POWER_SUPPLY_PROP_ONLINE,
 					&online);
@@ -243,8 +243,8 @@ static int apple_d2365_poweroff_prepare(struct sys_off_data *off)
 
 fail:
 	pmic->restart = true;
-	dev_err(pmic->dev, "shutdown preparation failed: %d; standby request %s; restarting\n",
-		ret, pmic->standby_attempted ? "outcome unknown" : "not attempted");
+	dev_err(pmic->dev, "shutdown preparation failed: %d; standby transaction %s; restarting\n",
+		ret, pmic->standby_transaction_attempted ? "outcome unknown" : "not attempted");
 	return NOTIFY_DONE;
 }
 
@@ -259,7 +259,7 @@ static int apple_d2365_poweroff_final(struct sys_off_data *off)
 	} else {
 		dev_emerg(pmic->dev, "power off failed (standby request %s)\n",
 			  pmic->standby_acknowledged ? "acknowledged" :
-			  pmic->standby_attempted ? "outcome unknown" : "not attempted");
+			  pmic->standby_transaction_attempted ? "outcome unknown" : "not attempted");
 	}
 
 	return NOTIFY_DONE;
