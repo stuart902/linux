@@ -22,7 +22,8 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,t8010-mca
+          contains:
+            const: apple,t8010-mca
     then:
       properties:
         dmas:
@@ -39,9 +40,13 @@ allOf:
 
 properties:
   compatible:
-    enum:
-      - apple,s8000-mca
-      - apple,t8010-mca
+    oneOf:
+      - enum:
+          - apple,s8000-mca
+          - apple,t8010-mca
+      - items:
+          - const: apple,j71b-mca
+          - const: apple,t8010-mca
 
   clocks:
     maxItems: 1
