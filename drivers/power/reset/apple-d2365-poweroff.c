@@ -178,6 +178,26 @@ static int apple_d2365_shutdown_sequence(struct apple_d2365_poweroff *pmic)
 	return ret;
 }
 
+/* Normal reboot bookkeeping; the existing watchdog still performs reset. */
+static int apple_d2365_restart_prepare(struct sys_off_data *off)
+{
+	struct apple_d2365_poweroff *pmic = off->cb_data;
+	u8 events[D2365_EVENT_COUNT];
+	int ret;
+
+	ret = regmap_bulk_read(pmic->regmap, D2365_EVENTS,
+			       events, sizeof(events));
+	if (ret)
+		dev_err(pmic->dev, "restart event acknowledgement failed: %d\n", ret);
+
+	/* Attempt both operations, even if the event read failed. */
+	ret = regmap_write(pmic->regmap, D2365_SHUTDOWN_STATE, 0);
+	if (ret)
+		dev_err(pmic->dev, "restart boot-stage clear failed: %d\n", ret);
+
+	return NOTIFY_DONE;
+}
+
 static int apple_d2365_poweroff_prepare(struct sys_off_data *off)
 {
 	struct apple_d2365_poweroff *pmic = off->cb_data;
@@ -274,6 +294,12 @@ static int apple_d2365_poweroff_probe(struct platform_device *pdev)
 				     "cannot get external power supply\n");
 	if (!pmic->supply)
 		return dev_err_probe(dev, -EPROBE_DEFER, "external power supply not ready\n");
+
+	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_RESTART_PREPARE,
+					    SYS_OFF_PRIO_DEFAULT,
+					    apple_d2365_restart_prepare, pmic);
+	if (ret)
+		return ret;
 
 	pmic->restart = true;
 	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF_PREPARE,
