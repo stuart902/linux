@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
 
-#include "aop-audio-protocol.h"
+#include "aop-audio-clock.h"
 
 static void aop_audio_set_test(struct kunit *test)
 {
@@ -63,11 +63,128 @@ static void aop_audio_domain_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, aop_audio_clock_domain(reply, 8, &domain), -EPROTO);
 }
 
+struct aop_audio_mock {
+	unsigned int calls;
+	unsigned int fail_call;
+	int error;
+	size_t set_reply_len;
+};
+
+static int aop_audio_mock_exchange(void *cookie, const void *request,
+				   size_t request_len, void *reply,
+				   size_t capacity, size_t *actual)
+{
+	struct aop_audio_mock *mock = cookie;
+
+	mock->calls++;
+	if (mock->calls == mock->fail_call)
+		return mock->error ?: -EIO;
+	if (capacity == AOP_AUDIO_CLOCK_REPLY_SIZE) {
+		put_unaligned_le32(4, reply);
+		put_unaligned_le32(0x1234, reply + 4);
+		*actual = AOP_AUDIO_CLOCK_REPLY_SIZE;
+	} else {
+		*actual = mock->set_reply_len;
+	}
+	return 0;
+}
+
+static void aop_audio_clock_initial_test(struct kunit *test)
+{
+	struct aop_audio_clock clock = {};
+	struct aop_audio_mock mock = {};
+
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 3072000,
+			 aop_audio_mock_exchange, &mock), -EBUSY);
+	KUNIT_EXPECT_EQ(test, mock.calls, 0U);
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 0,
+			 aop_audio_mock_exchange, &mock), 0);
+	KUNIT_EXPECT_EQ(test, mock.calls, 2U);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_OFF);
+}
+
+static void aop_audio_clock_cycle_test(struct kunit *test)
+{
+	struct aop_audio_clock clock = { .state = AOP_AUDIO_CLOCK_OFF };
+	struct aop_audio_mock mock = {};
+
+	KUNIT_ASSERT_EQ(test, aop_audio_clock_program(&clock, 3072000,
+			 aop_audio_mock_exchange, &mock), 0);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_ON);
+	KUNIT_EXPECT_EQ(test, clock.requested_rate, 3072000U);
+	KUNIT_EXPECT_EQ(test, clock.domain, 0x1234U);
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 2400000,
+			 aop_audio_mock_exchange, &mock), -EBUSY);
+	KUNIT_EXPECT_EQ(test, mock.calls, 2U);
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 0,
+			 aop_audio_mock_exchange, &mock), 0);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_OFF);
+	KUNIT_EXPECT_EQ(test, mock.calls, 4U);
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 0,
+			 aop_audio_mock_exchange, &mock), 0);
+	KUNIT_EXPECT_EQ(test, mock.calls, 4U);
+}
+
+static void aop_audio_clock_start_failure_test(struct kunit *test)
+{
+	struct aop_audio_clock clock = { .state = AOP_AUDIO_CLOCK_OFF };
+	struct aop_audio_mock mock = { .fail_call = 2 };
+
+	/* SET succeeds, GET fails: START must not be unwound as known OFF. */
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 3072000,
+			 aop_audio_mock_exchange, &mock), -EIO);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_FAULTED);
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 0,
+			 aop_audio_mock_exchange, &mock), -EIO);
+	KUNIT_EXPECT_EQ(test, mock.calls, 2U);
+}
+
+static void aop_audio_clock_stop_failure_test(struct kunit *test)
+{
+	struct aop_audio_clock clock = { .state = AOP_AUDIO_CLOCK_ON };
+	struct aop_audio_mock mock = { .fail_call = 1 };
+
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 0,
+			 aop_audio_mock_exchange, &mock), -EIO);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_FAULTED);
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 3072000,
+			 aop_audio_mock_exchange, &mock), -EIO);
+	KUNIT_EXPECT_EQ(test, mock.calls, 1U);
+}
+
+static void aop_audio_clock_rejected_test(struct kunit *test)
+{
+	struct aop_audio_clock clock = { .state = AOP_AUDIO_CLOCK_OFF };
+	struct aop_audio_mock mock = { .fail_call = 1, .error = 7 };
+
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 3072000,
+			 aop_audio_mock_exchange, &mock), -EREMOTEIO);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_FAULTED);
+	KUNIT_EXPECT_EQ(test, mock.calls, 1U);
+}
+
+static void aop_audio_clock_set_reply_test(struct kunit *test)
+{
+	struct aop_audio_clock clock = { .state = AOP_AUDIO_CLOCK_OFF };
+	struct aop_audio_mock mock = { .set_reply_len = 1 };
+
+	KUNIT_EXPECT_EQ(test, aop_audio_clock_program(&clock, 3072000,
+			 aop_audio_mock_exchange, &mock), -EPROTO);
+	KUNIT_EXPECT_EQ(test, clock.state, AOP_AUDIO_CLOCK_FAULTED);
+	KUNIT_EXPECT_EQ(test, mock.calls, 1U);
+}
+
 static struct kunit_case aop_audio_cases[] = {
 	KUNIT_CASE(aop_audio_set_test),
 	KUNIT_CASE(aop_audio_off_test),
 	KUNIT_CASE(aop_audio_get_test),
 	KUNIT_CASE(aop_audio_domain_test),
+	KUNIT_CASE(aop_audio_clock_initial_test),
+	KUNIT_CASE(aop_audio_clock_cycle_test),
+	KUNIT_CASE(aop_audio_clock_start_failure_test),
+	KUNIT_CASE(aop_audio_clock_stop_failure_test),
+	KUNIT_CASE(aop_audio_clock_rejected_test),
+	KUNIT_CASE(aop_audio_clock_set_reply_test),
 	{}
 };
 
