@@ -58,24 +58,24 @@ struct regmap;
 /* Providers and the PMIC transport must remain callable after device_shutdown().
  * The regmap must not be cache-only, and event/status reads and command writes
  * must reach hardware, never a cache. Device links alone guarantee none of this.
- * Callbacks must belong to the corresponding bound
- * provider module (which is pinned), never an unrelated module. No provider
- * meeting these contracts exists yet.
+ * The source callback must belong to the bound source provider module
+ * (which is pinned), never an unrelated module. No source provider meeting
+ * this contract exists yet; the concrete GPIO event owner is used directly.
  */
 struct d2365_reference_resources {
 	struct device *source_dev;
 	int (*snapshot_sources)(struct device *, struct d2365_sources *);
-	struct device *event_dev;
-	/* Stop/drain IRQ and work handlers, transfer read-to-clear event
-	 * ownership to the caller, and leave it quiesced until reset/off.
-	 * On error the adapter must not consume the event bank.
+	/* Bound apple,d2365-pmic-gpio child of this regmap's PMIC. The adapter
+	 * uses its checked event API to stop/drain IRQ/work and leave exclusive
+	 * read-to-clear ownership with the core until reset/off.
 	 */
-	int (*quiesce_events)(struct device *);
+	struct device *event_dev;
 	/* Explicit integration precondition, not hardware autodetection. */
 	bool ordinary_path_verified;
 };
 
-/* Call from a consumer probe, and fail that probe if registration fails.
+/* J71b only. Call from a consumer probe with valid references to providers,
+ * and fail that probe if registration fails.
  * Managed device links follow the consumer driver lifecycle.
  */
 int devm_d2365_reference_register(struct device *dev, struct regmap *regmap,

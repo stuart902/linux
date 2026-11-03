@@ -11,8 +11,9 @@ ARM64's terminal machine_restart entry point is not exported to modules.
 Compilation alone registers
 nothing. Do not wire it to hardware as-is.
 
-The registration API requires a probing consumer, an 8-bit regmap, same-PMIC
-event owner, explicit source snapshot provider and established ordinary-path
+The registration API requires J71b, a probing consumer, an 8-bit regmap, a
+same-PMIC apple,d2365-pmic-gpio event owner, an explicit source snapshot
+provider and established ordinary-path
 configuration. It pins bound provider modules/devices while creating managed
 links and rolls back handlers/pins on failure. A failed caller probe lets driver
 core clean managed links; callbacks must belong to the pinned provider modules.
@@ -30,8 +31,16 @@ The adapter checks existing poweroff handlers and uses unique HIGH priority.
 This does NOT guarantee global exclusivity: board integration must exclude both
 the existing driver and later competing handlers.
 
-The event owner must stop/drain IRQ/work and transfer read-to-clear ownership.
-Failure prevents all core PMIC operations. Normal restart then leaves reset to
+The adapter now uses the real D2365 GPIO provider, not a caller-supplied event
+callback. It checks the bound driver and event domain after taking the managed
+supplier dependency, then uses that owner's quiesce API. The API closes event,
+retry and mask-update gates, holds and drains the parent IRQ, and cancels retry
+work before returning ownership of the read-to-clear bank. It is a terminal
+shutdown handoff, not a reversible suspend operation. No new GPIO shutdown
+callback or all-board behavior change is added. The adapter requires this GPIO
+driver built-in, so there is no built-in-to-module symbol dependency.
+
+Invalid ownership prevents all core PMIC operations. Normal restart leaves reset to
 the existing platform driver. Poweroff remains unresolved and holds instead.
 Source sampling and bus transactions run only in sleepable prepare; final
 handling resets or waits without further PMIC access. The final wait spins with
@@ -39,7 +48,8 @@ IRQs disabled, unlike Apple's sleep loop: it is a Linux terminal adaptation,
 not proof of electrical off or a justified power-consumption policy. The
 adapter's unresolved-state hold is containment, not identical Apple behavior.
 
-Run ./run.sh and python3 test_adapter.py. Requires an existing C compiler. CFLAGS may enable sanitizers.
+Run ./run.sh, python3 test_adapter.py and python3 test_event_provider.py.
+Requires an existing C compiler and pthreads. CFLAGS may enable sanitizers.
 The runner uses a temporary executable and removes it on exit. No firmware
 bytes are distributed or required to run tests.
 
@@ -84,12 +94,12 @@ Before hardware activation
    properties, including absence, stale state, teardown, and cable transitions.
    Current Linux Tristar ONLINE is only cached 0x018a != 0, not a mapped source.
 2. Verify the ordinary-path configuration and reject unsupported runtime modes.
-3. Review provider/IRQ/I2C lifetime during Linux shutdown, including exclusive
-   read-to-clear event ownership. The reference core alone provides none.
+3. Verify the wired provider/IRQ/I2C lifetimes during Linux shutdown. The
+   concrete event API implements a handoff, but has not been hardware-qualified.
 4. Decide and document live read-error policy and nonreturning terminal handling.
    Do not silently import a one-second wait or fail-to-reset behavior and call
    that Apple-equivalent. Do not blindly copy unchecked Apple reads either.
-5. Finish review of the unwired adapter, compile it against the real kernel,
+5. Review and compile each integrated revision against the real kernel,
    add providers/bindings only once their contracts are grounded, then run
    kernel integration tests and request a bounded device test.
 
@@ -112,6 +122,33 @@ mutable RTC alarm state (0x6b87118-0x6b87164) and debug configuration
 is a syscfg substitution descriptor, not resolved runtime bytes. It cannot
 establish the ordinary-path precondition just because the board is J71b.
 These facts narrow the missing contracts; they do not implement a provider.
+
+Further tracing resolves the ordinary USB distinction: raw-external state is
+computed from reduced source info and requires resolved current greater than
+100, then passes classification/backend-load checks (0x5f16ea0-0x5f17618).
+Default source info without adapter/current events resolves current to zero.
+Cable detection instead follows the selected source's effective status, with
+pending changes held until the maximum contributed debounce-event deadline
+(0x5efc3d0, 0x5efc54c, 0x5efbda8). Thus cable=true and raw=false is valid.
+The missing implementation must supply source selection, current/adapter events,
+deadline ordering and startup validity, not merely another status-register read.
+
+Inspected Linux transport and ownership
+--------------------------------------
+J71b's PMIC is the simple-mfd-i2c apple,i2c-pmic device with a 16-bit-address,
+8-bit-value REGCACHE_NONE regmap. Its MFD has no shutdown/PM method that
+disables or caches the bus. The Apple PASemi platform controller retains its
+devm-enabled reference clock and IRQ and has no shutdown/PM callback. The PMGR
+power-state driver has no shutdown callback; its ordinary runtime/remove
+paths still matter. These source facts support this specific prepare path,
+not every future runtime/unbind configuration.
+
+Both prepare chains execute after device_shutdown and before syscore_shutdown.
+The PMIC I2C client has no own IRQ; disabling its clients does not stop the GPIO
+event thread. The concrete GPIO handoff is therefore required. Tristar shutdown
+stops polling and disables nested charger IRQs while preserving cached online
+state; that does not provide either missing Apple source contract. No MFD,
+I2C, PMGR or charging-policy change is part of this integration.
 
 Evidence provenance (facts/algorithm, no proprietary code)
 ---------------------------------------------------------
@@ -143,4 +180,13 @@ providers and wide-regmap inputs, check shared providers and both source reset
 branches,
 and check quiesce failures and bus-free terminal callbacks. The shim models
 probe cleanup but cannot prove kernel unbind/shutdown races, PMGR/I2C lifetime,
-or actual IRQ ownership. A real ARM64 kernel object build remains required.
+or actual IRQ ownership. Kernel compilation and integration checks are separate.
+
+test_event_provider.py compiles ten actual GPIO functions against explicit
+host IRQ/work primitives. Deterministic threads pause both pre-read line and
+post-read nested dispatch and verify the handoff waits for drain. Tests cover
+queued/dequeued retries, already-held IRQ, repeated handoff, read-error retry,
+readiness checks and no event read, mask write, requeue or reenable after return.
+Quiesce leaves the IRQ allocated; later normal driver cleanup frees it once.
+This tests the real function bodies and modeled boundaries, not full Linux IRQ
+descriptor/workqueue semantics or electrical behavior.

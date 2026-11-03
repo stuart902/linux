@@ -4,9 +4,11 @@
  */
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/gpio/apple-d2365.h>
 #include <linux/irqflags.h>
 #include <asm/processor.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/power/apple-d2365-reference.h>
 #include <linux/reboot.h>
 #include <linux/regmap.h>
@@ -106,6 +108,17 @@ static struct d2365_io d2365_adapter_io(struct d2365_adapter *a)
 	};
 }
 
+static int d2365_adapter_quiesce(struct d2365_adapter *a)
+{
+	/* Registration pinned this bound, same-PMIC provider. Transfer its
+	 * read-to-clear ownership only through the real IRQ/work owner.
+	 */
+	if (!apple_d2365_gpio_events_ready(a->resources.event_dev))
+		return -ENODEV;
+	apple_d2365_gpio_quiesce(a->resources.event_dev);
+	return 0;
+}
+
 static int d2365_adapter_prepare(struct sys_off_data *off)
 {
 	struct d2365_adapter *a = off->cb_data;
@@ -113,7 +126,7 @@ static int d2365_adapter_prepare(struct sys_off_data *off)
 	int error;
 
 	a->result = (struct d2365_result) { .terminal = D2365_UNRESOLVED };
-	error = a->resources.quiesce_events(a->resources.event_dev);
+	error = d2365_adapter_quiesce(a);
 	if (error) {
 		a->result.first_error = error;
 		dev_err(a->dev, "event ownership unavailable: %d; not accessing PMIC\n", error);
@@ -134,7 +147,7 @@ static int d2365_adapter_restart(struct sys_off_data *off)
 	struct d2365_result result;
 	int error;
 
-	error = a->resources.quiesce_events(a->resources.event_dev);
+	error = d2365_adapter_quiesce(a);
 	if (error) {
 		/* Do not compete for clear-on-read events. The existing platform
 		 * restart remains available, without this preparation.
@@ -177,9 +190,13 @@ int devm_d2365_reference_register(struct device *dev, struct regmap *regmap,
 
 	if (!dev || dev->links.status != DL_DEV_PROBING || !regmap || !resources ||
 	    !resources->ordinary_path_verified ||
-	    !resources->snapshot_sources || !resources->quiesce_events ||
+	    !resources->snapshot_sources ||
 	    !resources->source_dev || !resources->event_dev)
 		return -EINVAL;
+	if (!of_machine_is_compatible("apple,j71b") ||
+	    !of_device_is_compatible(resources->event_dev->of_node,
+				     "apple,d2365-pmic-gpio"))
+		return -ENODEV;
 	bus_dev = regmap_get_device(regmap);
 	if (regmap_get_val_bytes(regmap) != 1 || !bus_dev ||
 	    resources->event_dev->parent != bus_dev)
@@ -209,6 +226,10 @@ int devm_d2365_reference_register(struct device *dev, struct regmap *regmap,
 	error = d2365_pin_provider(dev, resources->event_dev);
 	if (error)
 		goto release;
+	if (!apple_d2365_gpio_events_ready(resources->event_dev)) {
+		error = -ENODEV;
+		goto release;
+	}
 	error = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF_PREPARE,
 		SYS_OFF_PRIO_HIGH, d2365_adapter_prepare, a);
 	if (error)
