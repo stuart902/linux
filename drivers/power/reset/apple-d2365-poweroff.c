@@ -26,7 +26,7 @@
 #define D2365_SHUTDOWN_FLAGS	0x5003
 #define D2365_BOOT_STATE		0x500f
 #define D2365_BOOT_PRESERVE	0x27
-#define D2365_BOOT_RESTART	0x90
+#define D2365_BOOT_SOURCE_FLAGS	0x90
 
 struct apple_d2365_poweroff_data {
 	u8 event_mask[D2365_EVENT_COUNT];
@@ -38,7 +38,8 @@ struct apple_d2365_poweroff {
 	struct power_supply *supply;
 	const struct apple_d2365_poweroff_data *data;
 	bool restart;
-	bool standby_requested;
+	bool standby_attempted;
+	bool standby_acknowledged;
 };
 
 static int apple_d2365_boot_state(struct apple_d2365_poweroff *pmic)
@@ -52,7 +53,7 @@ static int apple_d2365_boot_state(struct apple_d2365_poweroff *pmic)
 
 	value &= D2365_BOOT_PRESERVE;
 	if (pmic->restart)
-		value |= D2365_BOOT_RESTART;
+		value |= D2365_BOOT_SOURCE_FLAGS;
 
 	return regmap_write(pmic->regmap, D2365_BOOT_STATE, value);
 }
@@ -167,10 +168,12 @@ static int apple_d2365_shutdown_sequence(struct apple_d2365_poweroff *pmic)
 	}
 
 	/* Force the command write even if a previous request bit remains set. */
+	/* A failed transfer can still reach the PMIC; never retry the request. */
+	pmic->standby_attempted = true;
 	ret = regmap_write_bits(pmic->regmap, D2365_STANDBY,
 				D2365_STANDBY_REQUEST, D2365_STANDBY_REQUEST);
 	if (!ret)
-		pmic->standby_requested = true;
+		pmic->standby_acknowledged = true;
 
 	return ret;
 }
@@ -184,6 +187,8 @@ static int apple_d2365_poweroff_prepare(struct sys_off_data *off)
 
 	/* Unknown source state is never permission to enter standby. */
 	pmic->restart = true;
+	pmic->standby_attempted = false;
+	pmic->standby_acknowledged = false;
 	ret = power_supply_get_property(pmic->supply, POWER_SUPPLY_PROP_ONLINE,
 					&online);
 	if (ret)
@@ -209,8 +214,8 @@ static int apple_d2365_poweroff_prepare(struct sys_off_data *off)
 
 fail:
 	pmic->restart = true;
-	dev_err(pmic->dev, "shutdown preparation failed: %d; restarting without standby\n",
-		ret);
+	dev_err(pmic->dev, "shutdown preparation failed: %d; standby request %s; restarting\n",
+		ret, pmic->standby_attempted ? "outcome unknown" : "not attempted");
 	return NOTIFY_DONE;
 }
 
@@ -222,10 +227,10 @@ static int apple_d2365_poweroff_final(struct sys_off_data *off)
 	if (pmic->restart) {
 		dev_emerg(pmic->dev, "requesting restart instead of PMIC standby\n");
 		machine_restart(NULL);
-		dev_emerg(pmic->dev, "restart failed\n");
 	} else {
 		dev_emerg(pmic->dev, "power off failed (standby request %s)\n",
-			  pmic->standby_requested ? "sent" : "not sent");
+			  pmic->standby_acknowledged ? "acknowledged" :
+			  pmic->standby_attempted ? "outcome unknown" : "not attempted");
 	}
 
 	return NOTIFY_DONE;
