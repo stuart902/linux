@@ -363,6 +363,9 @@ static void sio_dma_block_done(void *data, int status, u64 response)
 		chan->inflight--;
 
 	if (chan->active == desc && !chan->stopping) {
+		/* Tagged completion data is the transferred byte count. */
+		if (!status && FIELD_GET(SIO_DMA_MSG_DATA, response) != b->len)
+			status = -EIO;
 		if (status) {
 			desc->status = status;
 			dev_err_ratelimited(chan->host->dev,
@@ -370,7 +373,7 @@ static void sio_dma_block_done(void *data, int status, u64 response)
 					    chan->endpoint, status);
 		}
 		if (desc->cyclic) {
-			if (!status) {
+			if (!desc->status) {
 				desc->done++;
 				vchan_cyclic_callback(&desc->vd);
 				kick = true;
