@@ -62,6 +62,7 @@ static int source_unresolved, sources_called, quiesce_called, existing_handler;
 static int source_external, source_cable;
 static int source_error, module_error, reset_called, irq_disabled;
 static int machine_match;
+static int runtime_called, runtime_error, runtime_skip;
 static struct device_link link;
 static jmp_buf terminal;
 static bool fail(void) { return ++steps == fail_at; }
@@ -130,6 +131,15 @@ static void local_irq_disable(void) { irq_disabled++; }
 static void cpu_relax(void) { longjmp(terminal,2); }
 '''
 TEST = r'''
+static struct d2365_runtime_state runtime_state;
+static struct device *expected_runtime_dev;
+static int prepare_runtime(struct device *d,struct d2365_runtime_state *s) {
+ assert(d==expected_runtime_dev && d->refs>0);
+ assert(!bus_count && !quiesce_called && !sources_called);
+ runtime_called++;
+ if(!runtime_skip) *s=runtime_state;
+ return runtime_error;
+}
 static int snapshot(struct device *d,struct d2365_sources *s) {
  sources_called++;
  *s=(struct d2365_sources){source_unresolved?D2365_PROPERTY_UNRESOLVED:
@@ -140,44 +150,54 @@ static int snapshot(struct device *d,struct d2365_sources *s) {
 static struct module module;
 static struct device_driver driver={&module};
 static struct device_node node;
-static struct device consumer,bus,source,event;
+static struct device consumer,bus,source,event,runtime;
 static struct regmap map;
 static struct d2365_reference_resources resources;
 static void clear(void) {
  devres_release_group(&consumer,NULL);
- assert(module.refs==0 && !bus.refs && !source.refs && !event.refs);
+ assert(module.refs==0 && !bus.refs && !source.refs && !event.refs && !runtime.refs);
  memset(handlers,0,sizeof(handlers));
  steps=fail_at=bus_count=quiesce_error=source_unresolved=sources_called=0;
  source_error=module_error=reset_called=irq_disabled=quiesce_called=existing_handler=0;
  source_external=source_cable=0;
+ runtime_called=runtime_error=runtime_skip=0;
+ runtime_state=(struct d2365_runtime_state){D2365_OPTION_DISABLED,D2365_OPTION_DISABLED,
+  D2365_OPTION_DISABLED,D2365_OPTION_DISABLED,D2365_OPTION_DISABLED};
  machine_match=node.compatible=1;
  consumer=(struct device){.driver=&driver,.links={DL_DEV_PROBING}};
  bus=(struct device){.driver=&driver,.links={DL_DEV_DRIVER_BOUND},.bound=1};
  source=(struct device){.driver=&driver,.links={DL_DEV_DRIVER_BOUND},.bound=1};
+ runtime=(struct device){.driver=&driver,.links={DL_DEV_DRIVER_BOUND},.bound=1};
  event=(struct device){.parent=&bus,.driver=&driver,.of_node=&node,.links={DL_DEV_DRIVER_BOUND},.bound=1,.event_owner=1};
  map=(struct regmap){.dev=&bus,.val_bytes=1};
- resources=(struct d2365_reference_resources){&source,snapshot,&event,true};
+ resources=(struct d2365_reference_resources){
+  .source_dev=&source,.snapshot_sources=snapshot,.event_dev=&event,
+  .runtime_dev=&runtime,.prepare_runtime=prepare_runtime};
+ expected_runtime_dev=&runtime;
 }
 static void invoke(int mode) {
  assert(handlers[mode].active);
  struct sys_off_data off={handlers[mode].data}; handlers[mode].callback(&off);
 }
+static void invoke_terminal(void) {
+ if(!setjmp(terminal)) invoke(2);
+}
 int main(void) {
  int total;
  clear(); assert(!devm_d2365_reference_register(&consumer,&map,&resources)); total=steps;
- assert(module.refs==3 && handlers[0].active && handlers[1].active && handlers[2].active);
+ assert(module.refs==4 && handlers[0].active && handlers[1].active && handlers[2].active);
  for(int fail_step=1;fail_step<=total;fail_step++) {
   clear(); fail_at=fail_step;
   assert(devm_d2365_reference_register(&consumer,&map,&resources)<0);
-  assert(!bus_count && !module.refs && !bus.refs && !source.refs && !event.refs);
+  assert(!bus_count && !module.refs && !bus.refs && !source.refs && !event.refs && !runtime.refs);
   assert(!handlers[0].active && !handlers[1].active && !handlers[2].active);
  }
  for(int alias=0;alias<2;alias++) {
   clear(); resources.source_dev=alias?&bus:&event;
   assert(!devm_d2365_reference_register(&consumer,&map,&resources));
-  assert(module.refs==3 && bus.refs==(alias?2:1) && event.refs==(alias?1:2));
+  assert(module.refs==4 && bus.refs==(alias?2:1) && event.refs==(alias?1:2));
  }
- for(int which=0;which<7;which++) {
+ for(int which=0;which<11;which++) {
   clear();
   if(which==0) bus.bound=0;
   if(which==1) source.bound=0;
@@ -186,6 +206,10 @@ int main(void) {
   if(which==4) module_error=1;
   if(which==5) consumer.links.status=0;
   if(which==6) map.val_bytes=4;
+  if(which==7) runtime.bound=0;
+  if(which==8) resources.runtime_dev=NULL;
+  if(which==9) resources.prepare_runtime=NULL;
+  if(which==10) resources.runtime_dev=&consumer;
   assert(devm_d2365_reference_register(&consumer,&map,&resources)<0);
   assert(!bus_count && !module.refs);
  }
@@ -202,22 +226,66 @@ int main(void) {
  /* A supplier can still look bound while its unbind path drops its lock
   * to detach consumers. Refuse new links in every non-bound link state.
   */
- for(int which=0;which<3;which++) {
+ for(int which=0;which<4;which++) {
   clear();
-  struct device *provider=which==0?&bus:which==1?&source:&event;
+  struct device *provider=which==0?&bus:which==1?&source:which==2?&event:&runtime;
   provider->links.status=DL_DEV_UNBINDING;
   assert(provider->bound);
   assert(devm_d2365_reference_register(&consumer,&map,&resources)==-EPROBE_DEFER);
-  assert(!bus_count && !module.refs && !bus.refs && !source.refs && !event.refs);
+  assert(!bus_count && !module.refs && !bus.refs && !source.refs && !event.refs && !runtime.refs);
   assert(!handlers[0].active && !handlers[1].active && !handlers[2].active);
  }
- for(int which=0;which<3;which++) {
+ for(int which=0;which<4;which++) {
   clear();
-  struct device *provider=which==0?&bus:which==1?&source:&event;
+  struct device *provider=which==0?&bus:which==1?&source:which==2?&event:&runtime;
   provider->locked=1;
   assert(devm_d2365_reference_register(&consumer,&map,&resources)==-EPROBE_DEFER);
-  assert(provider->locked && !bus_count && !module.refs && !bus.refs && !source.refs && !event.refs);
+  assert(provider->locked && !bus_count && !module.refs && !bus.refs && !source.refs && !event.refs && !runtime.refs);
   provider->locked=0;
+ }
+ /* Runtime aliases have independent pins and fully balanced cleanup. */
+ for(int alias=0;alias<3;alias++) {
+  clear(); resources.runtime_dev=alias==0?&bus:alias==1?&source:&event;
+  assert(!devm_d2365_reference_register(&consumer,&map,&resources));
+  assert(module.refs==4 && resources.runtime_dev->refs==2);
+  expected_runtime_dev=resources.runtime_dev;
+  invoke(0); assert(runtime_called==1 && bus_count==25);
+ }
+ /* All 4^5 option combinations: only five explicit DISABLED values pass.
+  * Includes zero/unknown and malformed positive values in every field.
+  * Set state after registration to test a mutable, not cached, decision.
+  */
+ for(int combination=0;combination<1024;combination++) {
+  clear(); assert(!devm_d2365_reference_register(&consumer,&map,&resources));
+  assert(runtime_called==0);
+  int code=combination;
+  runtime_state.rtc_alarm=code%4; code/=4;
+  runtime_state.upo_delay=code%4; code/=4;
+  runtime_state.charge_trap=code%4; code/=4;
+  runtime_state.external_shutdown=code%4; code/=4;
+  runtime_state.diagnostic=code%4;
+  invoke(0);
+  struct d2365_adapter *a=handlers[2].data;
+  assert(runtime_called==1);
+  if(combination==341) {
+   assert(a->result.terminal==D2365_STANDBY_WAIT && bus_count==25);
+  } else {
+   assert(a->result.terminal==D2365_UNRESOLVED && a->result.first_error==-EOPNOTSUPP);
+   assert(!bus_count && !quiesce_called && !sources_called);
+   invoke_terminal();
+   assert(!bus_count && !reset_called && irq_disabled==1);
+  }
+ }
+ for(int which=0;which<3;which++) {
+  clear(); assert(!devm_d2365_reference_register(&consumer,&map,&resources));
+  if(which==0) runtime_skip=1; /* Callback leaves zero/unknown output. */
+  if(which==1) runtime_error=-EIO; /* Error invalidates apparently good fields. */
+  if(which==2) runtime_state.rtc_alarm=-1;
+  invoke(0);
+  struct d2365_adapter *a=handlers[2].data;
+  assert(runtime_called==1 && !bus_count && !quiesce_called && !sources_called);
+  assert(a->result.terminal==D2365_UNRESOLVED);
+  assert(a->result.first_error==(which==1?-EIO:-EOPNOTSUPP));
  }
  clear(); existing_handler=1;
  assert(devm_d2365_reference_register(&consumer,&map,&resources)==-EBUSY && !steps);
@@ -230,12 +298,12 @@ int main(void) {
  source_unresolved=1; invoke(0);
  assert(bus_count==5 && sources_called==1);
  int before=bus_count;
- if(!setjmp(terminal)) invoke(2);
+ invoke_terminal();
  assert(bus_count==before && !reset_called && irq_disabled==1);
  clear(); assert(!devm_d2365_reference_register(&consumer,&map,&resources));
- invoke(0); assert(bus_count==25);
+ invoke(0); assert(bus_count==25 && runtime_called==1);
  before=bus_count;
- if(!setjmp(terminal)) invoke(2);
+ invoke_terminal();
  assert(bus_count==before && !reset_called && irq_disabled==1);
  for(int which=0;which<2;which++) {
   clear(); assert(!devm_d2365_reference_register(&consumer,&map,&resources));
@@ -243,11 +311,11 @@ int main(void) {
   invoke(0); assert(bus_count==7 && sources_called==1 && quiesce_called==1);
   assert(((struct d2365_adapter *)handlers[2].data)->result.terminal==D2365_PLATFORM_RESET);
   before=bus_count;
-  if(!setjmp(terminal)) invoke(2);
+  invoke_terminal();
   assert(reset_called==1 && bus_count==before && !irq_disabled);
  }
  clear(); assert(!devm_d2365_reference_register(&consumer,&map,&resources));
- invoke(1); assert(bus_count==2 && sources_called==0);
+ invoke(1); assert(bus_count==2 && sources_called==0 && runtime_called==0);
  clear(); puts("adapter lifecycle shim: all cases passed"); return 0;
 }
 '''

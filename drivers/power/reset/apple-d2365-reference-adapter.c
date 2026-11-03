@@ -123,9 +123,25 @@ static int d2365_adapter_prepare(struct sys_off_data *off)
 {
 	struct d2365_adapter *a = off->cb_data;
 	struct d2365_io io = d2365_adapter_io(a);
+	struct d2365_runtime_state state = {};
 	int error;
 
 	a->result = (struct d2365_result) { .terminal = D2365_UNRESOLVED };
+	/* Runtime options include mutable RTC state. Never substitute a
+	 * registration-time assertion for a coherent terminal snapshot.
+	 */
+	error = a->resources.prepare_runtime(a->resources.runtime_dev, &state);
+	if (!error && (state.rtc_alarm != D2365_OPTION_DISABLED ||
+		       state.upo_delay != D2365_OPTION_DISABLED ||
+		       state.charge_trap != D2365_OPTION_DISABLED ||
+		       state.external_shutdown != D2365_OPTION_DISABLED ||
+		       state.diagnostic != D2365_OPTION_DISABLED))
+		error = -EOPNOTSUPP;
+	if (error) {
+		a->result.first_error = error;
+		dev_err(a->dev, "ordinary runtime mode unavailable: %d; not accessing PMIC\n", error);
+		return NOTIFY_DONE;
+	}
 	error = d2365_adapter_quiesce(a);
 	if (error) {
 		a->result.first_error = error;
@@ -189,9 +205,9 @@ int devm_d2365_reference_register(struct device *dev, struct regmap *regmap,
 	int error;
 
 	if (!dev || dev->links.status != DL_DEV_PROBING || !regmap || !resources ||
-	    !resources->ordinary_path_verified ||
-	    !resources->snapshot_sources ||
-	    !resources->source_dev || !resources->event_dev)
+	    !resources->snapshot_sources || !resources->prepare_runtime ||
+	    !resources->source_dev || !resources->event_dev ||
+	    !resources->runtime_dev)
 		return -EINVAL;
 	if (!of_machine_is_compatible("apple,j71b") ||
 	    !of_device_is_compatible(resources->event_dev->of_node,
@@ -224,6 +240,9 @@ int devm_d2365_reference_register(struct device *dev, struct regmap *regmap,
 	if (error)
 		goto release;
 	error = d2365_pin_provider(dev, resources->event_dev);
+	if (error)
+		goto release;
+	error = d2365_pin_provider(dev, resources->runtime_dev);
 	if (error)
 		goto release;
 	if (!apple_d2365_gpio_events_ready(resources->event_dev)) {

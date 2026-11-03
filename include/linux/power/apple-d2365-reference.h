@@ -61,6 +61,21 @@ struct d2365_result d2365_reference_restart(const struct d2365_io *io);
 struct device;
 struct regmap;
 
+/* Zero initialization must not establish an unsupported mode as disabled. */
+enum d2365_runtime_option {
+	D2365_OPTION_UNRESOLVED,
+	D2365_OPTION_DISABLED,
+	D2365_OPTION_ENABLED,
+};
+
+struct d2365_runtime_state {
+	enum d2365_runtime_option rtc_alarm;
+	enum d2365_runtime_option upo_delay;
+	enum d2365_runtime_option charge_trap;
+	enum d2365_runtime_option external_shutdown;
+	enum d2365_runtime_option diagnostic;
+};
+
 /* Providers and the PMIC transport must remain callable after device_shutdown().
  * The regmap must not be cache-only, and event/status reads and command writes
  * must reach hardware, never a cache. Device links alone guarantee none of this.
@@ -76,8 +91,16 @@ struct d2365_reference_resources {
 	 * read-to-clear ownership with the core until reset/off.
 	 */
 	struct device *event_dev;
-	/* Explicit integration precondition, not hardware autodetection. */
-	bool ordinary_path_verified;
+	struct device *runtime_dev;
+	/* Terminal, sleepable preparation after device_shutdown(), before the
+	 * event handoff and core PMIC I/O. On success the provider must drain
+	 * and exclude option changes until reset/off, returning every current
+	 * option explicitly. A probe-time or unfrozen cached snapshot is not
+	 * sufficient. Errors invalidate all returned fields. The callback must
+	 * belong to runtime_dev's pinned driver module. No provider exists yet.
+	 * The operation must not consume the GPIO owner's read-to-clear bank.
+	 */
+	int (*prepare_runtime)(struct device *, struct d2365_runtime_state *);
 };
 
 /* J71b only. Call from a consumer probe with valid references to providers,

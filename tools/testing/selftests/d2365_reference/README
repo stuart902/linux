@@ -13,9 +13,8 @@ nothing. Do not wire it to hardware as-is.
 
 The registration API requires J71b, a probing consumer, an 8-bit regmap, a
 same-PMIC apple,d2365-pmic-gpio event owner, an explicit source snapshot
-provider and established ordinary-path
-configuration. It pins bound provider modules/devices while creating managed
-links and rolls back handlers/pins on failure. A failed caller probe lets driver
+provider and a terminal runtime-option provider. It pins bound provider
+modules/devices while creating managed links and rolls back handlers/pins on failure. A failed caller probe lets driver
 core clean managed links; callbacks must belong to the pinned provider modules.
 Providers must be fully bound, not already entering teardown even if their
 driver remains attached. This is checked while holding each provider's lock.
@@ -83,9 +82,20 @@ Source resolution happens at the corresponding point in the modeled sequence;
 so it can return unresolved after earlier simulated writes. Hardware integration
 must validate the entire producer contract before registering any callback.
 
-A normal_path_established input only expresses a test precondition. It does
-not detect the real board's active options. Scheduled RTC/UPO, special shutdown
-mode, an external shutdown controller, and diagnostic reads are excluded.
+The core's normal_path_established input only expresses a test precondition.
+The adapter now requires prepare_runtime on a separately pinned/linked provider
+and checks its result in sleepable poweroff preparation after device_shutdown,
+before taking event ownership or invoking any core PMIC operation. Every RTC
+alarm, UPO delay, charge-trap, external-shutdown and diagnostic option must be
+explicitly DISABLED. Zero/unknown, enabled, malformed or omitted fields reject
+the ordinary path; callback errors invalidate all output. The callback must
+drain option producers and exclude later changes until reset/off, not merely
+return a cached probe-time snapshot. It must not consume the GPIO owner's
+read-to-clear bank. This is an enforced interface contract, not an implemented
+runtime provider or proof that the actual board options have been discovered.
+Ordinary restart does not call the runtime-option provider. Scheduled RTC/UPO,
+special shutdown mode, an external controller and diagnostic reads remain
+unsupported; rejection leaves terminal handling in the unresolved hold.
 Failed 0x500f/0x0400 reads return UNRESOLVED instead of reusing Apple's scratch
 byte. This is an explicit modeling boundary, not a claim that Apple aborts.
 No return value means electrical-off success. A successful I2C write would
@@ -97,7 +107,9 @@ Before hardware activation
 1. Establish actual J71b producers and semantics for BOTH Apple source
    properties, including absence, stale state, teardown, and cable transitions.
    Current Linux Tristar ONLINE is only cached 0x018a != 0, not a mapped source.
-2. Verify the ordinary-path configuration and reject unsupported runtime modes.
+2. Implement and verify the terminal runtime-option provider, including actual
+   option ownership and frozen lifetime after device_shutdown. Typed admission
+   checks reject unsupported/unknown modes but cannot discover them themselves.
 3. Verify the wired provider/IRQ/I2C lifetimes during Linux shutdown. The
    concrete event API implements a handoff, but has not been hardware-qualified.
 4. Decide and document live read-error policy and nonreturning terminal handling.
@@ -194,3 +206,38 @@ readiness checks and no event read, mask write, requeue or reenable after return
 Quiesce leaves the IRQ allocated; later normal driver cleanup frees it once.
 This tests the real function bodies and modeled boundaries, not full Linux IRQ
 descriptor/workqueue semantics or electrical behavior.
+
+Runtime-provider tests additionally enumerate all 4^5 combinations of five
+options (unknown, disabled, enabled and malformed), plus negative enum values,
+untouched output and callback errors. Changes after registration are sampled
+at preparation; only five explicit DISABLED values pass. Rejected modes do not
+take event ownership, sample sources, access the adapter regmap or reset in the
+terminal callback. Runtime-provider pin/link rollback, unbinding/locked states,
+shared providers, exact callback-device identity and restart bypass are checked.
+The fixture does not prove a future provider can actually freeze RTC/option
+producers: no such provider or board registration is implemented yet.
+
+IDBus source-provider dependency
+-------------------------------
+The existing Tristar capability poll reads a cached eight-byte 0x75 response;
+it neither submits Dock commands 0x70/0x72 nor receives their matched 0x71/0x73
+responses. A successful cached capability read is not proof of USB route or
+absence of accessory deadlines. The exact firmware has a serialized transport,
+with one active job, expected RX length, timeout/cancel paths, CRC checks and
+asynchronous owner callbacks. A valid 0x73 response populates cached four-byte
+Dock state. A successful 0x71 in normal-handshake state 6, together with hardware
+power-present, installs the configurable deadline (default 300ms). MagicPullDown
+can install a separate epoch-bound two-second deadline before submitting 0x70.
+Transfer failure therefore cannot mean no deadline was installed.
+
+Evidence: 0x5ed7894/0x5ed8a8c (transport jobs), 0x6155f70 (CBTL start),
+0x6155700 (RX/CRC completion), 0x5ed71bc (owner cancellation),
+0x5ef4ba0/0x5ef4c90 (matching 0x73/0x71 state responses), 0x5ef571c
+(MagicPullDown), 0x5ef5b24 (normal handshake). These are behavioral facts from
+the same hashed image, not included proprietary instructions or firmware bytes.
+
+The missing production owner must preserve the full route/capability and cable
+generation, serialize with existing controller operations, reject late callbacks
+after detach, and drain IRQ/timer/owner work before teardown. Initial controller
+mode/routing and role/power policy remain unresolved, so no active IDBus
+transaction, deadline producer or source readiness is enabled by this patch.
