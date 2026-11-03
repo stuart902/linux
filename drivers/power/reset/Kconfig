@@ -383,8 +383,9 @@ config POWER_RESET_APPLE_D2365_REFERENCE
 	default n
 	help
 	  Separate Apple-derived ordinary shutdown/restart core and Linux
-	  resource adapter with the D2365 GPIO event-owner handoff. No board
-	  or source provider registers it.
+	  resource adapter with the D2365 GPIO event-owner handoff and an
+	  unactivated CBTL transaction core. No board or source provider
+	  registers it.
 	  This is not ready for hardware use: exact J71b source semantics and
 	  provider teardown contracts remain unverified. Say N.
 

@@ -241,3 +241,88 @@ generation, serialize with existing controller operations, reject late callbacks
 after detach, and drain IRQ/timer/owner work before teardown. Initial controller
 mode/routing and role/power policy remain unresolved, so no active IDBus
 transaction, deadline producer or source readiness is enabled by this patch.
+
+Unactivated CBTL transaction core and bounded Dock event producer
+---------------------------------------------------------------
+The default-off reference object now also links apple-cbtl-idbus.c. It has no
+probe, registration, interrupt, workqueue, timer or board caller; enabling the
+Kconfig option alone does not issue IDBus traffic. This is a reusable transport
+state machine, NOT yet the actual Tristar hardware owner. The production wrapper
+must share the existing Tristar register/policy mutex, cached-capability reads,
+mux operations and IRQ processing. It must retain the real source and controller
+lifetimes, supply the hardware prepare/recover operations, dispatch timed events,
+drain every completion consumer and then integrate the source-event reducer.
+Those integrations remain missing. No source snapshot becomes ready here.
+
+The core retains an immutable full six-byte 75 capability payload, both decoded
+routes, orientation, validated mode, owner, Dock command state and generation
+with each queued job. Its fixed eight-record queue admits one active transaction;
+completed records are copied out, not dispatched through unmanaged callback
+pointers. Job and cable identities never wrap. A detach invalidates generation
+before attempting cancellation; late IRQs and deferred source responses cannot
+mutate the new cable. Active cancellation failure retains the active record and
+quarantines the controller. Stop cannot claim drain until active cancellation
+succeeds and every completed record is consumed. A real wrapper must additionally
+join its IRQ, timer, worker and external consumers: these APIs do not do that.
+
+Framing implements 1..64-byte TX/RX, reversed TX, receive count at 60, start at
+61, ordinary mode-nibble-zero verification before the separate start write, and
+the documented alternate RX count. A timer is armed only after successful start.
+Failed starts may have committed and require abort/reset/drain before reuse.
+Read/CRC failures never publish response bytes. The hardware recovery callback
+must perform both abort and the controller reset/stale-IRQ drain; its success
+cannot mean only that the abort register was written. The reset helper's time
+unit is not established, so this code does not invent a physical reset delay.
+All entry points require the same external serialization. Token checks are NOT
+a substitute for draining hardware status before admitting the next job.
+
+The bounded Dock helper accepts only generation/job/command-matched responses.
+It records a 73 extended response separately from cached 75 identity; 71 in
+states 8/9/10/11 produces the proven pin/power acknowledgement matrix. Cable
+invalidation clears response validity without erasing lifecycle-requested pin
+state. The numeric accessory-power hook preserves mode != 1 request semantics.
+Policy-approved MagicPullDown preparation creates its two-second epoch-bound
+deadline and companion event BEFORE transport submission. A failed submission
+therefore does not remove that event. Matching successful state 6/71 plus an
+explicit validated hardware-power predicate removes the companion and creates
+the configurable persistent deadline. Wrong opcode, read/CRC/transport failure,
+stale generation or mismatched command does not create it. Effective source
+epoch advancement prunes only the older epoch-bound event, not the persistent
+handshake deadline. This helper does not implement complete event reduction,
+source debounce/publication, command selection, special-open lifecycle or the
+power/handshake policy. In particular its result is not either shutdown property.
+
+Additional evidence: source-history timestamp at 5ef218c/5ef2284; accessory
+PowerModeOff=1 and request production at 5e7e4d0/5ef6524; unique special-open
+client membership at 5ed9860/5ed991c; requested/acknowledged pin separation at
+5ef6588/5ef4ef4; three-state handshake property at 5ef2f5c. The same hashed J71b
+image named above is the evidence source. These establish producer contracts,
+not a current cable's live policy values, and do not justify treating unknown
+inputs as disabled or absent. Actual runtime-option providers remain missing.
+
+run.sh now compiles the actual transaction/event core for host testing. Tests
+cover all 16,384 TX/RX length, encoding and verification combinations, invalid
+lengths and ownership, queue exhaustion, immutable request/cable snapshots,
+identifier/time overflow, start/read/verification failure including an error
+after committed start, CRC/IRQ errors, timeout-versus-IRQ order, queued-owner
+cancellation preserving another owner, failed abort retention, stale generations,
+stop/result drain, and the bounded Dock event/response cases. They do not test
+Linux mutex/IRQ/workqueue semantics, real Tristar integration or live hardware.
+
+Review corrections: timeout starts from a monotonic sample taken after the
+successful start write, so synchronous register verification does not consume
+its duration. A successful-completion retire hook must acknowledge/drain old
+hardware status before reuse. Owner registration has a separate nonwrapping
+epoch: cancellation invalidates queued, completed and already-copied results,
+and reopening the same owner identity cannot resurrect them. Consumers must
+check result_current under the shared lock immediately before publication;
+cable-only current is insufficient. Internal drained does not certify external
+work/IRQ/timer consumers have joined. Tests include slow I/O, cancel/reopen after
+completion, post-success stale-status drain, failed recovery on start/IRQ/timeout/
+retire, and fixed independent CRC vectors. The bounded property-state helper
+also preserves unknown/completed/failed results and the distinct inflow-hold
+rules; it still does not implement that property's full event notification path.
+When canceling a transport owner, its consumer first invalidates the exact Dock
+pending token with cbtl_dock_cancel under the shared lock. This retains already
+produced events and acknowledgements while allowing a reopened owner to proceed;
+it does not require an unrelated full cable reset.
