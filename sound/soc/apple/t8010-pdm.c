@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Experimental T8010 PDM consumer. Default-off, NOT ENABLEMENT-READY:
- * Requires ownership-preserving SmartIO drain and exclusive firmware pdm0
- * ownership. Do not enable a board node until both integration contracts
+ * Requires ownership-preserving SmartIO drain and exclusive host PDM
+ * high-power request ownership. Do not enable a board node until both integration contracts
  * are reviewed. Uncertain ownership can permanently block close, suspend,
  * and shutdown until a physical device reset.
  */
@@ -13,8 +13,12 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mtd/mtd.h>
+#include <linux/of_platform.h>
+#include <linux/vmalloc.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/sio.h>
@@ -24,21 +28,28 @@
 #include <sound/soc.h>
 
 #include "t8010-pdm.h"
+#include "t8010-pdm-adt.h"
 
 #define PDM_BUFFER_BYTES (128 * 1024)
 
 struct pdm_decimator {
 	void __iomem *base;
-	resource_size_t size;
+	resource_size_t size, physical;
 	u32 config, delay_ms, force_gating;
 	u8 mic_name[4];
 	unsigned int nfilters;
 	struct pdm_filter filters[PDM_MAX_RATES];
 };
 
+struct pdm_profile {
+	const char *model;
+};
+
 struct t8010_pdm {
+	const struct pdm_profile *profile;
 	struct device *dev;
 	void __iomem *base;
+	resource_size_t physical, size;
 	struct pdm_decimator dec[PDM_DECIMATORS];
 	struct apple_aop_pdm_clock *clock;
 	struct mutex lifecycle;
@@ -62,55 +73,6 @@ struct t8010_pdm {
 	struct apple_sio_dma_config dma_config;
 };
 
-static int pdm_read_u32(struct device_node *np, const char *name, u32 *value)
-{
-	if (of_property_count_u32_elems(np, name) != 1)
-		return -EINVAL;
-	return of_property_read_u32(np, name, value);
-}
-
-static int pdm_read_bytes(struct device_node *np, const char *name,
-			  void *out, size_t size)
-{
-	int len;
-	const void *data = of_get_property(np, name, &len);
-
-	if (!data || len != size)
-		return -EINVAL;
-	memcpy(out, data, size);
-	return 0;
-}
-
-static int pdm_filter_read(struct device *dev, struct device_node *np,
-			   struct pdm_decimator *dec, struct pdm_filter *f)
-{
-	const void *coefficients;
-	int ret, len;
-	char name[32];
-
-	if (pdm_read_u32(np, "sample-rate", &f->rate) ||
-	    pdm_read_u32(np, "apple,pdm-frequency", &f->frequency) ||
-	    pdm_read_u32(np, "apple,latency", &f->latency) ||
-	    pdm_read_bytes(np, "apple,ratios", f->ratios, 3) ||
-	    pdm_read_bytes(np, "apple,lengths", f->lengths, 3))
-		return -EINVAL;
-	if (!f->rate || f->rate > 192000 || !f->frequency)
-		return -EINVAL;
-	snprintf(name, sizeof(name), "filter-%u", f->rate);
-	if (strcmp(kbasename(np->full_name), name))
-		return -EINVAL;
-	coefficients = of_get_property(np, "apple,coefficients", &len);
-	if (!coefficients)
-		return -EINVAL;
-	ret = pdm_filter_validate(f, dec->size, len);
-	if (ret)
-		return ret;
-	f->coefficients = devm_kmemdup(dev, coefficients, len, GFP_KERNEL);
-	if (!f->coefficients)
-		return -ENOMEM;
-	return 0;
-}
-
 static const struct pdm_filter *pdm_find_filter(struct pdm_decimator *d, u32 rate)
 {
 	unsigned int i;
@@ -121,73 +83,244 @@ static const struct pdm_filter *pdm_find_filter(struct pdm_decimator *d, u32 rat
 	return NULL;
 }
 
-static int pdm_calibration_read(struct t8010_pdm *pdm)
+/* Return only a snapshot of the existing live ADT RAM MTD, never named flash. */
+static void *pdm_adt_snapshot(size_t *bytes)
 {
-	struct device_node *node, *bank;
-	unsigned int seen = 0, i;
-	int ret;
-	u32 index;
+	struct device_node *reserved, *node, *selected = NULL;
+	struct platform_device *provider;
+	struct mtd_info *mtd;
+	const char *label;
+	void *snapshot;
+	size_t received;
+	int ret = -ENODEV;
 
-	for_each_child_of_node(pdm->dev->of_node, node) {
-		struct pdm_decimator *d;
-		char name[24];
-
-		ret = -EINVAL;
-		if (pdm_read_u32(node, "reg", &index) || index >= PDM_DECIMATORS ||
-		    seen & BIT(index))
-			goto put_node;
-		snprintf(name, sizeof(name), "decimator@%u", index);
-		if (strcmp(kbasename(node->full_name), name))
-			goto put_node;
-		seen |= BIT(index);
-		d = &pdm->dec[index];
-		if (pdm_read_u32(node, "apple,config", &d->config) ||
-		    pdm_read_u32(node, "apple,startup-delay-ms", &d->delay_ms) ||
-		    pdm_read_u32(node, "apple,force-clock-gating", &d->force_gating) ||
-		    pdm_read_bytes(node, "apple,mic-name", d->mic_name, 4) ||
-		    d->delay_ms > PDM_MAX_DELAY_MS || d->force_gating > 1)
-			goto put_node;
-		pdm->delay_ms = max(pdm->delay_ms, d->delay_ms);
-		for_each_child_of_node(node, bank) {
-			struct pdm_filter *f;
-
-			if (d->nfilters == PDM_MAX_RATES) {
-				ret = -E2BIG;
-				goto put_bank;
-			}
-			f = &d->filters[d->nfilters];
-			ret = pdm_filter_read(pdm->dev, bank, d, f);
-			if (ret)
-				goto put_bank;
-			if (pdm_find_filter(d, f->rate)) {
-				ret = -EINVAL;
-				goto put_bank;
-			}
-			d->nfilters++;
-		}
-		if (!d->nfilters) {
+	reserved = of_find_node_by_path("/reserved-memory");
+	if (!reserved)
+		return ERR_PTR(-ENODEV);
+	for_each_child_of_node(reserved, node) {
+		if (of_property_read_string(node, "label", &label) || strcmp(label, "adt"))
+			continue;
+		if (selected || !of_device_is_compatible(node, "phram") ||
+		    !of_device_is_available(node)) {
 			ret = -EINVAL;
-			goto put_node;
+			of_node_put(node);
+			goto put_nodes;
 		}
+		selected = of_node_get(node);
 	}
-	if (seen != GENMASK(PDM_DECIMATORS - 1, 0) ||
-	    pdm->dec[0].nfilters != pdm->dec[1].nfilters)
-		return -EINVAL;
-	for (i = 0; i < pdm->dec[0].nfilters; i++) {
-		const struct pdm_filter *a = &pdm->dec[0].filters[i];
-		const struct pdm_filter *b = pdm_find_filter(&pdm->dec[1], a->rate);
+	if (!selected)
+		goto put_nodes;
+	provider = of_find_device_by_node(selected);
+	if (!provider) {
+		ret = -EPROBE_DEFER;
+		goto put_nodes;
+	}
+	/* phram remove frees its mapping: exclude unbind while taking the copy. */
+	device_lock(&provider->dev);
+	if (!device_is_bound(&provider->dev)) {
+		ret = -EPROBE_DEFER;
+		goto unlock;
+	}
+	mtd = of_get_mtd_device_by_node(selected);
+	if (IS_ERR(mtd)) {
+		ret = PTR_ERR(mtd);
+		goto unlock;
+	}
+	if (mtd->type != MTD_RAM || mtd->size < 8 || mtd->size > PDM_ADT_MAX_BYTES) {
+		ret = -EINVAL;
+		goto put_mtd;
+	}
+	*bytes = mtd->size;
+	snapshot = kvmalloc(*bytes, GFP_KERNEL);
+	if (!snapshot) {
+		ret = -ENOMEM;
+		goto put_mtd;
+	}
+	ret = mtd_read(mtd, 0, *bytes, &received, snapshot);
+	if (ret || received != *bytes) {
+		kvfree(snapshot);
+		if (!ret)
+			ret = -EIO;
+		goto put_mtd;
+	}
+	put_mtd_device(mtd);
+	device_unlock(&provider->dev);
+	put_device(&provider->dev);
+	of_node_put(selected);
+	of_node_put(reserved);
+	return snapshot;
+put_mtd:
+	put_mtd_device(mtd);
+unlock:
+	device_unlock(&provider->dev);
+	put_device(&provider->dev);
+put_nodes:
+	of_node_put(selected);
+	of_node_put(reserved);
+	return ERR_PTR(ret);
+}
 
-		if (!b || a->frequency != b->frequency)
+static bool pdm_rate_present(const u32 *rates, unsigned int count, u32 rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		if (rates[i] == rate)
+			return true;
+	return false;
+}
+
+static int pdm_adt_filter_read(struct t8010_pdm *pdm, const struct pdm_adt *t,
+			       u32 provider, struct pdm_decimator *d, u32 rate)
+{
+	struct pdm_filter *f = &d->filters[d->nfilters];
+	const u8 *value;
+	char name[40];
+	u32 length;
+	int ret;
+
+	f->rate = rate;
+	snprintf(name, sizeof(name), "pdmfreq-%u", rate);
+	if (pdm_adt_u32(t, provider, name, &f->frequency))
+		return -EINVAL;
+	snprintf(name, sizeof(name), "latency-%u", rate);
+	if (pdm_adt_u32(t, provider, name, &f->latency))
+		return -EINVAL;
+	snprintf(name, sizeof(name), "ratios-%u", rate);
+	value = pdm_adt_property(t, provider, name, &length);
+	if (!value || length != 4 || value[3])
+		return -EINVAL;
+	memcpy(f->ratios, value, 3);
+	snprintf(name, sizeof(name), "lengths-%u", rate);
+	value = pdm_adt_property(t, provider, name, &length);
+	if (!value || length != 4 || value[3])
+		return -EINVAL;
+	memcpy(f->lengths, value, 3);
+	snprintf(name, sizeof(name), "coeff-%u", rate);
+	value = pdm_adt_property(t, provider, name, &length);
+	if (!value)
+		return -EINVAL;
+	ret = pdm_filter_validate(f, d->size, length);
+	if (ret)
+		return ret;
+	f->coefficients = devm_kmemdup(pdm->dev, value, length, GFP_KERNEL);
+	if (!f->coefficients)
+		return -ENOMEM;
+	d->nfilters++;
+	return 0;
+}
+
+static int pdm_adt_decode(struct t8010_pdm *pdm, const struct pdm_adt *t)
+{
+	u32 phandles[2], providers[2], dst[PDM_MAX_RATES];
+	u32 mic[2][PDM_MAX_RATES], mic_count[2], length, index, phandle;
+	const u8 *value;
+	int arm_io, receiver, decimator, provider, count, ret;
+	unsigned int i, j;
+
+	if (!pdm_adt_string(t, 0, "model", pdm->profile->model))
+		return -ENODEV;
+	arm_io = pdm_adt_child(t, 0, "arm-io");
+	if (arm_io < 0)
+		return arm_io;
+	receiver = pdm_adt_child(t, arm_io, "pdm");
+	if (receiver < 0)
+		return receiver;
+	if (!pdm_adt_string(t, arm_io, "compatible", "arm-io,t8010") ||
+	    !pdm_adt_string(t, receiver, "compatible", "pdm,t8010") ||
+	    !pdm_adt_reg_matches(t, arm_io, receiver, pdm->physical, pdm->size))
+		return -ENODEV;
+	/* The receiver must select the same pdm0 HP service used by our API. */
+	value = pdm_adt_property(t, receiver, "function-pdm-clk-cfg", &length);
+	if (!value || length != 8 || get_unaligned_le32(value + 4) != 0x70646d43)
+		return -EINVAL;
+	provider = pdm_adt_phandle(t, get_unaligned_le32(value));
+	if (provider < 0 || pdm_adt_u32(t, provider, "identifier", &index) ||
+	    index != 0x70646d30)
+		return -EINVAL;
+	value = pdm_adt_property(t, receiver, "decimators", &length);
+	if (!value || length != 8)
+		return -EINVAL;
+	phandles[0] = get_unaligned_le32(value);
+	phandles[1] = get_unaligned_le32(value + 4);
+	if (phandles[0] == phandles[1])
+		return -EINVAL;
+	count = pdm_adt_rates(t, receiver, "dst-samplerates", dst, PDM_MAX_RATES);
+	if (count < 0)
+		return count;
+	for (i = 0; i < PDM_DECIMATORS; i++) {
+		struct pdm_decimator *d = &pdm->dec[i];
+
+		decimator = pdm_adt_phandle(t, phandles[i]);
+		if (decimator < 0)
+			return decimator;
+		if (!pdm_adt_string(t, decimator, "compatible", "hifidec,t8010") ||
+		    !pdm_adt_reg_matches(t, arm_io, decimator, d->physical, d->size) ||
+		    pdm_adt_u32(t, decimator, "index", &index) || index != i ||
+		    pdm_adt_u32(t, decimator, "config", &d->config) ||
+		    pdm_adt_u32(t, decimator, "mic-startup-delay", &d->delay_ms) ||
+		    pdm_adt_u32(t, decimator, "mic-coeff-data", &phandle) ||
+		    d->delay_ms > PDM_MAX_DELAY_MS)
 			return -EINVAL;
-		pdm->rates[i] = a->rate;
+		value = pdm_adt_property(t, decimator, "mic-name", &length);
+		if (!value || length != sizeof(d->mic_name))
+			return -EINVAL;
+		memcpy(d->mic_name, value, length);
+		/* Apple's missing self-registry ForceClockGating property defaults false. */
+		d->force_gating = 0;
+		pdm->delay_ms = max(pdm->delay_ms, d->delay_ms);
+		provider = pdm_adt_phandle(t, phandle);
+		if (provider < 0)
+			return provider;
+		providers[i] = provider;
+		ret = pdm_adt_rates(t, provider, "mic-samplerates", mic[i], PDM_MAX_RATES);
+		if (ret < 0)
+			return ret;
+		mic_count[i] = ret;
 	}
+	for (j = 0; j < count; j++) {
+		if (!pdm_rate_present(mic[0], mic_count[0], dst[j]) ||
+		    !pdm_rate_present(mic[1], mic_count[1], dst[j]))
+			continue;
+		for (i = 0; i < PDM_DECIMATORS; i++) {
+			ret = pdm_adt_filter_read(pdm, t, providers[i], &pdm->dec[i], dst[j]);
+			if (ret)
+				return ret;
+		}
+		index = pdm->dec[0].nfilters - 1;
+		if (pdm->dec[0].filters[index].frequency != pdm->dec[1].filters[index].frequency)
+			return -EINVAL;
+		pdm->rates[index] = dst[j];
+	}
+	if (!pdm->dec[0].nfilters)
+		return -EINVAL;
 	pdm->rate_list.count = pdm->dec[0].nfilters;
 	pdm->rate_list.list = pdm->rates;
 	return 0;
-put_bank:
-	of_node_put(bank);
-put_node:
-	of_node_put(node);
+}
+
+static int pdm_calibration_read(struct t8010_pdm *pdm)
+{
+	struct pdm_adt tree = {};
+	void *snapshot;
+	int ret;
+
+	snapshot = pdm_adt_snapshot(&tree.size);
+	if (IS_ERR(snapshot))
+		return PTR_ERR(snapshot);
+	tree.data = snapshot;
+	tree.nodes = kvcalloc(PDM_ADT_MAX_NODES, sizeof(*tree.nodes), GFP_KERNEL);
+	if (!tree.nodes) {
+		ret = -ENOMEM;
+		goto free_snapshot;
+	}
+	ret = pdm_adt_parse(&tree);
+	if (!ret)
+		ret = pdm_adt_decode(pdm, &tree);
+	kvfree(tree.nodes);
+free_snapshot:
+	/* Only the selected validated coefficient copies outlive probe. */
+	kvfree(snapshot);
 	return ret;
 }
 
@@ -798,6 +931,9 @@ static int pdm_probe(struct platform_device *pdev)
 	pdm = devm_kzalloc(dev, sizeof(*pdm), GFP_KERNEL);
 	if (!pdm)
 		return -ENOMEM;
+	pdm->profile = of_device_get_match_data(dev);
+	if (!pdm->profile)
+		return -ENODEV;
 	pdm->dev = dev;
 	spin_lock_init(&pdm->lock);
 	mutex_init(&pdm->lifecycle);
@@ -806,6 +942,8 @@ static int pdm_probe(struct platform_device *pdev)
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pdmc");
 	if (!res || resource_size(res) < 0x114)
 		return -EINVAL;
+	pdm->physical = res->start;
+	pdm->size = resource_size(res);
 	pdm->base = devm_ioremap_resource(dev, res);
 	if (IS_ERR(pdm->base))
 		return PTR_ERR(pdm->base);
@@ -816,6 +954,7 @@ static int pdm_probe(struct platform_device *pdev)
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
 		if (!res || resource_size(res) <= PDM_COEFF_BASE)
 			return -EINVAL;
+		pdm->dec[i].physical = res->start;
 		pdm->dec[i].size = resource_size(res);
 		pdm->dec[i].base = devm_ioremap_resource(dev, res);
 		if (IS_ERR(pdm->dec[i].base))
@@ -857,8 +996,12 @@ static void pdm_shutdown(struct platform_device *pdev)
 	pdm_cleanup(platform_get_drvdata(pdev));
 }
 
+static const struct pdm_profile pdm_j71b_profile = {
+	.model = "iPad7,5",
+};
+
 static const struct of_device_id pdm_of_match[] = {
-	{ .compatible = "apple,t8010-pdm" },
+	{ .compatible = "apple,j71b-pdm", .data = &pdm_j71b_profile },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, pdm_of_match);
