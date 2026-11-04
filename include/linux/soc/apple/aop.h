@@ -40,4 +40,28 @@ void apple_aop_unlisten(const struct apple_aop_service *service);
 int apple_aop_call(const struct apple_aop_service *service, u16 subtype,
 		   const void *data, size_t len, void *reply, size_t reply_len);
 
+/*
+ * Advertise requested_len in the outbound EPIC inline_len field (excluding
+ * the firmware status),
+ * independently of the local reply_len receive capacity. Some services return
+ * a bounded opaque payload even when the caller requests no result bytes.
+ * Request and reply capacity must not exceed 228 bytes each; requested_len
+ * must not exceed reply_len. No response bytes are silently truncated.
+ * actual_len receives the untruncated payload size. On firmware success, an
+ * oversized reply returns -EMSGSIZE. Malformed headers return -EPROTO. Neither
+ * these errors nor a nonzero firmware status copies reply data.
+ * As with apple_aop_call(), nonnegative results are firmware return codes.
+ *
+ * Calls use tags disjoint from the legacy API and never reuse a tag this boot.
+ * Exhaustion returns -EOVERFLOW and requires a reboot; reopening a service
+ * does not reset the tag budget. A timeout or send error is not confirmation
+ * that firmware did not execute the request; callers must retain any affected
+ * resources and refuse unsafe reuse until a verified recovery boundary.
+ * The caller must serialize against service teardown; this call does not
+ * acquire or extend the lifetime of the service or its firmware owner.
+ */
+int apple_aop_call_inline(const struct apple_aop_service *service, u16 subtype,
+			  const void *data, size_t len, void *reply, size_t reply_len,
+			  size_t requested_len, size_t *actual_len);
+
 #endif /* _LINUX_SOC_APPLE_AOP_H_ */
