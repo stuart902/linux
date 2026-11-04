@@ -126,3 +126,9 @@
 		device-wakeup-gpios = <&pinctrl_ap 87 GPIO_ACTIVE_HIGH>;
 	};
 };
+
+/* The adopted MIPI DSI panel link cannot be restored after power loss. */
+&ps_mipi_dsi {
+	apple,always-on;
+	apple,manual-pm;
+};

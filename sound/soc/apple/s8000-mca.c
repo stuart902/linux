@@ -177,6 +177,8 @@ struct s8000_mca {
 	 */
 	spinlock_t hw_lock;
 	unsigned int prep_mask, run_mask;
+	/* Protected by hw_lock; shutdown drains any IRQ using a saved pointer. */
+	struct snd_pcm_substream *streams[2];
 	u32 irq_mask;		/* current MCA_IRQ_MASK value */
 };
 
@@ -587,8 +589,39 @@ static int mca_dai_probe(struct snd_soc_dai *dai)
 	return 0;
 }
 
+static int mca_startup(struct snd_pcm_substream *substream,
+		       struct snd_soc_dai *dai)
+{
+	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+	unsigned long flags;
+
+	/* FIFO errors stop PCM directly from the hard IRQ handler. */
+	if (substream->pcm->nonatomic)
+		return -EOPNOTSUPP;
+
+	spin_lock_irqsave(&mca->hw_lock, flags);
+	mca->streams[substream->stream] = substream;
+	spin_unlock_irqrestore(&mca->hw_lock, flags);
+	return 0;
+}
+
+static void mca_shutdown(struct snd_pcm_substream *substream,
+			 struct snd_soc_dai *dai)
+{
+	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+	unsigned long flags;
+
+	spin_lock_irqsave(&mca->hw_lock, flags);
+	mca->streams[substream->stream] = NULL;
+	spin_unlock_irqrestore(&mca->hw_lock, flags);
+	/* The IRQ may have saved this pointer before it was cleared. */
+	synchronize_irq(mca->irq);
+}
+
 static const struct snd_soc_dai_ops mca_dai_ops = {
 	.probe = mca_dai_probe,
+	.startup = mca_startup,
+	.shutdown = mca_shutdown,
 	.set_fmt = mca_set_fmt,
 	.hw_params = mca_hw_params,
 	.prepare = mca_prepare,
@@ -619,8 +652,19 @@ static const struct snd_soc_dai_driver mca_dai = {
 	.symmetric_sample_bits = 1,
 };
 
+static int mca_sync_stop(struct snd_soc_component *component,
+			 struct snd_pcm_substream *substream)
+{
+	struct s8000_mca *mca = snd_soc_component_get_drvdata(component);
+
+	/* Finish an old FIFO-error IRQ before prepare can start a new stream. */
+	synchronize_irq(mca->irq);
+	return 0;
+}
+
 static const struct snd_soc_component_driver mca_component = {
 	.name = "s8000-mca",
+	.sync_stop = mca_sync_stop,
 };
 
 /*
@@ -694,6 +738,7 @@ static const struct snd_dmaengine_pcm_config mca_dma_config = {
 static irqreturn_t mca_irq(int irq, void *data)
 {
 	struct s8000_mca *mca = data;
+	struct snd_pcm_substream *tx = NULL, *rx = NULL;
 	u32 raw, status;
 
 	spin_lock(&mca->hw_lock);
@@ -721,12 +766,24 @@ static irqreturn_t mca_irq(int irq, void *data)
 		 * (e.g. a TX underflow): mask them until the direction's next
 		 * prepare instead of taking an interrupt per frame.
 		 */
+		if ((status & MCA_IRQ_TX_CAUSES) &&
+		    (mca->run_mask & BIT(SNDRV_PCM_STREAM_PLAYBACK)))
+			tx = mca->streams[SNDRV_PCM_STREAM_PLAYBACK];
+		if ((status & MCA_IRQ_RX_CAUSES) &&
+		    (mca->run_mask & BIT(SNDRV_PCM_STREAM_CAPTURE)))
+			rx = mca->streams[SNDRV_PCM_STREAM_CAPTURE];
 		mca->irq_mask |= status & MCA_IRQ_ERRORS;
 		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
 		dev_dbg_ratelimited(mca->dev, "irq status %#x, masked\n",
 				    status);
 	}
 	spin_unlock(&mca->hw_lock);
+
+	/* ALSA's stream lock nests outside hw_lock in the trigger callback. */
+	if (tx)
+		snd_pcm_stop_xrun(tx);
+	if (rx)
+		snd_pcm_stop_xrun(rx);
 
 	return IRQ_HANDLED;
 }
@@ -937,3 +994,4 @@ module_platform_driver(s8000_mca_driver);
 MODULE_AUTHOR("Berkay Kösebay <brkosebay@users.noreply.github.com>");
 MODULE_DESCRIPTION("Apple S8000 (A9) MCA I2S driver");
 MODULE_LICENSE("Dual MIT/GPL");
+

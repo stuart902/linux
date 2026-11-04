@@ -230,6 +230,10 @@ static const struct of_device_id apple_wifi_pwrctrl_of_match[] = {
 		.compatible = "pci14e4,43dc",
 		.data = &apple_j172_wifi_data,
 	},
+	{
+		.compatible = "pci14e4,440a",
+		.data = &apple_j172_wifi_data,
+	},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_wifi_pwrctrl_of_match);

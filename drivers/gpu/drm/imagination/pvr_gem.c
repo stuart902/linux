@@ -52,8 +52,19 @@ static int pvr_gem_mmap(struct drm_gem_object *gem_obj, struct vm_area_struct *v
 	return drm_gem_shmem_mmap(shmem_obj, vma);
 }
 
+static enum drm_gem_object_status pvr_gem_object_status(struct drm_gem_object *obj)
+{
+	struct drm_gem_shmem_object *shmem_obj = to_drm_gem_shmem_obj(obj);
+
+	if (drm_gem_is_imported(obj) || shmem_obj->pages)
+		return DRM_GEM_OBJECT_RESIDENT;
+
+	return 0;
+}
+
 static const struct drm_gem_object_funcs pvr_gem_object_funcs = {
 	.free = pvr_gem_object_free,
+	.status = pvr_gem_object_status,
 	.print_info = drm_gem_shmem_object_print_info,
 	.export = pvr_gem_export,
 	.pin = drm_gem_shmem_object_pin,

@@ -4,6 +4,7 @@
  * Copyright (c) 2022, Konrad Dybcio <konradybcio@kernel.org>
  */
 
+/* Experimental capture only: assumes one Linux host HP requester. */
 /dts-v1/;
 
 #include "t8010-ipad6.dtsi"
@@ -12,6 +13,44 @@
 	compatible = "apple,j71b", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 6 (Wi-Fi)";
 
+	dmic: dmic {
+		compatible = "dmic-codec";
+		#sound-dai-cells = <0>;
+		num-channels = <2>;
+		status = "okay";
+	};
+
+	microphones {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "J71b Microphones";
+		status = "okay";
+
+		simple-audio-card,cpu {
+			sound-dai = <&pdm>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&dmic>;
+		};
+	};
+
+	soc {
+		pdm: pdm@20a0b4000 {
+			compatible = "apple,j71b-pdm";
+			reg = <0x2 0x0a0b4000 0x0 0x1000>,
+			      <0x2 0x0a120000 0x0 0x4000>,
+			      <0x2 0x0a124000 0x0 0x4000>;
+			reg-names = "pdmc", "decimator0", "decimator1";
+			interrupts = <AIC_IRQ 238 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_hfd0>;
+			dmas = <&sio 0x5b>;
+			dma-names = "rx";
+			apple,aop-audio = <&aop_audio>;
+			#sound-dai-cells = <0>;
+			status = "okay";
+		};
+	};
+
 	/* One logical codec models the amplifier bank's shared SD_MODE line. */
 	speaker_amps: amplifier {
 		compatible = "maxim,max98357a";
@@ -19,7 +58,9 @@
 		sdmode-gpios = <&pinctrl_ap 20 GPIO_ACTIVE_HIGH>;
 	};
 
+	/* Test-only: no playback card before the desktop session starts. */
 	sound {
+		status = "disabled";
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "J71b Speakers";
 		simple-audio-card,format = "i2s";
@@ -46,6 +87,11 @@
 &aop {
 	firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
 	status = "okay";
+
+	aop_audio: aop-audio {
+		compatible = "apple,t8010-aop-audio";
+		status = "okay";
+	};
 };
 
 &aop_mbox {
@@ -69,7 +115,7 @@
 
 &mca2 {
 	apple,i2s-switch = <&i2s_switch 2 2>;
-	status = "okay";
+	status = "disabled";
 };
 
 &i2s_switch {
@@ -82,4 +128,11 @@
 
 &nco {
 	status = "okay";
+};
+
+&d2365_pmic {
+	poweroff {
+		compatible = "apple,d2365-poweroff";
+		power-supplies = <&tristar_charger>;
+	};
 };
