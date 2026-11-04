@@ -1,0 +1,463 @@
+J71b Apple-derived power reference (unwired kernel adapter)
+================================================================
+
+This is the first separately implemented core for the requested second power
+approach. It starts from upstream df7c930, independently of the existing
+j71b/power-validation driver. It is NOT a second bootable image or a completed
+Apple-equivalent Linux driver. The kernel-compatible core and default-off
+POWER_RESET_APPLE_D2365_REFERENCE adapter now exist, but no platform driver,
+DT node or board calls the registration API. It is built-in only because
+ARM64's terminal machine_restart entry point is not exported to modules.
+Compilation alone registers
+nothing. Do not wire it to hardware as-is.
+
+The registration API requires J71b, a probing consumer, an 8-bit regmap, a
+same-PMIC apple,d2365-pmic-gpio event owner, an explicit source snapshot
+provider and a terminal runtime-option provider. It pins bound provider
+modules/devices while creating managed links and rolls back handlers/pins on failure. A failed caller probe lets driver
+core clean managed links; callbacks must belong to the pinned provider modules.
+Providers must be fully bound, not already entering teardown even if their
+driver remains attached. This is checked while holding each provider's lock.
+Lock acquisition is nonblocking: a locked provider causes probe deferral,
+including a parent that synchronously populates children from its own probe.
+The caller must still have a reprobe path: arbitrary lock release alone does
+not retrigger deferred probing, whereas a parent's successful probe does.
+The PMIC transport must still be operational after device_shutdown(), and its
+regmap must bypass caching for events, status and commands and never be in
+cache-only mode during callbacks. These transport properties are caller
+contracts, not properties established by device links or the 8-bit check.
+The adapter checks existing poweroff handlers and uses unique HIGH priority.
+This does NOT guarantee global exclusivity: board integration must exclude both
+the existing driver and later competing handlers.
+
+The adapter now uses the real D2365 GPIO provider, not a caller-supplied event
+callback. It checks the bound driver and event domain after taking the managed
+supplier dependency, then uses that owner's quiesce API. The API closes event,
+retry and mask-update gates, holds and drains the parent IRQ, and cancels retry
+work before returning ownership of the read-to-clear bank. It is a terminal
+shutdown handoff, not a reversible suspend operation. No new GPIO shutdown
+callback or all-board behavior change is added. The adapter requires this GPIO
+driver built-in, so there is no built-in-to-module symbol dependency.
+
+Invalid ownership prevents all core PMIC operations. Normal restart leaves reset to
+the existing platform driver. Poweroff remains unresolved and holds instead.
+Source sampling and bus transactions run only in sleepable prepare; final
+handling resets or waits without further PMIC access. The final wait spins with
+IRQs disabled, unlike Apple's sleep loop: it is a Linux terminal adaptation,
+not proof of electrical off or a justified power-consumption policy. The
+adapter's unresolved-state hold is containment, not identical Apple behavior.
+
+Run ./run.sh, python3 test_adapter.py and python3 test_event_provider.py.
+Requires an existing C compiler and pthreads. CFLAGS may enable sanitizers.
+The runner uses a temporary executable and removes it on exit. No firmware
+bytes are distributed or required to run tests.
+
+Distinct behavior implemented
+-----------------------------
+* Separate logical Apple raw-external and USB-cable properties. No 0x018a
+  substitute, charger ONLINE shortcut, or repeated source rechecks.
+* Ordinary sequence: read events, policy mask, RTC/no-alarm, clear boot stage
+  and flags, sample properties, preserve boot-state bits, then either return
+  toward platform reset or prepare GPIOs and request standby.
+* Fresh paired GPIO bytes before writing. GPIO helper failure is recorded
+  and the enclosing standby sequence continues, unlike the existing Linux
+  driver's abort-to-reset policy.
+* Write/event errors are recorded without automatically selecting reset.
+* Terminal actions are values: PLATFORM_RESET and STANDBY_WAIT do not perform
+  a reset or an indefinite wait. A standby write error still leads to Apple's
+  wait terminal, but its transaction outcome is explicitly unacknowledged.
+* Ordinary restart attempts event acknowledgement and boot-stage clear even
+  when the first operation fails, then returns the platform-reset terminal.
+
+Limits and deliberately non-identical cases
+------------------------------------------
+No complete hardware shutdown source-property provider is implemented. ABSENT means an observed
+absent Apple property/object, not a missing Linux provider. A successful coherent
+snapshot with either independently valid TRUE determines the reset branch even
+if the other property is UNRESOLVED; it does not invent that property's value.
+Standby requires both properties resolved. Callback errors invalidate the whole
+snapshot, and malformed values are rejected even alongside TRUE. UNRESOLVED
+must not be mapped to ABSENT or FALSE to make a device boot or shut down.
+Source resolution happens at the corresponding point in the modeled sequence;
+so it can return unresolved after earlier simulated writes. Hardware integration
+must validate the entire producer contract before registering any callback.
+
+The core's normal_path_established input only expresses a test precondition.
+The adapter now requires prepare_runtime on a separately pinned/linked provider
+and checks its result in sleepable poweroff preparation after device_shutdown,
+before taking event ownership or invoking any core PMIC operation. Every RTC
+alarm, UPO delay, charge-trap, external-shutdown and diagnostic option must be
+explicitly DISABLED. Zero/unknown, enabled, malformed or omitted fields reject
+the ordinary path; callback errors invalidate all output. The callback must
+drain option producers and exclude later changes until reset/off, not merely
+return a cached probe-time snapshot. It must not consume the GPIO owner's
+read-to-clear bank. This is an enforced interface contract, not an implemented
+runtime provider or proof that the actual board options have been discovered.
+Ordinary restart does not call the runtime-option provider. Scheduled RTC/UPO,
+special shutdown mode, an external controller and diagnostic reads remain
+unsupported; rejection leaves terminal handling in the unresolved hold.
+Failed 0x500f/0x0400 reads return UNRESOLVED instead of reusing Apple's scratch
+byte. This is an explicit modeling boundary, not a claim that Apple aborts.
+No return value means electrical-off success. A successful I2C write would
+not prove that either. GPIO and event errors may make continued standby unsafe
+for a live Linux system; this model does not authorize that policy on hardware.
+
+Before hardware activation
+--------------------------
+1. Establish actual J71b producers and semantics for BOTH Apple source
+   properties, including absence, stale state, teardown, and cable transitions.
+   Current Linux Tristar ONLINE is only cached 0x018a != 0, not a mapped source.
+2. Implement and verify the terminal runtime-option provider, including actual
+   option ownership and frozen lifetime after device_shutdown. Typed admission
+   checks reject unsupported/unknown modes but cannot discover them themselves.
+3. Verify the wired provider/IRQ/I2C lifetimes during Linux shutdown. The
+   concrete event API implements a handoff, but has not been hardware-qualified.
+4. Decide and document live read-error policy and nonreturning terminal handling.
+   Do not silently import a one-second wait or fail-to-reset behavior and call
+   that Apple-equivalent. Do not blindly copy unchecked Apple reads either.
+5. Review and compile each integrated revision against the real kernel,
+   add providers/bindings only once their contracts are grounded, then run
+   kernel integration tests and request a bounded device test.
+
+Additional source-contract evidence
+-----------------------------------
+The D2365 source dictionary's 0x189 bit-1 requirement is state-dependent:
+the charger passes inverse previous source status to the backend getter
+(0x5f161e4-0x5f16204; D2365 selection at 0x6b85294). It is not a fixed mask.
+The immediate charger USB override is function-usb_det, not the separate
+function-usb_dmonitor facility (0x5f15b30-0x5f15b9c, 0x5f163b4-0x5f163e4).
+AppleUSBCableDetect is published from a cached IOAccessoryUSBPower-derived
+value (0x5ed36c0-0x5ed37fc), not a fresh shutdown-time PMIC read. Source
+selection, all update paths and teardown/staleness guarantees remain unproven.
+
+Ordinary-mode inputs also require runtime evidence: upo-shutdown-delay
+(0x6b7e514-0x6b7e5a8), pmu-chargetrap or resolved software-behavior bit 6
+(0x6b7e744-0x6b7e7ec), function-external_shutdown (0x6b7e8cc-0x6b7e8e8),
+mutable RTC alarm state (0x6b87118-0x6b87164) and debug configuration
+(0x6b7c030-0x6b7c0bc). The supplied firmware DeviceTree's software-behavior
+is a syscfg substitution descriptor, not resolved runtime bytes. It cannot
+establish the ordinary-path precondition just because the board is J71b.
+These facts narrow the missing contracts; they do not implement a provider.
+
+Further tracing resolves the ordinary USB distinction: raw-external state is
+computed from reduced source info and requires resolved current greater than
+100, then passes classification/backend-load checks (0x5f16ea0-0x5f17618).
+Default source info without adapter/current events resolves current to zero.
+Cable detection instead follows the selected source's effective status, with
+pending changes held until the maximum contributed debounce-event deadline
+(0x5efc3d0, 0x5efc54c, 0x5efbda8). Thus cable=true and raw=false is valid.
+The missing implementation must supply source selection, current/adapter events,
+deadline ordering and startup validity, not merely another status-register read.
+
+Inspected Linux transport and ownership
+--------------------------------------
+J71b's PMIC is the simple-mfd-i2c apple,i2c-pmic device with a 16-bit-address,
+8-bit-value REGCACHE_NONE regmap. Its MFD has no shutdown/PM method that
+disables or caches the bus. The Apple PASemi platform controller retains its
+devm-enabled reference clock and IRQ and has no shutdown/PM callback. The PMGR
+power-state driver has no shutdown callback; its ordinary runtime/remove
+paths still matter. These source facts support this specific prepare path,
+not every future runtime/unbind configuration.
+
+Both prepare chains execute after device_shutdown and before syscore_shutdown.
+The PMIC I2C client has no own IRQ; disabling its clients does not stop the GPIO
+event thread. The concrete GPIO handoff is therefore required. Tristar shutdown
+stops polling and disables nested charger IRQs while preserving cached online
+state; that does not provide either missing Apple source contract. No MFD,
+I2C, PMGR or charging-limit policy change is part of this integration.
+
+Evidence provenance (facts/algorithm, no proprietary code)
+---------------------------------------------------------
+Exact J71b/iPad7,5 T8010 kernel, iPadOS build 21H461; decompressed kernel SHA256:
+5c0822a78a10191b56edd468f100b331b0e86bcafa3fdcc5d974dadc427dbec9
+
+Addresses below are unslid ARM64 virtual addresses with prefix fffffff0.
+006b826c0-006b82774: initial events, 30-byte policy mask, no-alarm RTC and clears.
+006b827b4-006b8287c: AppleARMPMUPowerSource AppleRawExternalConnected and separate
+IOService resource AppleUSBCableDetect, compared with true.
+006b82890-006b828f4: boot state mask 0x27; ordinary non-standby flag 0x90.
+006b8294c-006b82a68: GPIO helper, logged errors, event acknowledgement,
+0x0400 read/bit0/write, then repeated wait.
+006b8206c-006b82208: GPIO write helper refreshes 36 bytes and overlays even
+configuration bytes before the bulk write and six separate writes.
+006b7c794-006b7c7f0: shutdown caller proceeds to PE_halt_restart(1).
+006b7b6e4: restart wrapper; 006b81048-006b81070: boot-stage property write.
+
+Tests enumerate all 4x4 source property combinations and 256 boot-state bytes,
+all GPIO configuration bytes with asynchronously refreshed pairs, each ordinary
+sequence transaction failure (including partial and complete-before-error commitment), unsupported
+mode rejection, and normal restart error continuation. They test our model,
+not the original executable, kernel lifecycle, bus framing, or physical IRQs.
+
+Adapter tests compile the actual C adapter against a host lifecycle shim.
+They inject failure at every modeled allocation/link/action/handler operation,
+check rollback of pins and handlers, reject unbound/unbinding/locked/missing
+providers and wide-regmap inputs, check shared providers and both source reset
+branches,
+and check quiesce failures and bus-free terminal callbacks. The shim models
+probe cleanup but cannot prove kernel unbind/shutdown races, PMGR/I2C lifetime,
+or actual IRQ ownership. Kernel compilation and integration checks are separate.
+
+test_event_provider.py compiles ten actual GPIO functions against explicit
+host IRQ/work primitives. Deterministic threads pause both pre-read line and
+post-read nested dispatch and verify the handoff waits for drain. Tests cover
+queued/dequeued retries, already-held IRQ, repeated handoff, read-error retry,
+readiness checks and no event read, mask write, requeue or reenable after return.
+Quiesce leaves the IRQ allocated; later normal driver cleanup frees it once.
+This tests the real function bodies and modeled boundaries, not full Linux IRQ
+descriptor/workqueue semantics or electrical behavior.
+
+Runtime-provider tests additionally enumerate all 4^5 combinations of five
+options (unknown, disabled, enabled and malformed), plus negative enum values,
+untouched output and callback errors. Changes after registration are sampled
+at preparation; only five explicit DISABLED values pass. Rejected modes do not
+take event ownership, sample sources, access the adapter regmap or reset in the
+terminal callback. Runtime-provider pin/link rollback, unbinding/locked states,
+shared providers, exact callback-device identity and restart bypass are checked.
+The fixture does not prove a future provider can actually freeze RTC/option
+producers: no such provider or board registration is implemented yet.
+
+IDBus source-provider dependency
+-------------------------------
+The existing Tristar capability poll reads a cached eight-byte 0x75 response;
+it neither submits Dock commands 0x70/0x72 nor receives their matched 0x71/0x73
+responses. A successful cached capability read is not proof of USB route or
+absence of accessory deadlines. The exact firmware has a serialized transport,
+with one active job, expected RX length, timeout/cancel paths, CRC checks and
+asynchronous owner callbacks. A valid 0x73 response populates cached four-byte
+Dock state. A successful 0x71 in normal-handshake state 6, together with hardware
+power-present, installs the configurable deadline (default 300ms). MagicPullDown
+can install a separate epoch-bound two-second deadline before submitting 0x70.
+Transfer failure therefore cannot mean no deadline was installed.
+
+Evidence: 0x5ed7894/0x5ed8a8c (transport jobs), 0x6155f70 (CBTL start),
+0x6155700 (RX/CRC completion), 0x5ed71bc (owner cancellation),
+0x5ef4ba0/0x5ef4c90 (matching 0x73/0x71 state responses), 0x5ef571c
+(MagicPullDown), 0x5ef5b24 (normal handshake). These are behavioral facts from
+the same hashed image, not included proprietary instructions or firmware bytes.
+
+The missing production owner must preserve the full route/capability and cable
+generation, serialize with existing controller operations, reject late callbacks
+after detach, and drain IRQ/timer/owner work before teardown. Initial controller
+mode/routing and role/power policy remain unresolved, so no active IDBus
+transaction, deadline producer or source readiness is enabled by this patch.
+
+Unactivated CBTL transaction core and bounded Dock event producer
+---------------------------------------------------------------
+The default-off reference object now also links apple-cbtl-idbus.c. It has no
+probe, registration, interrupt, workqueue, timer or board caller; enabling the
+Kconfig option alone does not issue IDBus traffic. This is a reusable transport
+state machine, NOT yet the actual Tristar hardware owner. The production wrapper
+must share the existing Tristar register/policy mutex, cached-capability reads,
+mux operations and IRQ processing. It must retain the real source and controller
+lifetimes, supply the hardware prepare/recover operations, dispatch timed events,
+drain every completion consumer and then integrate the source-event reducer.
+Those integrations remain missing. No source snapshot becomes ready here.
+
+The core retains an immutable full six-byte 75 capability payload, both decoded
+routes, orientation, validated mode, owner, Dock command state and generation
+with each queued job. Its fixed eight-record queue admits one active transaction;
+completed records are copied out, not dispatched through unmanaged callback
+pointers. Job and cable identities never wrap. A detach invalidates generation
+before attempting cancellation; late IRQs and deferred source responses cannot
+mutate the new cable. Active cancellation failure retains the active record and
+quarantines the controller. Stop cannot claim drain until active cancellation
+succeeds and every completed record is consumed. A real wrapper must additionally
+join its IRQ, timer, worker and external consumers: these APIs do not do that.
+
+Framing implements 1..64-byte TX/RX, reversed TX, receive count at 60, start at
+61, ordinary mode-nibble-zero verification before the separate start write, and
+the documented alternate RX count. A timer is armed only after successful start.
+Failed starts may have committed and require abort/reset/drain before reuse.
+Read/CRC failures never publish response bytes. The hardware recovery callback
+must perform both abort and the controller reset/stale-IRQ drain; its success
+cannot mean only that the abort register was written. Follow-on symbol resolution establishes IOSleep(500), a 500 ms reset delay.
+Register 05 ownership and physical IRQ drain semantics remain unimplemented;
+this core still delegates recovery rather than issuing an unqualified reset.
+All entry points require the same external serialization. Token checks are NOT
+a substitute for draining hardware status before admitting the next job.
+
+The bounded Dock helper accepts only generation/job/command-matched responses.
+It records a 73 extended response separately from cached 75 identity; 71 in
+states 8/9/10/11 produces the proven pin/power acknowledgement matrix. Cable
+invalidation clears response validity without erasing lifecycle-requested pin
+state. The numeric accessory-power hook preserves mode != 1 request semantics.
+Policy-approved MagicPullDown preparation creates its two-second epoch-bound
+deadline and companion event BEFORE transport submission. A failed submission
+therefore does not remove that event. Matching successful state 6/71 plus an
+explicit validated hardware-power predicate removes the companion and creates
+the configurable persistent deadline. Wrong opcode, read/CRC/transport failure,
+stale generation or mismatched command does not create it. Effective source
+epoch advancement prunes only the older epoch-bound event, not the persistent
+handshake deadline. This helper does not implement complete event reduction,
+source debounce/publication, command selection, special-open lifecycle or the
+power/handshake policy. In particular its result is not either shutdown property.
+
+Additional evidence: source-history timestamp at 5ef218c/5ef2284; accessory
+PowerModeOff=1 and request production at 5e7e4d0/5ef6524; unique special-open
+client membership at 5ed9860/5ed991c; requested/acknowledged pin separation at
+5ef6588/5ef4ef4; three-state handshake property at 5ef2f5c. The same hashed J71b
+image named above is the evidence source. These establish producer contracts,
+not a current cable's live policy values, and do not justify treating unknown
+inputs as disabled or absent. Actual runtime-option providers remain missing.
+
+run.sh now compiles the actual transaction/event core for host testing. Tests
+cover all 16,384 TX/RX length, encoding and verification combinations, invalid
+lengths and ownership, queue exhaustion, immutable request/cable snapshots,
+identifier/time overflow, start/read/verification failure including an error
+after committed start, CRC/IRQ errors, timeout-versus-IRQ order, queued-owner
+cancellation preserving another owner, failed abort retention, stale generations,
+stop/result drain, and the bounded Dock event/response cases. They do not test
+Linux mutex/IRQ/workqueue semantics, real Tristar integration or live hardware.
+
+Review corrections: timeout starts from a monotonic sample taken after the
+successful start write, so synchronous register verification does not consume
+its duration. A successful-completion retire hook must acknowledge/drain old
+hardware status before reuse. Owner registration has a separate nonwrapping
+epoch: cancellation invalidates queued, completed and already-copied results,
+and reopening the same owner identity cannot resurrect them. Consumers must
+check result_current under the shared lock immediately before publication;
+cable-only current is insufficient. Internal drained does not certify external
+work/IRQ/timer consumers have joined. Tests include slow I/O, cancel/reopen after
+completion, post-success stale-status drain, failed recovery on start/IRQ/timeout/
+retire, and fixed independent CRC vectors. The bounded property-state helper
+also preserves unknown/completed/failed results and the distinct inflow-hold
+rules; it still does not implement that property's full event notification path.
+When canceling a transport owner, its consumer first invalidates the exact Dock
+pending token with cbtl_dock_cancel under the shared lock. This retains already
+produced events and acknowledgements while allowing a reopened owner to proceed;
+it does not require an unrelated full cable reset.
+
+Bounded owned USBHost source reducer
+-----------------------------------
+The default-off kernel object now links apple-d2365-source.c to the existing
+Dock event and shutdown cores. It implements a restricted source-policy
+component, not a registered device provider or proof of full Apple parity.
+No hardware caller, board activation, new I/O, or default config is added.
+
+Its caller contract requires one selected ordinary USB source, one owned
+USBHost current-grant producer, the exact initialized D2365 backend with zero
+backoff, and no unsupported current/base/offset/flag/capability events or other
+source classifications. The profile enum asserts a contract the owner must
+actually establish; it does not discover the event universe. In this subset a
+qualified USB=false sample establishes battery classification, while effective
+cable status may remain true under a Dock deadline. Other classifications or
+unresolved producer history must invalidate readiness, never become false.
+
+Binding requires established complete Dock event/deadline history, explicit
+effective and requested states/timestamps, a separate physical event watermark,
+pending
+transition, existing host event/current/sequence, initialized reject latch,
+actual allocated backend current and actual protection deadline. It does not
+invent an empty event set or no pending transition. One host identity is
+supported, not arbitrary multiple grant producers. Production-stamped source
+generation, effective epoch and strictly increasing grant sequence reject late
+or reordered grants. Effective epoch changes prune the old grant; a zero grant
+replaces its contribution without claiming cable detach. Unchanged status
+preserves a nonzero effective epoch and its grant.
+
+The reducer consumes the existing Dock max-deadline state, retains a pending
+status until expiration, and advances the Dock source epoch only with the
+corresponding effective source timestamp. Epoch-bound events are then pruned;
+persistent handshake deadlines survive cable detach. Source history remains
+effective status OR nonzero effective timestamp for an eventual command-policy
+consumer; it is not a raw physical-online replacement.
+
+Raw-external uses current>100 on the sampled ordinary USB classification and
+keeps the proven low-current reject latch sticky. Feedback uses the supplied
+actual allocated current, not host grant, ramp current, measured current or
+PMIC code. Allocated 100..299 may set rejection only after the actual backend
+protection deadline. No synthetic 500 ms timer begins on a host grant. Reset
+is a separate source-epoch-checked explicit operation after the owner actually reset its latches;
+a false sample alone does not claim that happened. Unsupported live current
+values invalidate readiness; stale old-generation callbacks leave new state
+intact.
+
+All source, Dock, grant, backend, timer and publication operations require the
+same external lock. Refresh follows every producer transaction and the next
+returned deadline. Freeze recomputes one coherent terminal snapshot only after
+the owner has excluded and drained all those producers and notifications; it
+does not perform that kernel lifecycle work itself. Snapshot refuses live,
+uninitialized or invalidated state and leaves both properties UNRESOLVED on
+failure. The frozen values directly match the shutdown core source interface.
+Source invalidation after freeze still revokes the snapshot.
+
+Tests execute the production C reducer and existing Dock/core together. They
+cover 123,201 grant/allocated-current pairs, initial pending state, prolonged
+and canceled debounce, zero-current grants, source epoch expiration, reordered
+and stale callbacks, current/protection boundaries, sticky rejection/reset,
+unsupported-input invalidation, generation exhaustion and terminal freeze.
+An end-to-end fake-transport test feeds these actual source snapshots into the
+actual shutdown core for reset, standby and unresolved outcomes. This verifies
+software policy only, not producer completeness, Linux callback lifetime,
+physical transport, charging control or electrical shutdown.
+
+Evidence is the same hashed J71b image documented above: source state/debounce
+5efc3d0/5efbda8, USBHost grant/reducer 5ed311c/5e6790c, raw USB calculation
+5f1706c and backend feedback 5f115a4/5f117a8. No proprietary source is copied.
+Remaining production gates are the real shared Tristar register/IRQ/work owner,
+complete accessory command policy and backend ownership, terminal runtime-option
+provider, board integration and kernel/hardware qualification. The live USB
+producer below now supplies one part of the remaining production contract.
+
+Live typed gadget / DWC2 / Tristar current producer
+------------------------------------------------
+The experimental option now connects actual USB current producers to Tristar's
+source owner. The normal default remains off. It does not register a shutdown
+provider, start IDBus traffic, change legacy current values, or prove the Apple
+source profile's complete producer history. A hardware image must not enable
+the option until the new controller path has been qualified.
+
+Composite gadget events retain RESET, CONFIGURED, UNCONFIGURED, SUSPEND,
+RESUME, DISCONNECT, VENDOR or UNKNOWN reasons. Apple extra-current adjusted
+values remain VENDOR even at a later configuration or resume. The generic
+gadget API falls back to the original scalar operation for existing drivers;
+DWC2 still executes its original scalar charger path unchanged. The typed
+stream is independent and never infers reason or epoch from the scalar value.
+
+Tristar requests a globally unique session before releasing a held USB device
+role. DWC2 installs it before data activation but emits no grant until an actual
+bus reset, including a reset before SET_ADDRESS. It clears old reset IRQ bits
+only with the controller powered, enabled and held. For cable-at-boot before
+UDC enable, the token remains unarmed until the existing core-init reset clears
+its interrupt state; no MMIO is added while the controller is disabled. A reset
+handler captures the token before callbacks can drop its lock, so a rebind
+cannot relabel an already observed reset. Software reinitialization withdraws
+the active grant and waits for another hardware reset.
+
+Each producer event carries immutable session and sequence IDs through an
+ordered bounded FIFO, instead of the legacy work item's coalesced mA scalar.
+FIFO overflow, delivery failure or sequence exhaustion creates an out-of-band
+LOST record and a sticky loss latch until a new owned session. The sink uses a
+separate ordered FIFO and rejects missing/stale sessions, sequence gaps and a
+first event other than RESET. Teardown can deliver loss even for a pending
+session, closes admission and drains its worker outside source-policy locks.
+
+The optional power-supply callback retains the parent device and takes its
+device lock before checking binding/removal and touching the owner callback.
+This excludes old supply references from calling freed driver state. The
+Tristar sink serializes with the source mutex to allow an early RESET delivery
+to wait until the initiating role handoff publishes its session. PMU source
+events invalidate identity immediately, including during a sleepable handoff.
+Failed/transitional source reads, suspend and removal also revoke identity.
+An already enabled same-cable role is not forcibly restarted just to recover
+missing history; it remains unready until a genuine owned transition.
+
+apple_tristar_take_usb_current() exports the source owner's event queue under
+device-unbind exclusion. Its session is an opaque USB lifetime token, NOT the
+Apple effective source epoch. A future provider must map production to the
+actual source transaction under common serialization, preserve Dock/backend
+history, and exclude/drain all producers at terminal freeze. Copying a record
+or observing no queued work does not prove any of those contracts. The
+collector deliberately does not map unsupported VENDOR/UNKNOWN events, lost
+history or missing sessions to ordinary USB or absent external power.
+
+run.sh also executes test_current_api.py and test_usb_stream.py. They compile
+the actual changed API, role, DWC2 producer and Tristar sink functions against
+instrumented host primitives. Coverage includes all 327,680 signed Apple
+extra-current comparisons against legacy values, 8,000 concurrent unique
+sessions, callback and disabled-stub semantics, retained-parent lifetime,
+stale reset/rebind, pre-UDC startup, ordered reasons, producer/sink FIFO loss,
+sequence overflow, failed delivery, pending-session stop, PMU events during
+handoff and an early worker blocked until source publication. These are
+software/lifecycle boundary tests, not Linux lockdep or hardware evidence.

@@ -225,6 +225,50 @@ static int dwc2_drd_role_sw_set(struct usb_role_switch *sw, enum usb_role role)
 	return ret;
 }
 
+/* An opaque current session belongs to the source owner, not userspace's
+ * role selection. Only the held peripheral role supports this contract.
+ */
+static int dwc2_drd_role_sw_set_current(struct usb_role_switch *sw,
+				      enum usb_role role, u64 session)
+{
+	struct dwc2_hsotg *hsotg = usb_role_switch_get_drvdata(sw);
+	unsigned long flags;
+	int ret;
+
+	mutex_lock(&hsotg->role_sw_lock);
+	hsotg->role_sw_driven = true;
+	if (session && (!dwc2_drd_soft_role(hsotg) || role != USB_ROLE_DEVICE)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	spin_lock_irqsave(&hsotg->lock, flags);
+	if (session && (!hsotg->role_sw_hold || hsotg->in_ppd ||
+			hsotg->hibernated || hsotg->bus_suspended ||
+			(dwc2_is_device_enabled(hsotg) && !hsotg->ll_hw_enabled))) {
+		ret = -EBUSY;
+	} else {
+		ret = dwc2_current_bind(hsotg, session);
+		if (!ret && session && hsotg->ll_hw_enabled &&
+		    dwc2_is_device_enabled(hsotg)) {
+			/* These are the same write-one-to-clear reset bits owned by
+			 * the gadget IRQ. An old pending IRQ cannot activate this token.
+			 */
+			dwc2_writel(hsotg, GINTSTS_USBRST | GINTSTS_RESETDET, GINTSTS);
+		}
+	}
+	spin_unlock_irqrestore(&hsotg->lock, flags);
+	if (!ret)
+		ret = dwc2_drd_set_role(hsotg, role);
+	if (ret && session) {
+		spin_lock_irqsave(&hsotg->lock, flags);
+		dwc2_current_bind(hsotg, 0);
+		spin_unlock_irqrestore(&hsotg->lock, flags);
+	}
+out:
+	mutex_unlock(&hsotg->role_sw_lock);
+	return ret;
+}
+
 static void dwc2_drd_role_sw_fallback(struct work_struct *work)
 {
 	struct dwc2_hsotg *hsotg = container_of(to_delayed_work(work),
@@ -255,6 +299,8 @@ int dwc2_drd_init(struct dwc2_hsotg *hsotg)
 	role_sw_desc.driver_data = hsotg;
 	role_sw_desc.fwnode = dev_fwnode(hsotg->dev);
 	role_sw_desc.set = dwc2_drd_role_sw_set;
+	if (IS_ENABLED(CONFIG_POWER_RESET_APPLE_D2365_REFERENCE))
+		role_sw_desc.set_with_current_session = dwc2_drd_role_sw_set_current;
 	role_sw_desc.allow_userspace_control = true;
 
 	role_sw = usb_role_switch_register(hsotg->dev, &role_sw_desc);

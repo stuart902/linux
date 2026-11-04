@@ -956,12 +956,15 @@ static void reset_config(struct usb_composite_dev *cdev)
 #define USB_APPLE_VENDOR_ID		0x05ac
 #define USB_APPLE_REQ_CURRENT_LIMIT	0x40
 
-static void composite_vbus_draw(struct usb_composite_dev *cdev, unsigned int mA)
+static void composite_vbus_draw(struct usb_composite_dev *cdev, unsigned int mA,
+				enum usb_current_reason reason)
 {
 	cdev->vbus_draw_ma = mA;
-	if (mA && cdev->apple_extra_ma)
+	if (mA && cdev->apple_extra_ma) {
 		mA = max(500 + cdev->apple_extra_ma, 0);
-	usb_gadget_vbus_draw(cdev->gadget, mA);
+		reason = USB_CURRENT_VENDOR;
+	}
+	usb_gadget_vbus_draw_reason(cdev->gadget, mA, reason);
 }
 
 static int composite_apple_current_limit(struct usb_composite_dev *cdev,
@@ -970,7 +973,7 @@ static int composite_apple_current_limit(struct usb_composite_dev *cdev,
 	cdev->apple_extra_ma = (s16)w_index;
 	DBG(cdev, "Apple host current grant: extra %d mA, suspend %d mA\n",
 	    (s16)w_index, (s16)w_value);
-	composite_vbus_draw(cdev, cdev->vbus_draw_ma);
+	composite_vbus_draw(cdev, cdev->vbus_draw_ma, USB_CURRENT_VENDOR);
 	return 0;
 }
 
@@ -1086,7 +1089,9 @@ done:
 	else
 		usb_gadget_set_selfpowered(gadget);
 
-	composite_vbus_draw(cdev, power);
+	composite_vbus_draw(cdev, power, result < 0 ? USB_CURRENT_UNKNOWN :
+			    number ? USB_CURRENT_CONFIGURED :
+			    USB_CURRENT_UNCONFIGURED);
 	if (result >= 0 && cdev->delayed_status)
 		result = USB_GADGET_DELAYED_STATUS;
 	return result;
@@ -2346,7 +2351,7 @@ void composite_disconnect(struct usb_gadget *gadget)
 	struct usb_composite_dev *cdev = get_gadget_data(gadget);
 
 	cdev->apple_extra_ma = 0;
-	composite_vbus_draw(cdev, 0);
+	composite_vbus_draw(cdev, 0, USB_CURRENT_DISCONNECT);
 	__composite_disconnect(gadget);
 }
 
@@ -2360,7 +2365,7 @@ void composite_reset(struct usb_gadget *gadget)
 	 * draw at max 100mA while in a connected, but unconfigured state.
 	 */
 	cdev->apple_extra_ma = 0;
-	composite_vbus_draw(cdev, 100);
+	composite_vbus_draw(cdev, 100, USB_CURRENT_RESET);
 	__composite_disconnect(gadget);
 }
 
@@ -2650,7 +2655,7 @@ void composite_suspend(struct usb_gadget *gadget)
 
 	/* A grant applies to the active bus; resuming needs a new one. */
 	cdev->apple_extra_ma = 0;
-	composite_vbus_draw(cdev, 2);
+	composite_vbus_draw(cdev, 2, USB_CURRENT_SUSPEND);
 }
 
 void composite_resume(struct usb_gadget *gadget)
@@ -2689,11 +2694,11 @@ void composite_resume(struct usb_gadget *gadget)
 		else
 			usb_gadget_set_selfpowered(gadget);
 
-		composite_vbus_draw(cdev, maxpower);
+		composite_vbus_draw(cdev, maxpower, USB_CURRENT_RESUME);
 	} else {
 		maxpower = CONFIG_USB_GADGET_VBUS_DRAW;
 		maxpower = min(maxpower, 100U);
-		composite_vbus_draw(cdev, maxpower);
+		composite_vbus_draw(cdev, maxpower, USB_CURRENT_RESUME);
 	}
 
 	cdev->suspended = 0;

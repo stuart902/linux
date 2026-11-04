@@ -7,10 +7,12 @@
  *         Hans de Goede <hdegoede@redhat.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/component.h>
 #include <linux/usb/role.h>
 #include <linux/property.h>
 #include <linux/device.h>
+#include <linux/limits.h>
 #include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -33,6 +35,7 @@ struct usb_role_switch {
 	struct device *usb3_port;
 	struct device *udc;
 	usb_role_switch_set_t set;
+	usb_role_switch_set_current_session_t set_with_current_session;
 	usb_role_switch_get_t get;
 	bool allow_userspace_control;
 };
@@ -79,22 +82,96 @@ int usb_role_switch_set_role(struct usb_role_switch *sw, enum usb_role role)
 	if (IS_ERR_OR_NULL(sw))
 		return 0;
 
-	if (!sw->registered)
-		return -EOPNOTSUPP;
-
 	mutex_lock(&sw->lock);
 
-	ret = sw->set(sw, role);
+	if (!sw->registered) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	if (sw->set_with_current_session)
+		ret = sw->set_with_current_session(sw, role, 0);
+	else
+		ret = sw->set(sw, role);
 	if (!ret) {
 		sw->role = role;
 		kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
 	}
 
+out:
 	mutex_unlock(&sw->lock);
 
 	return ret;
 }
 EXPORT_SYMBOL_GPL(usb_role_switch_set_role);
+
+/* Shared by all switches so removing and probing a controller cannot reuse it. */
+static atomic64_t usb_current_session = ATOMIC64_INIT(0);
+
+static int usb_role_switch_next_current_session(u64 *session)
+{
+	s64 old, next;
+
+	do {
+		old = atomic64_read(&usb_current_session);
+		if (old == S64_MAX)
+			return -EOVERFLOW;
+		next = old + 1;
+	} while (atomic64_cmpxchg(&usb_current_session, old, next) != old);
+
+	*session = next;
+	return 0;
+}
+
+/**
+ * usb_role_switch_set_role_with_current_session - Start a tracked device role
+ * @sw: USB role switch
+ * @session: Receives the assigned token on success, zero on failure
+ *
+ * Request USB_ROLE_DEVICE with a globally unique, nonzero current-report
+ * session. The switch callback must install the token at the producer before
+ * enabling the device role. Queued event delivery must not assign the token.
+ * Failed requests consume their token, so it can never be reused. Allocation
+ * fails rather than wrapping after S64_MAX sessions.
+ *
+ * Returns zero on success, -EOPNOTSUPP if the switch cannot establish a
+ * session, or another negative errno. The caller must hold a switch reference.
+ */
+int usb_role_switch_set_role_with_current_session(struct usb_role_switch *sw,
+						  u64 *session)
+{
+	u64 token;
+	int ret;
+
+	if (!session)
+		return -EINVAL;
+	*session = 0;
+
+	if (IS_ERR_OR_NULL(sw))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&sw->lock);
+	if (!sw->registered || !sw->set_with_current_session) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	ret = usb_role_switch_next_current_session(&token);
+	if (ret)
+		goto out;
+
+	ret = sw->set_with_current_session(sw, USB_ROLE_DEVICE, token);
+	if (!ret) {
+		sw->role = USB_ROLE_DEVICE;
+		*session = token;
+		kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
+	}
+
+out:
+	mutex_unlock(&sw->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usb_role_switch_set_role_with_current_session);
 
 /**
  * usb_role_switch_get_role - Get the USB role for a switch
@@ -366,7 +443,7 @@ usb_role_switch_register(struct device *parent,
 	struct usb_role_switch *sw;
 	int ret;
 
-	if (!desc || !desc->set)
+	if (!desc || (!desc->set && !desc->set_with_current_session))
 		return ERR_PTR(-EINVAL);
 
 	sw = kzalloc_obj(*sw);
@@ -381,6 +458,7 @@ usb_role_switch_register(struct device *parent,
 	sw->usb3_port = desc->usb3_port;
 	sw->udc = desc->udc;
 	sw->set = desc->set;
+	sw->set_with_current_session = desc->set_with_current_session;
 	sw->get = desc->get;
 
 	sw->module = parent->driver->owner;
@@ -423,7 +501,9 @@ void usb_role_switch_unregister(struct usb_role_switch *sw)
 {
 	if (IS_ERR_OR_NULL(sw))
 		return;
+	mutex_lock(&sw->lock);
 	sw->registered = false;
+	mutex_unlock(&sw->lock);
 	if (dev_fwnode(&sw->dev))
 		component_del(&sw->dev, &connector_ops);
 	device_unregister(&sw->dev);

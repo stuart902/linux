@@ -43,3 +43,6 @@ obj-$(CONFIG_POWER_RESET_SC27XX) += sc27xx-poweroff.o
 obj-$(CONFIG_NVMEM_REBOOT_MODE) += nvmem-reboot-mode.o
 obj-$(CONFIG_POWER_MLXBF) += pwr-mlxbf.o
 obj-$(CONFIG_POWER_RESET_QEMU_VIRT_CTRL) += qemu-virt-ctrl.o
+
+obj-$(CONFIG_POWER_RESET_APPLE_D2365_REFERENCE) += apple-d2365-reference.o
+apple-d2365-reference-y := apple-d2365-reference-core.o apple-d2365-reference-adapter.o apple-cbtl-idbus.o apple-d2365-source.o

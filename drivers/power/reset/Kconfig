@@ -376,4 +376,19 @@ config POWER_RESET_QEMU_VIRT_CTRL
 	  Say Y here if you are running Linux on a QEMU virtual machine that
 	  provides this controller, such as the m68k virt machine.
 
+config POWER_RESET_APPLE_D2365_REFERENCE
+	bool "Experimental unwired J71b Apple-derived power adapter"
+	depends on ARM64 && REGMAP
+	depends on GPIO_APPLE_D2365=y
+	default n
+	help
+	  Separate Apple-derived ordinary shutdown/restart core and Linux
+	  resource adapter with the D2365 GPIO event-owner handoff and an
+	  unactivated CBTL transaction core and bounded USBHost source reducer.
+	  Also enables the experimental source-owned USB current event stream
+	  through the gadget, DWC2 and Tristar drivers. No shutdown source
+	  provider or board registers the adapter.
+	  This is not ready for hardware use: exact J71b source semantics and
+	  provider teardown contracts remain unverified. Say N.
+
 endif

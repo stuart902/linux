@@ -16,6 +16,9 @@ enum usb_role {
 typedef int (*usb_role_switch_set_t)(struct usb_role_switch *sw,
 				     enum usb_role role);
 typedef enum usb_role (*usb_role_switch_get_t)(struct usb_role_switch *sw);
+typedef int (*usb_role_switch_set_current_session_t)(struct usb_role_switch *sw,
+						   enum usb_role role,
+						   u64 session);
 
 /**
  * struct usb_role_switch_desc - USB Role Switch Descriptor
@@ -23,7 +26,11 @@ typedef enum usb_role (*usb_role_switch_get_t)(struct usb_role_switch *sw);
  * @usb2_port: Optional reference to the host controller port device (USB2)
  * @usb3_port: Optional reference to the host controller port device (USB3)
  * @udc: Optional reference to the peripheral controller device
- * @set: Callback for setting the role
+ * @set: Callback for setting the role (optional if set_with_current_session is set)
+ * @set_with_current_session: Optional role callback receiving a current-report
+ *	session token. Zero means a legacy role request without a session.
+ *	A nonzero token must be installed before enabling the device role and
+ *	only activated when the controller observes a USB bus reset.
  * @get: Callback for getting the role (optional)
  * @allow_userspace_control: If true userspace may change the role through sysfs
  * @driver_data: Private data pointer
@@ -41,6 +48,7 @@ struct usb_role_switch_desc {
 	struct device *usb3_port;
 	struct device *udc;
 	usb_role_switch_set_t set;
+	usb_role_switch_set_current_session_t set_with_current_session;
 	usb_role_switch_get_t get;
 	bool allow_userspace_control;
 	void *driver_data;
@@ -50,6 +58,8 @@ struct usb_role_switch_desc {
 
 #if IS_ENABLED(CONFIG_USB_ROLE_SWITCH)
 int usb_role_switch_set_role(struct usb_role_switch *sw, enum usb_role role);
+int usb_role_switch_set_role_with_current_session(struct usb_role_switch *sw,
+						  u64 *session);
 enum usb_role usb_role_switch_get_role(struct usb_role_switch *sw);
 struct usb_role_switch *usb_role_switch_get(struct device *dev);
 struct usb_role_switch *fwnode_usb_role_switch_get(struct fwnode_handle *node);
@@ -71,6 +81,15 @@ static inline int usb_role_switch_set_role(struct usb_role_switch *sw,
 		enum usb_role role)
 {
 	return 0;
+}
+
+static inline int
+usb_role_switch_set_role_with_current_session(struct usb_role_switch *sw,
+					     u64 *session)
+{
+	if (session)
+		*session = 0;
+	return -EOPNOTSUPP;
 }
 
 static inline enum usb_role usb_role_switch_get_role(struct usb_role_switch *sw)

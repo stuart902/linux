@@ -19,6 +19,7 @@
 #include <linux/notifier.h>
 #include <linux/err.h>
 #include <linux/power_supply.h>
+#include <linux/usb/current.h>
 #include <linux/property.h>
 #include <linux/thermal.h>
 #include <linux/fixp-arith.h>
@@ -1484,6 +1485,49 @@ int power_supply_set_property(struct power_supply *psy, enum power_supply_proper
 EXPORT_SYMBOL_GPL(power_supply_set_property);
 
 /**
+ * power_supply_submit_usb_current - Submit a typed USB current report
+ * @psy: The power supply receiving the report
+ * @event: Immutable report captured by the USB current producer
+ *
+ * The caller must hold a power supply reference and provide a nonzero session
+ * and sequence. The callback consumes the report synchronously; it must copy
+ * the event if it needs to retain it. This API does not expose event identity
+ * through writable scalar power supply properties. The parent's device lock
+ * excludes driver unbind while the callback accesses its owner's state.
+ * Supplies using this callback must register and unregister under that lock,
+ * as happens in normal driver probe and remove paths.
+ *
+ * Context: Can sleep. The caller must not hold the parent's device lock, and
+ * the callback must not acquire it.
+ * Return: 0 on success or negative error code on failure.
+ */
+int power_supply_submit_usb_current(struct power_supply *psy,
+				    const struct usb_current_event *event)
+{
+	struct device *parent = psy->usb_current_parent;
+	int ret = -ENODEV;
+
+	if (!event || !event->session || !event->sequence ||
+	    event->reason < USB_CURRENT_UNKNOWN || event->reason > USB_CURRENT_LOST)
+		return -EINVAL;
+
+	if (!parent)
+		return -ENODEV;
+
+	device_lock(parent);
+	if (atomic_read(&psy->use_cnt) <= 0 || READ_ONCE(psy->removing) ||
+	    !device_is_bound(parent) || parent->links.status != DL_DEV_DRIVER_BOUND)
+		goto out;
+
+	if (psy->desc->usb_current_event)
+		ret = psy->desc->usb_current_event(psy, event);
+out:
+	device_unlock(parent);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(power_supply_submit_usb_current);
+
+/**
  * power_supply_set_property_direct - Write a power supply property without checking for extensions
  * @psy: The power supply
  * @psp: The power supply property to write
@@ -1627,6 +1671,7 @@ static void power_supply_dev_release(struct device *dev)
 	struct power_supply *psy = to_power_supply(dev);
 
 	dev_dbg(dev, "%s\n", __func__);
+	put_device(psy->usb_current_parent);
 	kfree(psy);
 }
 
@@ -1740,6 +1785,8 @@ __power_supply_register(struct device *parent,
 	dev->release = power_supply_dev_release;
 	dev_set_drvdata(dev, psy);
 	psy->desc = desc;
+	if (desc->usb_current_event)
+		psy->usb_current_parent = get_device(parent);
 	if (cfg) {
 		device_set_node(dev, cfg->fwnode);
 		dev->groups = cfg->attr_grp;

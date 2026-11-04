@@ -48,6 +48,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/power_supply.h>
+#include <linux/power/apple-tristar-current.h>
+#include <linux/usb/current-stream.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/string.h>
@@ -129,6 +131,17 @@ struct tristar_charger {
 	/* Serializes policy state and PMIC/Tristar sequences. */
 	struct mutex lock;
 
+	/* Passive, typed UDC stream. This is NOT the Apple source reducer.
+	 * PMU invalidation cannot take the policy mutex (ADC waits hold it), so
+	 * session admission and queue state use their own IRQ-safe lock.
+	 */
+	spinlock_t current_lock;
+	struct usb_current_queue current_queue;
+	u64 current_session;
+	u64 current_sequence;
+	unsigned int current_source_events;
+	bool current_stopped;
+
 	/*
 	 * Event attribution: a new epoch invalidates measurements and grants.
 	 * Written only by the event handlers, which the PMIC event controller
@@ -166,6 +179,95 @@ struct tristar_charger {
 	u64 guard_ns;
 	unsigned int epoch_seen;
 };
+
+static struct platform_driver tristar_driver;
+
+static void tristar_current_invalidate(struct tristar_charger *chg, bool stop)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&chg->current_lock, flags);
+	chg->current_session = 0;
+	chg->current_sequence = 0;
+	chg->current_stopped |= stop;
+	usb_current_queue_init(&chg->current_queue);
+	spin_unlock_irqrestore(&chg->current_lock, flags);
+}
+
+static int tristar_usb_current_event(struct power_supply *psy,
+				     const struct usb_current_event *event)
+{
+	struct tristar_charger *chg = power_supply_get_drvdata(psy);
+	unsigned long flags;
+	int ret = 0;
+
+	/* The role caller holds lock through publication of its returned token. */
+	mutex_lock(&chg->lock);
+	spin_lock_irqsave(&chg->current_lock, flags);
+	if (chg->current_stopped) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
+	if (!chg->current_session || event->session != chg->current_session) {
+		ret = -ESTALE;
+		goto out;
+	}
+	if (chg->current_queue.lost)
+		goto out;
+	/* The producer begins only at a real USB reset, never a role write.
+	 * Missing or reordered delivery invalidates the whole captured history.
+	 */
+	if (event->reason == USB_CURRENT_LOST ||
+	    chg->current_sequence == U64_MAX ||
+	    event->sequence != chg->current_sequence + 1 ||
+	    (!chg->current_sequence && event->reason != USB_CURRENT_RESET)) {
+		usb_current_queue_lose(&chg->current_queue, event);
+		goto out;
+	}
+	chg->current_sequence = event->sequence;
+	usb_current_queue_push(&chg->current_queue, event);
+out:
+	spin_unlock_irqrestore(&chg->current_lock, flags);
+	mutex_unlock(&chg->lock);
+	return ret;
+}
+
+int apple_tristar_take_usb_current(struct device *dev, u64 *session,
+				  struct usb_current_event *event)
+{
+	struct tristar_charger *chg;
+	unsigned long flags;
+	int ret;
+
+	if (!dev || !session || !event)
+		return -EINVAL;
+	*session = 0;
+	memset(event, 0, sizeof(*event));
+	/* Avoid recursive acquisition if an ancestor is still probing. */
+	if (!device_trylock(dev))
+		return -EBUSY;
+	if (!device_is_bound(dev) || dev->driver != &tristar_driver.driver ||
+	    dev->links.status != DL_DEV_DRIVER_BOUND) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	chg = dev_get_drvdata(dev);
+	spin_lock_irqsave(&chg->current_lock, flags);
+	if (chg->current_stopped || !chg->current_session) {
+		ret = -ENODATA;
+	} else {
+		*session = chg->current_session;
+		if (usb_current_queue_take(&chg->current_queue, event))
+			ret = 1;
+		else
+			ret = chg->current_queue.lost ? -EPIPE : 0;
+	}
+	spin_unlock_irqrestore(&chg->current_lock, flags);
+unlock:
+	device_unlock(dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_tristar_take_usb_current);
 
 static unsigned int tristar_code_ma(unsigned int code)
 {
@@ -651,8 +753,36 @@ static unsigned int tristar_usb_ma(struct tristar_charger *chg)
  */
 static void tristar_set_usb(struct tristar_charger *chg, bool on)
 {
-	int ret = usb_role_switch_set_role(chg->role_sw,
-					   on ? USB_ROLE_DEVICE : USB_ROLE_NONE);
+	unsigned long flags;
+	unsigned int epoch;
+	bool can_track;
+	u64 session = 0;
+	int ret;
+
+	spin_lock_irqsave(&chg->current_lock, flags);
+	epoch = READ_ONCE(chg->epoch);
+	can_track = !chg->current_source_events;
+	chg->current_session = 0;
+	chg->current_sequence = 0;
+	usb_current_queue_init(&chg->current_queue);
+	spin_unlock_irqrestore(&chg->current_lock, flags);
+	if (IS_ENABLED(CONFIG_POWER_RESET_APPLE_D2365_REFERENCE) &&
+	    on && !chg->usb_on && !chg->stopping && can_track) {
+		ret = usb_role_switch_set_role_with_current_session(chg->role_sw, &session);
+		if (!ret) {
+			/* A PMU event during the sleepable role operation wins. */
+			spin_lock_irqsave(&chg->current_lock, flags);
+			if (!chg->current_stopped && !chg->current_source_events &&
+			    epoch == READ_ONCE(chg->epoch))
+				chg->current_session = session;
+			spin_unlock_irqrestore(&chg->current_lock, flags);
+		}
+	} else {
+		ret = -EOPNOTSUPP;
+	}
+	if (ret)
+		ret = usb_role_switch_set_role(chg->role_sw,
+					      on ? USB_ROLE_DEVICE : USB_ROLE_NONE);
 
 	if (ret)
 		dev_err(chg->dev, "cannot turn USB data %s (%d)\n", on ? "on" : "off", ret);
@@ -902,6 +1032,7 @@ static void tristar_poll(struct work_struct *work)
 	old_code = chg->code;
 	old_online = chg->online;
 	if (regmap_read(chg->regmap, chg->status_base + TRISTAR_CHG_STATUS, &status)) {
+		tristar_current_invalidate(chg, false);
 		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
 		dev_err_ratelimited(chg->dev, "PMIC status unreadable; holding the fallback\n");
 		goto again;
@@ -923,6 +1054,7 @@ static void tristar_poll(struct work_struct *work)
 		goto again;
 	}
 	if (status != TRISTAR_CHG_STATUS_ONLINE) {
+		tristar_current_invalidate(chg, false);
 		/* Transitional input state (e.g. 0x40 while attaching): no grant. */
 		if (chg->code > TRISTAR_CHG_FALLBACK_CODE)
 			tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
@@ -1034,9 +1166,19 @@ static void tristar_source_event(struct tristar_charger *chg)
 	u32 reg = chg->control_base + TRISTAR_CHG_INPUT_LIMIT;
 	unsigned int i;
 	u64 now;
+	unsigned long flags;
 
+	/* Invalidate before sleepable I/O, including a role handoff in flight. */
+	spin_lock_irqsave(&chg->current_lock, flags);
+	chg->current_session = 0;
+	chg->current_source_events++;
+	spin_unlock_irqrestore(&chg->current_lock, flags);
 	tristar_event_withdraw(chg);
+	/* Preserve the legacy epoch boundary after the withdrawal write. */
+	spin_lock_irqsave(&chg->current_lock, flags);
 	WRITE_ONCE(chg->epoch, chg->epoch + 1);
+	chg->current_source_events--;
+	spin_unlock_irqrestore(&chg->current_lock, flags);
 	mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
 
 	now = ktime_get_ns();
@@ -1171,6 +1313,7 @@ static const struct power_supply_desc tristar_desc = {
 	.num_properties = ARRAY_SIZE(tristar_properties),
 	.get_property = tristar_get_property,
 	.set_property = tristar_set_property,
+	.usb_current_event = tristar_usb_current_event,
 };
 
 /* ---- Probe ---- */
@@ -1210,6 +1353,7 @@ static void tristar_stop(struct tristar_charger *chg, const char *reason)
 
 	mutex_lock(&chg->lock);
 	chg->stopping = true;
+	tristar_current_invalidate(chg, true);
 	mutex_unlock(&chg->lock);
 	for (i = 0; i < chg->nirqs; i++)
 		disable_irq(chg->irqs[i]);
@@ -1241,6 +1385,8 @@ static int tristar_probe(struct platform_device *pdev)
 	if (!chg)
 		return -ENOMEM;
 	chg->dev = dev;
+	spin_lock_init(&chg->current_lock);
+	usb_current_queue_init(&chg->current_queue);
 	chg->regmap = dev_get_regmap(dev->parent, NULL);
 	if (!chg->regmap)
 		return dev_err_probe(dev, -ENODEV, "parent regmap unavailable\n");
@@ -1363,6 +1509,7 @@ static int tristar_suspend(struct device *dev)
 
 	mutex_lock(&chg->lock);
 	chg->stopping = true;
+	tristar_current_invalidate(chg, false);
 	chg->present = false;
 	chg->phase = TRISTAR_EMPTY;
 	ret = tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE);

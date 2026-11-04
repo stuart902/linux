@@ -17,6 +17,7 @@
 #include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/gpio/driver.h>
+#include <linux/gpio/apple-d2365.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
@@ -124,6 +125,7 @@ struct apple_pmic_gpio {
 	bool suspended;
 	bool irq_held;
 	bool removing;
+	bool shutting_down;
 };
 
 static unsigned int d2207_gpio_config_reg(unsigned int offset)
@@ -194,6 +196,11 @@ static void apple_pmic_irq_bus_sync_unlock(struct irq_data *data)
 	int ret;
 
 	gpio->wake_delta = 0;
+	/* Power-off preparation owns the PMIC masks after shutdown. */
+	if (gpio->shutting_down) {
+		mutex_unlock(&gpio->irq_lock);
+		return;
+	}
 	/* No bus access between our suspend and resume callbacks. */
 	if (!gpio->suspended) {
 		ret = apple_pmic_event_sync(gpio, gpio->enabled);
@@ -299,7 +306,7 @@ static void apple_pmic_irq_hold(struct apple_pmic_gpio *gpio, bool retry)
 		disable_irq_nosync(gpio->parent_irq);
 		gpio->irq_held = true;
 	}
-	if (!retry)
+	if (!retry || gpio->shutting_down)
 		return;
 	if (gpio->retries < APPLE_PMIC_IRQ_RETRIES) {
 		gpio->retries++;
@@ -318,7 +325,8 @@ static void apple_pmic_irq_retry(struct work_struct *work)
 						    irq_retry);
 
 	mutex_lock(&gpio->irq_lock);
-	if (!gpio->suspended && !gpio->removing && gpio->irq_held) {
+	if (!gpio->suspended && !gpio->removing && !gpio->shutting_down &&
+	    gpio->irq_held) {
 		gpio->irq_held = false;
 		enable_irq(gpio->parent_irq);
 	}
@@ -328,7 +336,7 @@ static void apple_pmic_irq_retry(struct work_struct *work)
 /* May the event thread use the bus? Caller holds irq_lock. */
 static bool apple_pmic_event_gate(struct apple_pmic_gpio *gpio)
 {
-	if (gpio->removing)
+	if (gpio->removing || gpio->shutting_down)
 		return false;
 	if (gpio->suspended) {
 		/*
@@ -534,6 +542,39 @@ static int apple_pmic_event_probe(struct platform_device *pdev,
 				     "failed to request the PMU interrupt\n");
 	return devm_add_action_or_reset(dev, apple_pmic_event_stop, gpio);
 }
+
+static struct platform_driver d2365_gpio_driver;
+
+bool apple_d2365_gpio_events_ready(struct device *dev)
+{
+	struct apple_pmic_gpio *gpio;
+
+	if (dev->driver != &d2365_gpio_driver.driver)
+		return false;
+	gpio = dev_get_drvdata(dev);
+	return gpio && gpio->domain;
+}
+EXPORT_SYMBOL_GPL(apple_d2365_gpio_events_ready);
+
+void apple_d2365_gpio_quiesce(struct device *dev)
+{
+	struct apple_pmic_gpio *gpio = dev_get_drvdata(dev);
+
+	if (!gpio->domain)
+		return;
+
+	/* Stop new reads and mask updates before the power-off handler runs. */
+	mutex_lock(&gpio->irq_lock);
+	gpio->shutting_down = true;
+	apple_pmic_irq_hold(gpio, false);
+	mutex_unlock(&gpio->irq_lock);
+
+	/* Drain any thread which passed the gate before closing it. */
+	synchronize_irq(gpio->parent_irq);
+	cancel_delayed_work_sync(&gpio->irq_retry);
+	/* Keep the IRQ allocated: devres still owns its eventual free_irq(). */
+}
+EXPORT_SYMBOL_GPL(apple_d2365_gpio_quiesce);
 
 static int apple_pmic_gpio_suspend(struct device *dev)
 {

@@ -8,6 +8,7 @@
 #ifndef __DWC2_CORE_H__
 #define __DWC2_CORE_H__
 
+#include <linux/usb/current-stream.h>
 #include <linux/acpi.h>
 #include <linux/device-id/pci.h>
 #include <linux/phy/phy.h>
@@ -1242,8 +1243,27 @@ struct dwc2_hsotg {
 	const char *usb_psy_name;
 	struct work_struct vbus_draw_work;
 	unsigned int vbus_draw_ma;
+	spinlock_t current_lock;
+	struct work_struct current_work;
+	struct usb_current_queue current_queue;
+	u64 current_pending;
+	u64 current_active;
+	u64 current_sequence;
+	bool current_stopped;
+	bool current_armed;
 #endif /* CONFIG_USB_DWC2_PERIPHERAL || CONFIG_USB_DWC2_DUAL_ROLE */
 };
+
+#if IS_ENABLED(CONFIG_USB_DWC2_PERIPHERAL) || IS_ENABLED(CONFIG_USB_DWC2_DUAL_ROLE)
+void dwc2_current_init(struct dwc2_hsotg *hsotg);
+void dwc2_current_stop(struct dwc2_hsotg *hsotg);
+int dwc2_current_bind(struct dwc2_hsotg *hsotg, u64 session);
+#else
+static inline void dwc2_current_init(struct dwc2_hsotg *hsotg) { }
+static inline void dwc2_current_stop(struct dwc2_hsotg *hsotg) { }
+static inline int dwc2_current_bind(struct dwc2_hsotg *hsotg, u64 session)
+{ return session ? -EOPNOTSUPP : 0; }
+#endif
 
 /* Normal architectures just use readl/write */
 static inline u32 dwc2_readl(struct dwc2_hsotg *hsotg, u32 offset)
