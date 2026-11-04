@@ -128,6 +128,9 @@ static int usb_role_switch_set_role(struct usb_role_switch *sw,enum usb_role rol
 { return dwc2_drd_role_sw_set_current(sw,role,0); }
 '''
 production2 = function('drivers/power/supply/apple_tristar_charger.c','tristar_set_usb')
+platform_source = (ROOT / 'drivers/usb/dwc2/platform.c').read_text()
+probe_failure = platform_source.split('error_drd:', 1)[1].split('error_init:', 1)[0]
+assert probe_failure.index('dwc2_drd_exit(hsotg)') < probe_failure.index('dwc2_current_stop(hsotg)')
 source_event = function('drivers/power/supply/apple_tristar_charger.c', 'tristar_source_event')
 assert source_event.index('chg->current_source_events++') < source_event.index('tristar_event_withdraw(chg)')
 assert source_event.index('tristar_event_withdraw(chg)') < source_event.index('WRITE_ONCE(chg->epoch')

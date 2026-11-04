@@ -639,6 +639,8 @@ error_debugfs:
 #endif
 error_drd:
 	dwc2_drd_exit(hsotg);
+	/* A published role may already have queued typed-event retirement. */
+	dwc2_current_stop(hsotg);
 
 error_init:
 	if (hsotg->params.activate_stm_id_vb_detection)
