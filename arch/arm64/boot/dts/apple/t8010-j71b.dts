@@ -60,6 +60,8 @@
 	};
 
 	sound {
+		/* Test image only: desktop acceptance requires no playback PCM. */
+		status = "disabled";
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "J71b Speakers";
 		simple-audio-card,format = "dsp_a";
@@ -114,7 +116,7 @@
 
 &mca2 {
 	apple,i2s-switch = <&i2s_switch 2 2>;
-	status = "okay";
+	status = "disabled";
 };
 
 &i2s_switch {
