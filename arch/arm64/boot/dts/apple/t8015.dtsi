@@ -616,6 +616,12 @@
 			mboxes = <&smc_mbox>;
 			power-domains = <&ps_smc_cpu>;
 
+			smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
 			};
@@ -684,6 +690,34 @@
 			power-domains = <&ps_ans2>;
 		};
 
+		dart_apcie2: iommu@603008000 {
+			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x03008000 0x0 0x4000>;
+			#iommu-cells = <5>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			/* ADT dart-apcie2: error-reflector, fetch-config, diag-config */
+			apple,error-reflector = /bits/ 64 <0x233ffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x80000100>;
+			status = "disabled";
+		};
+
+		dart_apcie3: iommu@604008000 {
+			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x04008000 0x0 0x4000>;
+			#iommu-cells = <5>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 350 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			/* ADT dart-apcie3: error-reflector, fetch-config, diag-config */
+			apple,error-reflector = /bits/ 64 <0x233ffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x80000100>;
+			status = "disabled";
+		};
+
 		nvme@259cc0000 {
 			compatible = "apple,t8015-nvme-ans2";
 			reg = <0x2 0x59cc0000 0x0 0x40000>,
@@ -696,6 +730,49 @@
 			power-domains = <&ps_ans2>, <&ps_pcie>;
 			power-domain-names = "ans", "apcie0";
 			resets = <&ps_ans2>;
+		};
+
+		apcie: pcie@610000000 {
+			compatible = "apple,t8015-pcie";
+			device_type = "pci";
+
+			reg = <0x6 0x10000000 0x0 0x1000000>,
+			      <0x6 0x00000000 0x0 0x50000>,
+			      <0x6 0x00080000 0x0 0x4000>,
+			      <0x6 0x000c0000 0x0 0x40000>,
+			      <0x6 0x01000000 0x0 0x4000>,
+			      <0x6 0x02000000 0x0 0x4000>,
+			      <0x6 0x03000000 0x0 0x4000>,
+			      <0x6 0x04000000 0x0 0x4000>;
+			reg-names = "config", "rc", "phy", "phy-ip",
+				    "port0", "port1", "port2", "port3";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 340 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 343 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 346 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 349 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "port0", "port1", "port2", "port3";
+
+			msi-controller;
+			msi-parent = <&apcie>;
+			msi-ranges = <&aic AIC_IRQ 352 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-doorbell = <0xbffff000>;
+
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			bus-range = <0x00 0x08>;
+			ranges = <0x43000000 0x6 0x20000000
+				  0x6 0x20000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0x40000000
+				  0x6 0x40000000 0x0 0x40000000>;
+
+			power-domains = <&ps_pcie>;
+			clocks = <&ps_pcie_aux>, <&ps_pcie_ref>;
+			clock-names = "aux", "ref";
+			status = "disabled";
 		};
 	};
 

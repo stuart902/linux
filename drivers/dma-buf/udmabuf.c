@@ -309,10 +309,19 @@ static long udmabuf_pin_folios(struct udmabuf *ubuf, struct file *memfd,
 	u32 cur_folio, cur_pgcnt;
 	pgoff_t pgoff, pgcnt;
 	long nr_folios;
-	loff_t end;
+	loff_t end, isize;
 
 	pgcnt = size >> PAGE_SHIFT;
 	end = start + (pgcnt << PAGE_SHIFT) - 1;
+	/*
+	 * The page that holds the end of the file is whole in the page cache,
+	 * past the end only zeroes: take it when the range ends there. A
+	 * client's buffer often ends inside a page on kernels with pages larger
+	 * than 4 KiB, and memfd_pin_folios() takes nothing past the end.
+	 */
+	isize = i_size_read(file_inode(memfd));
+	if (end >= isize && start < isize && start + size <= PAGE_ALIGN(isize))
+		end = isize - 1;
 	nr_folios = memfd_pin_folios(memfd, start, end, folios, pgcnt, &pgoff);
 	if (nr_folios <= 0)
 		return nr_folios ? nr_folios : -EINVAL;

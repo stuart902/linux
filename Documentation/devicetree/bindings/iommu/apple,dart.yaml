@@ -37,6 +37,7 @@ properties:
               - apple,t7000-dart
               - apple,s8000-dart
               - apple,t8010-dart
+              - apple,t8015-dart
           - const: apple,s5l8960x-dart
 
   reg:

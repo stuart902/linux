@@ -510,8 +510,10 @@ static int tristar_identify_bc12(struct tristar_charger *chg, unsigned int bank,
 				 epoch, &dm);
 	if (ret)
 		return ret;
-	if (dm < 326 || dm > 899)
+	if (dm < 326 || dm > 899) {
+		dev_dbg(chg->dev, "BC1.2 primary detection: D- %u mV, no charging port\n", dm);
 		return 0;
+	}
 	ret = tristar_mux_sample(chg, tristar_dplus[bank], 2, 10 + 2 * bank,
 				 epoch, &dp);
 	if (ret)
