@@ -83,3 +83,10 @@
 &nco {
 	status = "okay";
 };
+
+&d2365_pmic {
+	poweroff {
+		compatible = "apple,d2365-poweroff";
+		power-supplies = <&tristar_charger>;
+	};
+};

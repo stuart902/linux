@@ -149,6 +149,16 @@ config POWER_RESET_MACSMC
 
 	  Say Y here if you have an Apple Silicon Mac.
 
+config POWER_RESET_APPLE_D2365
+	bool "Apple D2365 PMIC power-off driver"
+	depends on OF && MFD_SIMPLE_MFD_I2C=y && POWER_SUPPLY=y
+	depends on GPIO_APPLE_D2365=y
+	help
+	  Power off boards using the Apple D2365 (Angel) PMIC direct
+	  standby sequence. With an external power source attached, restart
+	  instead. All PMIC communication occurs before interrupts stop.
+	  Scheduled RTC/UPO wake alarms are not supported by this driver.
+
 config POWER_RESET_MSM
 	bool "Qualcomm MSM power-off driver"
 	depends on ARCH_QCOM

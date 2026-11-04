@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/reset/apple,d2365-poweroff.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple D2365 PMIC power off
+
+maintainers:
+  - Stuart Fraser <me@stuartfraser.ca>
+
+description: |
+  The D2365 (Angel) PMIC can enter standby through its I2C register map.
+  This child of the PMIC describes boards using the PMIC's direct shutdown
+  sequence, not a separate external shutdown controller. Such boards restart
+  instead of entering standby while external power is connected. The supply
+  reference identifies the board's external power source.
+
+properties:
+  compatible:
+    const: apple,d2365-poweroff
+
+  power-supplies:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 1
+    description: |
+      External USB or charger power supply provided by a sibling child of
+      the same PMIC. Its cached state complements the direct PMIC source check.
+
+required:
+  - compatible
+  - power-supplies
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        pmic@3c {
+            compatible = "apple,angel-pmic", "apple,i2c-pmic";
+            reg = <0x3c>;
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            poweroff {
+                compatible = "apple,d2365-poweroff";
+                power-supplies = <&tristar_charger>;
+            };
+        };
+    };
