@@ -657,14 +657,37 @@ EXPORT_SYMBOL_GPL(usb_gadget_vbus_connect);
  */
 int usb_gadget_vbus_draw(struct usb_gadget *gadget, unsigned mA)
 {
+	return usb_gadget_vbus_draw_reason(gadget, mA, USB_CURRENT_UNKNOWN);
+}
+EXPORT_SYMBOL_GPL(usb_gadget_vbus_draw);
+
+/**
+ * usb_gadget_vbus_draw_reason - report VBUS usage with its provenance
+ * @gadget: The device whose VBUS usage is being described
+ * @mA: How much current to draw, in milliamperes
+ * @reason: Provenance of the current report
+ *
+ * Like usb_gadget_vbus_draw(), but preserves the reason for controllers
+ * implementing vbus_draw_reason. Other controllers retain their legacy
+ * vbus_draw behavior. The reason must describe the source of the report,
+ * rather than being inferred from the current value.
+ *
+ * Returns zero on success, else negative errno.
+ */
+int usb_gadget_vbus_draw_reason(struct usb_gadget *gadget, unsigned int mA,
+				enum usb_current_reason reason)
+{
 	int ret = 0;
 
-	if (!gadget->ops->vbus_draw) {
+	if (gadget->ops->vbus_draw_reason)
+		ret = gadget->ops->vbus_draw_reason(gadget, mA, reason);
+	else if (gadget->ops->vbus_draw)
+		ret = gadget->ops->vbus_draw(gadget, mA);
+	else {
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
 
-	ret = gadget->ops->vbus_draw(gadget, mA);
 	if (!ret)
 		gadget->mA = mA;
 
@@ -673,7 +696,7 @@ out:
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(usb_gadget_vbus_draw);
+EXPORT_SYMBOL_GPL(usb_gadget_vbus_draw_reason);
 
 /**
  * usb_gadget_vbus_disconnect - notify controller about VBUS session end

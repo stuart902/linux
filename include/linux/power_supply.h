@@ -238,6 +238,7 @@ union power_supply_propval {
 
 struct device_node;
 struct power_supply;
+struct usb_current_event;
 
 /* Run-time specific power supply configuration */
 struct power_supply_config {
@@ -277,6 +278,9 @@ struct power_supply_desc {
 	int (*set_property)(struct power_supply *psy,
 			    enum power_supply_property psp,
 			    const union power_supply_propval *val);
+	/* Optional immutable USB current reports, separate from scalar properties. */
+	int (*usb_current_event)(struct power_supply *psy,
+				 const struct usb_current_event *event);
 	/*
 	 * property_is_writeable() will be called during registration
 	 * of power supply. If this happens during device probe then it must
@@ -330,6 +334,8 @@ struct power_supply_ext {
 
 struct power_supply {
 	const struct power_supply_desc *desc;
+	/* Retained through final release for typed USB callback exclusion. */
+	struct device *usb_current_parent;
 
 	char **supplied_to;
 	size_t num_supplicants;
@@ -918,12 +924,18 @@ extern int power_supply_get_property(struct power_supply *psy,
 int power_supply_get_property_direct(struct power_supply *psy, enum power_supply_property psp,
 				     union power_supply_propval *val);
 #if IS_ENABLED(CONFIG_POWER_SUPPLY)
+int power_supply_submit_usb_current(struct power_supply *psy,
+				    const struct usb_current_event *event);
 extern int power_supply_set_property(struct power_supply *psy,
 			    enum power_supply_property psp,
 			    const union power_supply_propval *val);
 int power_supply_set_property_direct(struct power_supply *psy, enum power_supply_property psp,
 				     const union power_supply_propval *val);
 #else
+static inline int
+power_supply_submit_usb_current(struct power_supply *psy,
+				const struct usb_current_event *event)
+{ return -EOPNOTSUPP; }
 static inline int power_supply_set_property(struct power_supply *psy,
 			    enum power_supply_property psp,
 			    const union power_supply_propval *val)

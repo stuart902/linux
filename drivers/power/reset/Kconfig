@@ -385,7 +385,9 @@ config POWER_RESET_APPLE_D2365_REFERENCE
 	  Separate Apple-derived ordinary shutdown/restart core and Linux
 	  resource adapter with the D2365 GPIO event-owner handoff and an
 	  unactivated CBTL transaction core and bounded USBHost source reducer.
-	  No board or hardware source provider registers it.
+	  Also enables the experimental source-owned USB current event stream
+	  through the gadget, DWC2 and Tristar drivers. No shutdown source
+	  provider or board registers the adapter.
 	  This is not ready for hardware use: exact J71b source semantics and
 	  provider teardown contracts remain unverified. Say N.
 

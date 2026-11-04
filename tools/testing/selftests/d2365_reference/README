@@ -71,7 +71,7 @@ Distinct behavior implemented
 
 Limits and deliberately non-identical cases
 ------------------------------------------
-No hardware source-property producer is implemented. ABSENT means an observed
+No complete hardware shutdown source-property provider is implemented. ABSENT means an observed
 absent Apple property/object, not a missing Linux provider. A successful coherent
 snapshot with either independently valid TRUE determines the reset branch even
 if the other property is UNRESOLVED; it does not invent that property's value.
@@ -164,7 +164,7 @@ The PMIC I2C client has no own IRQ; disabling its clients does not stop the GPIO
 event thread. The concrete GPIO handoff is therefore required. Tristar shutdown
 stops polling and disables nested charger IRQs while preserving cached online
 state; that does not provide either missing Apple source contract. No MFD,
-I2C, PMGR or charging-policy change is part of this integration.
+I2C, PMGR or charging-limit policy change is part of this integration.
 
 Evidence provenance (facts/algorithm, no proprietary code)
 ---------------------------------------------------------
@@ -396,6 +396,68 @@ Evidence is the same hashed J71b image documented above: source state/debounce
 5efc3d0/5efbda8, USBHost grant/reducer 5ed311c/5e6790c, raw USB calculation
 5f1706c and backend feedback 5f115a4/5f117a8. No proprietary source is copied.
 Remaining production gates are the real shared Tristar register/IRQ/work owner,
-complete accessory command policy, typed UDC event production and backend
-ownership, terminal runtime-option provider, board integration and kernel/
-hardware qualification. This component closes only the bounded source reducer.
+complete accessory command policy and backend ownership, terminal runtime-option
+provider, board integration and kernel/hardware qualification. The live USB
+producer below now supplies one part of the remaining production contract.
+
+Live typed gadget / DWC2 / Tristar current producer
+------------------------------------------------
+The experimental option now connects actual USB current producers to Tristar's
+source owner. The normal default remains off. It does not register a shutdown
+provider, start IDBus traffic, change legacy current values, or prove the Apple
+source profile's complete producer history. A hardware image must not enable
+the option until the new controller path has been qualified.
+
+Composite gadget events retain RESET, CONFIGURED, UNCONFIGURED, SUSPEND,
+RESUME, DISCONNECT, VENDOR or UNKNOWN reasons. Apple extra-current adjusted
+values remain VENDOR even at a later configuration or resume. The generic
+gadget API falls back to the original scalar operation for existing drivers;
+DWC2 still executes its original scalar charger path unchanged. The typed
+stream is independent and never infers reason or epoch from the scalar value.
+
+Tristar requests a globally unique session before releasing a held USB device
+role. DWC2 installs it before data activation but emits no grant until an actual
+bus reset, including a reset before SET_ADDRESS. It clears old reset IRQ bits
+only with the controller powered, enabled and held. For cable-at-boot before
+UDC enable, the token remains unarmed until the existing core-init reset clears
+its interrupt state; no MMIO is added while the controller is disabled. A reset
+handler captures the token before callbacks can drop its lock, so a rebind
+cannot relabel an already observed reset. Software reinitialization withdraws
+the active grant and waits for another hardware reset.
+
+Each producer event carries immutable session and sequence IDs through an
+ordered bounded FIFO, instead of the legacy work item's coalesced mA scalar.
+FIFO overflow, delivery failure or sequence exhaustion creates an out-of-band
+LOST record and a sticky loss latch until a new owned session. The sink uses a
+separate ordered FIFO and rejects missing/stale sessions, sequence gaps and a
+first event other than RESET. Teardown can deliver loss even for a pending
+session, closes admission and drains its worker outside source-policy locks.
+
+The optional power-supply callback retains the parent device and takes its
+device lock before checking binding/removal and touching the owner callback.
+This excludes old supply references from calling freed driver state. The
+Tristar sink serializes with the source mutex to allow an early RESET delivery
+to wait until the initiating role handoff publishes its session. PMU source
+events invalidate identity immediately, including during a sleepable handoff.
+Failed/transitional source reads, suspend and removal also revoke identity.
+An already enabled same-cable role is not forcibly restarted just to recover
+missing history; it remains unready until a genuine owned transition.
+
+apple_tristar_take_usb_current() exports the source owner's event queue under
+device-unbind exclusion. Its session is an opaque USB lifetime token, NOT the
+Apple effective source epoch. A future provider must map production to the
+actual source transaction under common serialization, preserve Dock/backend
+history, and exclude/drain all producers at terminal freeze. Copying a record
+or observing no queued work does not prove any of those contracts. The
+collector deliberately does not map unsupported VENDOR/UNKNOWN events, lost
+history or missing sessions to ordinary USB or absent external power.
+
+run.sh also executes test_current_api.py and test_usb_stream.py. They compile
+the actual changed API, role, DWC2 producer and Tristar sink functions against
+instrumented host primitives. Coverage includes all 327,680 signed Apple
+extra-current comparisons against legacy values, 8,000 concurrent unique
+sessions, callback and disabled-stub semantics, retained-parent lifetime,
+stale reset/rebind, pre-UDC startup, ordered reasons, producer/sink FIFO loss,
+sequence overflow, failed delivery, pending-session stop, PMU events during
+handoff and an early worker blocked until source publication. These are
+software/lifecycle boundary tests, not Linux lockdep or hardware evidence.

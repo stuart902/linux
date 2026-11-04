@@ -372,8 +372,10 @@ static void dwc2_driver_shutdown(struct platform_device *dev)
 	if (hsotg->ll_hw_enabled) {
 		dwc2_disable_global_interrupts(hsotg);
 		synchronize_irq(hsotg->irq);
-		dwc2_lowlevel_hw_disable(hsotg);
 	}
+	dwc2_current_stop(hsotg);
+	if (hsotg->ll_hw_enabled)
+		dwc2_lowlevel_hw_disable(hsotg);
 }
 
 /**
@@ -471,6 +473,7 @@ static int dwc2_driver_probe(struct platform_device *dev)
 		return retval;
 
 	spin_lock_init(&hsotg->lock);
+	dwc2_current_init(hsotg);
 
 	hsotg->vbus_supply = devm_regulator_get_optional(hsotg->dev, "vbus");
 	if (IS_ERR(hsotg->vbus_supply)) {

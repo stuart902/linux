@@ -3306,6 +3306,11 @@ static void kill_all_requests(struct dwc2_hsotg *hsotg,
 		dwc2_hsotg_txfifo_flush(hsotg, ep->fifo_index);
 }
 
+static void dwc2_current_disconnect(struct dwc2_hsotg *hsotg);
+static u64 dwc2_current_pending(struct dwc2_hsotg *hsotg);
+static void dwc2_current_arm(struct dwc2_hsotg *hsotg);
+static void dwc2_current_reset(struct dwc2_hsotg *hsotg, u64 session);
+
 /**
  * dwc2_hsotg_disconnect - disconnect service
  * @hsotg: The device state.
@@ -3317,6 +3322,8 @@ static void kill_all_requests(struct dwc2_hsotg *hsotg,
 void dwc2_hsotg_disconnect(struct dwc2_hsotg *hsotg)
 {
 	unsigned int ep;
+
+	dwc2_current_disconnect(hsotg);
 
 	if (!hsotg->connected)
 		return;
@@ -3392,6 +3399,10 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 	u32 dcfg = 0;
 	int ep;
 
+	/* Software reinitialization cannot preserve an active host grant. */
+	if (!is_usb_reset)
+		dwc2_current_disconnect(hsotg);
+
 	/* Kill any ep0 requests as controller will be reinitialized */
 	kill_all_requests(hsotg, hsotg->eps_out[0], -ECONNRESET);
 
@@ -3458,6 +3469,8 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 
 	/* Clear any pending interrupts */
 	dwc2_writel(hsotg, 0xffffffff, GINTSTS);
+	/* Startup now owns a clean reset boundary for a pre-UDC source token. */
+	dwc2_current_arm(hsotg);
 	intmsk = GINTSTS_ERLYSUSP | GINTSTS_SESSREQINT |
 		GINTSTS_GOUTNAKEFF | GINTSTS_GINNAKEFF |
 		GINTSTS_USBRST | GINTSTS_RESETDET |
@@ -3748,6 +3761,7 @@ irq_retry:
 	if (gintsts & (GINTSTS_USBRST | GINTSTS_RESETDET)) {
 		u32 usb_status = dwc2_readl(hsotg, GOTGCTL);
 		u32 connected = hsotg->connected;
+		u64 current_session = dwc2_current_pending(hsotg);
 
 		dev_dbg(hsotg->dev, "%s: USBRst\n", __func__);
 		dev_dbg(hsotg->dev, "GNPTXSTS=%08x\n",
@@ -3763,6 +3777,10 @@ irq_retry:
 
 		if (usb_status & GOTGCTL_BSESVLD && connected)
 			dwc2_hsotg_core_init_disconnected(hsotg, true);
+		/* A real reset, including before SET_ADDRESS, activates provenance.
+		 * This does not change the legacy disconnect/current callback.
+		 */
+		dwc2_current_reset(hsotg, current_session);
 	}
 
 	if (gintsts & GINTSTS_ENUMDONE) {
@@ -4624,6 +4642,7 @@ static int dwc2_hsotg_udc_stop(struct usb_gadget *gadget)
 
 	spin_lock_irqsave(&hsotg->lock, flags);
 
+	dwc2_current_bind(hsotg, 0);
 	hsotg->driver = NULL;
 	hsotg->gadget.dev.of_node = NULL;
 	hsotg->gadget.speed = USB_SPEED_UNKNOWN;
@@ -4759,6 +4778,191 @@ static int dwc2_hsotg_vbus_session(struct usb_gadget *gadget, int is_active)
 	return 0;
 }
 
+/* All stream fields use current_lock; no power-supply operation occurs there.
+ * The legacy last-value charging worker remains separate and unchanged.
+ */
+static void dwc2_current_emit_locked(struct dwc2_hsotg *hsotg,
+				     enum usb_current_reason reason, unsigned int ma)
+{
+	struct usb_current_event event;
+
+	if (hsotg->current_stopped || !hsotg->current_active || hsotg->current_queue.lost)
+		return;
+	event.session = hsotg->current_active;
+	event.milliamps = ma;
+	event.reason = reason;
+	if (hsotg->current_sequence == U64_MAX) {
+		event.sequence = U64_MAX;
+		usb_current_queue_lose(&hsotg->current_queue, &event);
+	} else {
+		event.sequence = ++hsotg->current_sequence;
+		usb_current_queue_push(&hsotg->current_queue, &event);
+	}
+	schedule_work(&hsotg->current_work);
+}
+
+static void dwc2_current_lose_locked(struct dwc2_hsotg *hsotg)
+{
+	struct usb_current_event event = {
+		.session = hsotg->current_active ?: hsotg->current_pending,
+		.sequence = hsotg->current_sequence == U64_MAX ? U64_MAX :
+			    ++hsotg->current_sequence,
+		.reason = USB_CURRENT_LOST,
+	};
+
+	if (!event.session || hsotg->current_stopped)
+		return;
+	usb_current_queue_lose(&hsotg->current_queue, &event);
+	schedule_work(&hsotg->current_work);
+}
+
+static void dwc2_current_emit(struct dwc2_hsotg *hsotg,
+			    enum usb_current_reason reason, unsigned int ma)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hsotg->current_lock, flags);
+	dwc2_current_emit_locked(hsotg, reason, ma);
+	spin_unlock_irqrestore(&hsotg->current_lock, flags);
+}
+
+static void dwc2_current_work(struct work_struct *work)
+{
+	struct dwc2_hsotg *hsotg = container_of(work, struct dwc2_hsotg, current_work);
+	struct usb_current_event event;
+	struct power_supply *psy;
+	unsigned long flags;
+	bool have_event;
+	int ret;
+
+	for (;;) {
+		spin_lock_irqsave(&hsotg->current_lock, flags);
+		have_event = usb_current_queue_take(&hsotg->current_queue, &event);
+		spin_unlock_irqrestore(&hsotg->current_lock, flags);
+		if (!have_event)
+			return;
+		psy = power_supply_get_by_name(hsotg->usb_psy_name);
+		if (psy) {
+			ret = power_supply_submit_usb_current(psy, &event);
+			power_supply_put(psy);
+		} else {
+			ret = -ENODEV;
+		}
+		if (!ret || event.reason == USB_CURRENT_LOST)
+			continue;
+		/* A delivery failure loses history, never restamp it as a new grant.
+		 * An old delivery cannot poison an already rebound stream.
+		 */
+		spin_lock_irqsave(&hsotg->current_lock, flags);
+		if (event.session == hsotg->current_pending)
+			usb_current_queue_lose(&hsotg->current_queue, &event);
+		spin_unlock_irqrestore(&hsotg->current_lock, flags);
+	}
+}
+
+void dwc2_current_init(struct dwc2_hsotg *hsotg)
+{
+	spin_lock_init(&hsotg->current_lock);
+	INIT_WORK(&hsotg->current_work, dwc2_current_work);
+	usb_current_queue_init(&hsotg->current_queue);
+}
+
+/* Called with the controller lock and before role release. A nonzero pending
+ * token is NOT an active grant: only a subsequently observed bus reset can
+ * activate it. An owner must hold the data role before installing a new token.
+ */
+int dwc2_current_bind(struct dwc2_hsotg *hsotg, u64 session)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&hsotg->current_lock, flags);
+	if (session && (hsotg->current_stopped || !hsotg->usb_psy_name)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!session) {
+		dwc2_current_lose_locked(hsotg);
+		hsotg->current_pending = 0;
+		hsotg->current_active = 0;
+		hsotg->current_armed = false;
+	} else {
+		usb_current_queue_init(&hsotg->current_queue);
+		hsotg->current_pending = session;
+		hsotg->current_active = 0;
+		hsotg->current_sequence = 0;
+		hsotg->current_armed = hsotg->ll_hw_enabled &&
+				       dwc2_is_device_enabled(hsotg);
+	}
+out:
+	spin_unlock_irqrestore(&hsotg->current_lock, flags);
+	return ret;
+}
+
+/* Called under the controller lock after startup clears pending IRQ state. */
+static void dwc2_current_arm(struct dwc2_hsotg *hsotg)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hsotg->current_lock, flags);
+	if (!hsotg->current_stopped && !hsotg->current_queue.lost &&
+	    hsotg->current_pending)
+		hsotg->current_armed = true;
+	spin_unlock_irqrestore(&hsotg->current_lock, flags);
+}
+
+static void dwc2_current_disconnect(struct dwc2_hsotg *hsotg)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hsotg->current_lock, flags);
+	dwc2_current_emit_locked(hsotg, USB_CURRENT_DISCONNECT, 0);
+	hsotg->current_active = 0;
+	spin_unlock_irqrestore(&hsotg->current_lock, flags);
+}
+
+/* Capture before disconnect callbacks drop the controller lock. A role change
+ * during those callbacks must not relabel an already captured hardware reset.
+ */
+static u64 dwc2_current_pending(struct dwc2_hsotg *hsotg)
+{
+	unsigned long flags;
+	u64 session;
+
+	spin_lock_irqsave(&hsotg->current_lock, flags);
+	session = hsotg->current_armed ? hsotg->current_pending : 0;
+	spin_unlock_irqrestore(&hsotg->current_lock, flags);
+	return session;
+}
+
+static void dwc2_current_reset(struct dwc2_hsotg *hsotg, u64 session)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hsotg->current_lock, flags);
+	if (!hsotg->current_stopped && hsotg->current_armed &&
+	    !hsotg->current_queue.lost && session && session == hsotg->current_pending) {
+		hsotg->current_active = session;
+		dwc2_current_emit_locked(hsotg, USB_CURRENT_RESET, 100);
+	}
+	spin_unlock_irqrestore(&hsotg->current_lock, flags);
+}
+
+/* No policy mutex may be held: delivery can be waiting for the sink's mutex. */
+void dwc2_current_stop(struct dwc2_hsotg *hsotg)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hsotg->current_lock, flags);
+	dwc2_current_lose_locked(hsotg);
+	hsotg->current_stopped = true;
+	hsotg->current_armed = false;
+	hsotg->current_pending = 0;
+	hsotg->current_active = 0;
+	spin_unlock_irqrestore(&hsotg->current_lock, flags);
+	flush_work(&hsotg->current_work);
+}
+
 /**
  * dwc2_hsotg_vbus_draw - report bMaxPower field
  * @gadget: The usb gadget state
@@ -4801,6 +5005,17 @@ static int dwc2_hsotg_vbus_draw(struct usb_gadget *gadget, unsigned int mA)
 	return 0;
 }
 
+static int dwc2_hsotg_vbus_draw_reason(struct usb_gadget *gadget, unsigned int ma,
+				      enum usb_current_reason reason)
+{
+	struct dwc2_hsotg *hsotg = to_hsotg(gadget);
+	int ret = dwc2_hsotg_vbus_draw(gadget, ma);
+
+	if (!ret)
+		dwc2_current_emit(hsotg, reason, ma);
+	return ret;
+}
+
 static void dwc2_gadget_set_speed(struct usb_gadget *g, enum usb_device_speed speed)
 {
 	struct dwc2_hsotg *hsotg = to_hsotg(g);
@@ -4832,6 +5047,7 @@ static const struct usb_gadget_ops dwc2_hsotg_gadget_ops = {
 	.udc_set_speed		= dwc2_gadget_set_speed,
 	.vbus_session		= dwc2_hsotg_vbus_session,
 	.vbus_draw		= dwc2_hsotg_vbus_draw,
+	.vbus_draw_reason	= dwc2_hsotg_vbus_draw_reason,
 };
 
 /**
@@ -5134,6 +5350,7 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
  */
 int dwc2_hsotg_remove(struct dwc2_hsotg *hsotg)
 {
+	dwc2_current_stop(hsotg);
 	usb_del_gadget_udc(&hsotg->gadget);
 	if (hsotg->usb_psy_name)
 		cancel_work_sync(&hsotg->vbus_draw_work);

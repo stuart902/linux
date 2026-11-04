@@ -26,6 +26,7 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 #include <linux/usb/ch9.h>
+#include <linux/usb/current.h>
 
 #define UDC_TRACE_STR_MAX	512
 
@@ -342,6 +343,8 @@ struct usb_gadget_ops {
 	int	(*set_selfpowered) (struct usb_gadget *, int is_selfpowered);
 	int	(*vbus_session) (struct usb_gadget *, int is_active);
 	int	(*vbus_draw) (struct usb_gadget *, unsigned mA);
+	int	(*vbus_draw_reason)(struct usb_gadget *gadget, unsigned int mA,
+				    enum usb_current_reason reason);
 	int	(*pullup) (struct usb_gadget *, int is_on);
 	int	(*ioctl)(struct usb_gadget *,
 				unsigned code, unsigned long param);
@@ -644,6 +647,8 @@ int usb_gadget_set_selfpowered(struct usb_gadget *gadget);
 int usb_gadget_clear_selfpowered(struct usb_gadget *gadget);
 int usb_gadget_vbus_connect(struct usb_gadget *gadget);
 int usb_gadget_vbus_draw(struct usb_gadget *gadget, unsigned mA);
+int usb_gadget_vbus_draw_reason(struct usb_gadget *gadget, unsigned int mA,
+				enum usb_current_reason reason);
 int usb_gadget_vbus_disconnect(struct usb_gadget *gadget);
 int usb_gadget_connect(struct usb_gadget *gadget);
 int usb_gadget_disconnect(struct usb_gadget *gadget);
@@ -664,6 +669,9 @@ static inline int usb_gadget_clear_selfpowered(struct usb_gadget *gadget)
 static inline int usb_gadget_vbus_connect(struct usb_gadget *gadget)
 { return 0; }
 static inline int usb_gadget_vbus_draw(struct usb_gadget *gadget, unsigned mA)
+{ return 0; }
+static inline int usb_gadget_vbus_draw_reason(struct usb_gadget *gadget,
+		unsigned int mA, enum usb_current_reason reason)
 { return 0; }
 static inline int usb_gadget_vbus_disconnect(struct usb_gadget *gadget)
 { return 0; }
