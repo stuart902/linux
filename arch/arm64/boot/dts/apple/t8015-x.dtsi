@@ -11,3 +11,29 @@
 / {
 	chassis-type = "handset";
 };
+
+&apcie {
+	iommu-map = <0x100 &dart_apcie3 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	pinctrl-0 = <&wifi_clkreq>;
+	pinctrl-names = "default";
+
+	port03: pci@3,0 {
+		device_type = "pci";
+		reg = <0x1800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		max-link-speed = <2>;
+		apple,manual-availability-iommu = <&dart_apcie3 0>;
+		reset-gpios = <&pinctrl_ap 167 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+	};
+};
+
+&pinctrl_ap {
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(163, 1)>;
+	};
+};

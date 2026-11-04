@@ -25,6 +25,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_print.h>
 
 #include <linux/err.h>
 #include <linux/export.h>
@@ -1377,7 +1378,17 @@ pvr_drm_driver_postclose(__always_unused struct drm_device *drm_dev,
 	file->driver_priv = NULL;
 }
 
-DEFINE_DRM_GEM_FOPS(pvr_drm_driver_fops);
+static void pvr_drm_driver_show_fdinfo(struct drm_printer *p,
+				       struct drm_file *file)
+{
+	drm_show_memory_stats(p, file);
+}
+
+static const struct file_operations pvr_drm_driver_fops = {
+	.owner = THIS_MODULE,
+	DRM_GEM_FOPS,
+	.show_fdinfo = drm_show_fdinfo,
+};
 
 static struct drm_driver pvr_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER |
@@ -1387,6 +1398,7 @@ static struct drm_driver pvr_drm_driver = {
 	.ioctls = pvr_drm_driver_ioctls,
 	.num_ioctls = ARRAY_SIZE(pvr_drm_driver_ioctls),
 	.fops = &pvr_drm_driver_fops,
+	.show_fdinfo = pvr_drm_driver_show_fdinfo,
 #if defined(CONFIG_DEBUG_FS)
 	.debugfs_init = pvr_debugfs_init,
 #endif
@@ -1532,7 +1544,33 @@ static const struct of_device_id dt_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dt_match);
 
+/*
+ * System sleep: the Apple GPU loses its firmware state when its power domain
+ * goes off, so it stops and restarts the firmware. Other GPUs keep relying on
+ * runtime PM as before.
+ */
+static int pvr_system_suspend(struct device *dev)
+{
+	struct drm_device *drm_dev = dev_get_drvdata(dev);
+	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return 0;
+	return pvr_apple_suspend(pvr_dev);
+}
+
+static int pvr_system_resume(struct device *dev)
+{
+	struct drm_device *drm_dev = dev_get_drvdata(dev);
+	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return 0;
+	return pvr_apple_resume(pvr_dev);
+}
+
 static const struct dev_pm_ops pvr_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(pvr_system_suspend, pvr_system_resume)
 	RUNTIME_PM_OPS(pvr_power_device_suspend, pvr_power_device_resume, pvr_power_device_idle)
 };
 

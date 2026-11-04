@@ -777,14 +777,14 @@ static int apple_spi_transfer_one_t8010_pio(struct spi_controller *ctlr,
 }
 
 /*
- * S8000 byte-wide PIO, in the register order validated on the iPad 5:
- * stop, clock divider, word delay, status, configuration, enable, the
- * word counts and only then PIO mode. The FIFOs are fed continuously, never
+ * Legacy byte-wide PIO. S8000 uses the register order validated on the
+ * iPad 5; T7000 needs the counts before RUN and the TX FIFO primed after
+ * selecting PIO mode. The FIFOs are fed continuously, never
  * with more than one FIFO's worth of words not yet read back, so that a
  * long upload (the 57016-byte touch firmware) keeps the clock running and
  * the RX FIFO cannot overflow.
  */
-static int apple_spi_transfer_one_s8000(struct spi_controller *ctlr,
+static int apple_spi_transfer_one_legacy_pio(struct spi_controller *ctlr,
 					struct spi_device *device,
 					struct spi_transfer *t)
 {
@@ -822,14 +822,28 @@ static int apple_spi_transfer_one_s8000(struct spi_controller *ctlr,
 		cfg |= APPLE_SPI_CFG_CPOL;
 
 	reg_write(spi, APPLE_SPI_CTRL, 0);
+	if (spi->hw->spi_v1) {
+		reg_write(spi, APPLE_SPI_TXCNT, t->len);
+		reg_write(spi, APPLE_SPI_RXCNT, t->len);
+	}
 	reg_write(spi, APPLE_SPI_CLKDIV, div);
 	reg_write(spi, APPLE_SPI_WORD_DELAY, word_delay);
-	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_T8010_DESC_STATUS_CFG);
+	reg_write(spi, APPLE_SPI_STATUS, spi->hw->spi_v1 ?
+		  reg_read(spi, APPLE_SPI_STATUS) :
+		  APPLE_SPI_T8010_DESC_STATUS_CFG);
 	reg_write(spi, APPLE_SPI_CFG, cfg);
 	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_T8010_ENABLE);
-	reg_write(spi, APPLE_SPI_RXCNT, t->len);
-	reg_write(spi, APPLE_SPI_TXCNT, t->len);
+	if (!spi->hw->spi_v1) {
+		reg_write(spi, APPLE_SPI_RXCNT, t->len);
+		reg_write(spi, APPLE_SPI_TXCNT, t->len);
+	}
 	reg_write(spi, APPLE_SPI_CFG, cfg | APPLE_SPI_CFG_T8010_PIOEN);
+	if (spi->hw->spi_v1) {
+		while (sent < t->len && sent < APPLE_SPI_FIFO_DEPTH) {
+			reg_write(spi, APPLE_SPI_TXDATA, tx ? tx[sent] : 0xff);
+			sent++;
+		}
+	}
 
 	while (received < t->len) {
 		status = reg_read(spi, APPLE_SPI_STATUS);
@@ -875,7 +889,9 @@ static int apple_spi_transfer_one_s8000(struct spi_controller *ctlr,
 
 	reg_write(spi, APPLE_SPI_CFG, cfg);
 	reg_write(spi, APPLE_SPI_CTRL, 0);
-	reg_write(spi, APPLE_SPI_STATUS, APPLE_SPI_T8010_DESC_STATUS_CFG);
+	reg_write(spi, APPLE_SPI_STATUS, spi->hw->spi_v1 ?
+		  reg_read(spi, APPLE_SPI_STATUS) :
+		  APPLE_SPI_T8010_DESC_STATUS_CFG);
 	reg_read(spi, APPLE_SPI_CTRL);
 
 	return ret;
@@ -889,6 +905,16 @@ static int apple_spi_transfer_one_t8010(struct spi_controller *ctlr,
 		return apple_spi_transfer_one_t8010_dma(ctlr, device, t);
 
 	return apple_spi_transfer_one_t8010_pio(ctlr, device, t);
+}
+
+static int apple_spi_transfer_one_t7000(struct spi_controller *ctlr,
+					struct spi_device *device,
+					struct spi_transfer *t)
+{
+	if ((t->bits_per_word ?: device->bits_per_word) == 16)
+		return apple_spi_transfer_one_t8010_pio(ctlr, device, t);
+
+	return apple_spi_transfer_one_legacy_pio(ctlr, device, t);
 }
 
 static void apple_spi_tx(struct apple_spi *spi, const void **tx_ptr, u32 *left,
@@ -1139,7 +1165,9 @@ static int apple_spi_probe(struct platform_device *pdev)
 	ctlr->prepare_message = apple_spi_prepare_message;
 	ctlr->set_cs = apple_spi_set_cs;
 	if (spi->hw->pio_only)
-		ctlr->transfer_one = apple_spi_transfer_one_s8000;
+		ctlr->transfer_one = apple_spi_transfer_one_legacy_pio;
+	else if (spi->hw->spi_v1)
+		ctlr->transfer_one = apple_spi_transfer_one_t7000;
 	else if (spi->hw->legacy_status)
 		ctlr->transfer_one = apple_spi_transfer_one_t8010;
 	else
@@ -1172,10 +1200,10 @@ static int apple_spi_probe(struct platform_device *pdev)
 		return ret;
 
 	/*
-	 * S8000: keep the controller powered rather than cycling its power
+	 * S5L: keep the controller powered rather than cycling its power
 	 * domain around every message; it is configured once at probe.
 	 */
-	if (spi->hw->pio_only) {
+	if (spi->hw->pio_only || spi->hw->spi_v1) {
 		ret = pm_runtime_resume_and_get(&pdev->dev);
 		if (ret < 0)
 			return ret;

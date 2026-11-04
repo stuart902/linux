@@ -36,6 +36,13 @@ properties:
       Delay time for SD_MODE pin changes intended to make I2S clocks ready
       before SD_MODE is unmuted in order to avoid the speaker pop noise.
 
+  maxim,tdm:
+    type: boolean
+    description:
+      The link runs in TDM mode, with up to eight slots. The amplifier selects
+      its slot by the wiring of its SD_MODE and GAIN_SLOT pins, at a fixed 12 dB
+      gain.
+
 required:
   - compatible
 

@@ -776,6 +776,26 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
 
+/**
+ * apple_rtkit_mbox_stop() - Stop the mailbox of a co-processor that is shut down
+ * @rtk: RTKit reference, after apple_rtkit_shutdown()
+ *
+ * A shut-down co-processor sends nothing, but its mailbox stays started and
+ * so keeps its power domain on. Stop it until apple_rtkit_reinit(), which
+ * the caller runs before starting the co-processor again.
+ *
+ * Return: 0, or -EBUSY while the co-processor runs.
+ */
+int apple_rtkit_mbox_stop(struct apple_rtkit *rtk)
+{
+	if (apple_rtkit_is_running(rtk))
+		return -EBUSY;
+	apple_mbox_stop(rtk->mbox);
+	flush_workqueue(rtk->wq);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_mbox_stop);
+
 static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 					  unsigned int state)
 {

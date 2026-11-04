@@ -117,6 +117,7 @@ struct tristar_charger {
 	struct i2c_client *tristar;
 	struct power_supply *psy;
 	struct usb_role_switch *role_sw;
+	struct workqueue_struct *wq;	/* frozen across system sleep */
 	struct delayed_work poll_work;
 	struct completion adc_done;
 	int irqs[TRISTAR_IRQS_MAX];
@@ -510,8 +511,10 @@ static int tristar_identify_bc12(struct tristar_charger *chg, unsigned int bank,
 				 epoch, &dm);
 	if (ret)
 		return ret;
-	if (dm < 326 || dm > 899)
+	if (dm < 326 || dm > 899) {
+		dev_dbg(chg->dev, "BC1.2 primary detection: D- %u mV, no charging port\n", dm);
 		return 0;
+	}
 	ret = tristar_mux_sample(chg, tristar_dplus[bank], 2, 10 + 2 * bank,
 				 epoch, &dp);
 	if (ret)
@@ -820,7 +823,10 @@ static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
 
 	if (chg->step_ns && now - chg->step_ns < TRISTAR_RAMP_STEP_MS * NSEC_PER_MSEC)
 		return;
-	if (tristar_read_pack(&pack) || !tristar_pack_allows_grant(&pack)) {
+	/* A read that fails says nothing about the battery: hold, and look again. */
+	if (tristar_read_pack(&pack))
+		return;
+	if (!tristar_pack_allows_grant(&pack)) {
 		chg->phase = TRISTAR_CHARGING;
 		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
 		dev_warn(chg->dev, "battery outside the charging window; holding the fallback\n");
@@ -885,6 +891,10 @@ static void tristar_guard(struct tristar_charger *chg, u64 now)
 	if (chg->code > TRISTAR_CHG_FALLBACK_CODE && !tristar_pack_allows_grant(&pack)) {
 		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
 		dev_warn(chg->dev, "battery outside the charging window; holding the fallback\n");
+	} else if (chg->code < chg->target_code && tristar_pack_allows_grant(&pack)) {
+		/* Back inside the window: no replug needed to charge again. */
+		chg->phase = TRISTAR_RAMPING;
+		chg->step_ns = 0;
 	}
 }
 
@@ -978,7 +988,7 @@ static void tristar_poll(struct work_struct *work)
 		break;
 	}
 again:
-	mod_delayed_work(system_highpri_wq, &chg->poll_work,
+	mod_delayed_work(chg->wq, &chg->poll_work,
 			 msecs_to_jiffies(TRISTAR_POLL_MS));
 	if (chg->code != old_code || chg->online != old_online)
 		power_supply_changed(chg->psy);
@@ -1037,7 +1047,7 @@ static void tristar_source_event(struct tristar_charger *chg)
 
 	tristar_event_withdraw(chg);
 	WRITE_ONCE(chg->epoch, chg->epoch + 1);
-	mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
+	mod_delayed_work(chg->wq, &chg->poll_work, 0);
 
 	now = ktime_get_ns();
 	if (now - chg->storm_start_ns > NSEC_PER_SEC) {
@@ -1142,7 +1152,7 @@ static int tristar_set_property(struct power_supply *psy,
 	dev_dbg(chg->dev, "USB host allows %u mA\n", chg->usb_ma);
 	if (!chg->stopping) {
 		tristar_update_target(chg);
-		mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
+		mod_delayed_work(chg->wq, &chg->poll_work, 0);
 	}
 	mutex_unlock(&chg->lock);
 
@@ -1299,6 +1309,9 @@ static int tristar_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	init_completion(&chg->adc_done);
+	chg->wq = devm_alloc_workqueue(dev, "tristar-charger", WQ_HIGHPRI | WQ_FREEZABLE, 1);
+	if (!chg->wq)
+		return -ENOMEM;
 	INIT_DELAYED_WORK(&chg->poll_work, tristar_poll);
 
 	/* Never adopt a limit we cannot explain; anything higher drops to the fallback. */
@@ -1340,7 +1353,7 @@ static int tristar_probe(struct platform_device *pdev)
 	tristar_set_usb(chg, false);
 	mutex_unlock(&chg->lock);
 
-	mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
+	mod_delayed_work(chg->wq, &chg->poll_work, 0);
 	return 0;
 }
 
@@ -1382,7 +1395,7 @@ static int tristar_resume(struct device *dev)
 	mutex_lock(&chg->lock);
 	chg->stopping = false;
 	mutex_unlock(&chg->lock);
-	mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
+	mod_delayed_work(chg->wq, &chg->poll_work, 0);
 	return 0;
 }
 

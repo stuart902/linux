@@ -301,3 +301,9 @@
 	pinctrl-names = "default";
 	status = "okay";
 };
+
+/* The adopted DisplayPort panel link cannot be restored after power loss. */
+&ps_dp {
+	apple,always-on;
+	apple,manual-pm;
+};

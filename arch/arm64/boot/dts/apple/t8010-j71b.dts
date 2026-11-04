@@ -16,13 +16,14 @@
 	speaker_amps: amplifier {
 		compatible = "maxim,max98357a";
 		#sound-dai-cells = <0>;
+		maxim,tdm;
 		sdmode-gpios = <&pinctrl_ap 20 GPIO_ACTIVE_HIGH>;
 	};
 
 	sound {
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "J71b Speakers";
-		simple-audio-card,format = "i2s";
+		simple-audio-card,format = "dsp_a";
 		simple-audio-card,bitclock-master = <&speaker_cpu>;
 		simple-audio-card,frame-master = <&speaker_cpu>;
 		simple-audio-card,widgets = "Speaker", "Speakers";

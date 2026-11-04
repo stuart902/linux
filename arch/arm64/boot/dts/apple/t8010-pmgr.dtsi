@@ -91,6 +91,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "gpio";
+		apple,always-on; /* Power/Home wake IRQs over s2idle */
+		apple,manual-pm;
 	};
 
 	ps_pms: power-controller@80120 {
@@ -400,6 +402,8 @@
 		#reset-cells = <0>;
 		label = "disp0_fe";
 		power-domains = <&ps_rtmux>;
+		apple,always-on; /* Display pipe adopted from iBoot */
+		apple,manual-pm;
 	};
 
 	ps_disp0_be: power-controller@802b8 {
@@ -409,6 +413,8 @@
 		#reset-cells = <0>;
 		label = "disp0_be";
 		power-domains = <&ps_disp0_fe>;
+		apple,always-on; /* Display pipe adopted from iBoot */
+		apple,manual-pm;
 	};
 
 	ps_pmp: power-controller@802f0 {

@@ -13,6 +13,7 @@
 #include "pvr_context.h"
 #include "pvr_device.h"
 #include "pvr_job.h"
+#include "pvr_power.h"
 #include "pvr_queue.h"
 #include "pvr_rogue_fwif_client.h"
 
@@ -22,9 +23,8 @@
 
 #define APPLE_QUEUE_TIMEOUT_MS	5000
 
-static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
+static struct dma_fence *pvr_apple_submit(struct pvr_job *job)
 {
-	struct pvr_job *job = container_of(sched_job, struct pvr_job, base);
 	const struct rogue_fwif_cmd_compute *cmd = job->cmd;
 
 	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY || job->type == DRM_PVR_JOB_TYPE_FRAGMENT)
@@ -35,6 +35,26 @@ static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
 	return pvr_apple_submit_compute_job(job->pvr_dev, job->ctx->vm_ctx,
 					    cmd->regs.cdm_ctrl_stream_base,
 					    cmd->regs.cdm_context_state_base_addr);
+}
+
+/*
+ * The GPU stays powered while the firmware has the job: the reference taken
+ * here is dropped when the job's fence leaves the pending list (signalled or
+ * cancelled), or right away if the job never reached the firmware.
+ */
+static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
+{
+	struct pvr_job *job = container_of(sched_job, struct pvr_job, base);
+	struct dma_fence *fence;
+	int err;
+
+	err = pvr_power_get(job->pvr_dev);
+	if (err)
+		return ERR_PTR(err);
+	fence = pvr_apple_submit(job);
+	if (IS_ERR(fence))
+		pvr_power_put(job->pvr_dev);
+	return fence;
 }
 
 static enum drm_gpu_sched_stat pvr_apple_timedout_job(struct drm_sched_job *sched_job)

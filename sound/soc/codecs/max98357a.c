@@ -119,8 +119,31 @@ static struct snd_soc_dai_driver max98357a_dai_driver = {
 	.ops    = &max98357a_dai_ops,
 };
 
+/* The amplifier picks its slot of the frame by SD_MODE and GAIN_SLOT. */
+static struct snd_soc_dai_driver max98357a_tdm_dai_driver = {
+	.name = "HiFi",
+	.playback = {
+		.stream_name	= "HiFi Playback",
+		.formats	= SNDRV_PCM_FMTBIT_S16 |
+					SNDRV_PCM_FMTBIT_S32,
+		.rates		= SNDRV_PCM_RATE_8000 |
+					SNDRV_PCM_RATE_16000 |
+					SNDRV_PCM_RATE_32000 |
+					SNDRV_PCM_RATE_44100 |
+					SNDRV_PCM_RATE_48000 |
+					SNDRV_PCM_RATE_88200 |
+					SNDRV_PCM_RATE_96000,
+		.rate_min	= 8000,
+		.rate_max	= 96000,
+		.channels_min	= 1,
+		.channels_max	= 8,
+	},
+	.ops    = &max98357a_dai_ops,
+};
+
 static int max98357a_platform_probe(struct platform_device *pdev)
 {
+	struct snd_soc_dai_driver *dai_driver;
 	struct max98357a_priv *max98357a;
 	int ret;
 
@@ -144,9 +167,13 @@ static int max98357a_platform_probe(struct platform_device *pdev)
 
 	dev_set_drvdata(&pdev->dev, max98357a);
 
+	dai_driver = &max98357a_dai_driver;
+	if (device_property_read_bool(&pdev->dev, "maxim,tdm"))
+		dai_driver = &max98357a_tdm_dai_driver;
+
 	return devm_snd_soc_register_component(&pdev->dev,
 			&max98357a_component_driver,
-			&max98357a_dai_driver, 1);
+			dai_driver, 1);
 }
 
 #ifdef CONFIG_OF

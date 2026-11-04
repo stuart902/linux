@@ -93,6 +93,8 @@ struct pvr_apple {
 	void *heap;
 	dma_addr_t heap_dma;
 	bool booted;
+	bool fw_ready;		/* init data handed over once: runtime PM restarts it */
+	bool rtk_idle;		/* RTKit's mailbox stopped while the GPU is off */
 
 	struct mutex submit_lock;	/* job slots, rings, producer index, GPU VM */
 	u32 last_seq;			/* last submitted compute job */
@@ -182,6 +184,9 @@ struct pvr_apple_fence {
 static unsigned int pvr_apple_poll_us = 100;
 module_param_named(apple_poll_us, pvr_apple_poll_us, uint, 0644);
 MODULE_PARM_DESC(apple_poll_us, "Apple A10: microseconds between job completion checks (default 100)");
+
+/* Idle time before runtime PM powers the GPU off; tunable in sysfs. */
+#define PVR_APPLE_AUTOSUSPEND_MS	1000
 
 /*
  * The firmware's debug flags: 1 SKU trace events, 2 cancel-path events, into
@@ -493,16 +498,15 @@ static int pvr_apple_power_init(struct pvr_device *pvr_dev)
 	pvr_apple_opp_init(apple);
 
 	/*
-	 * The firmware keeps its state only while powered, and suspending and
-	 * re-initializing it is not implemented: keep the device active. This
-	 * resumes it: power_on() runs here.
+	 * Each runtime resume boots the firmware again: idle for longer than
+	 * a frame or two before powering it off.
 	 */
-	pm_runtime_forbid(dev);
+	pm_runtime_set_autosuspend_delay(dev, PVR_APPLE_AUTOSUSPEND_MS);
 
 	return 0;
 }
 
-static int pvr_apple_power_on(struct pvr_device *pvr_dev)
+static int pvr_apple_boot(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
 	struct device *dev = apple_dev(apple);
@@ -512,6 +516,13 @@ static int pvr_apple_power_on(struct pvr_device *pvr_dev)
 	if (apple->booted)
 		return 0;
 
+	/* The mailbox first: the firmware talks as soon as it runs */
+	if (apple->rtk_idle) {
+		err = apple_rtkit_reinit(apple->rtk);
+		if (err)
+			return err;
+		apple->rtk_idle = false;
+	}
 	pvr_apple_set_window(apple);
 	writel(readl(apple->fender + FENDER_RUN) | FENDER_RUN_ENABLE, apple->fender + FENDER_RUN);
 
@@ -556,12 +567,63 @@ err_stop:
 	return err;
 }
 
+static int pvr_apple_fw_restart(struct pvr_apple *apple);
+static void pvr_apple_fw_stop(struct pvr_apple *apple);
+static int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us);
+
+/*
+ * Runtime PM. Every job the firmware runs holds a runtime-PM reference from
+ * pvr_apple_run_job() until its fence leaves the pending list, so the GPU
+ * goes idle only with nothing in flight. Then the firmware is shut down and
+ * the GPU powered off; the next job boots it again with fresh init data, as
+ * after a reset. At probe, before the init data exists, power on only boots
+ * the firmware: pvr_apple_fw_init() follows.
+ */
+static int pvr_apple_power_on(struct pvr_device *pvr_dev)
+{
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	int err;
+
+	if (!apple->fw_ready)
+		return pvr_apple_boot(pvr_dev);
+
+	mutex_lock(&apple->submit_lock);
+	err = apple->booted ? 0 : pvr_apple_fw_restart(apple);
+	mutex_unlock(&apple->submit_lock);
+	if (err)
+		dev_err(apple_dev(apple), "GPU did not start: %d\n", err);
+	else if (apple->devfreq)
+		devfreq_resume_device(apple->devfreq);
+	return err;
+}
+
 static int pvr_apple_power_off(struct pvr_device *pvr_dev)
 {
-	/*
-	 * The firmware keeps its init data across idle periods; powering down and
-	 * re-initializing it is not implemented yet, so the GPU stays on.
-	 */
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	int err;
+
+	if (!apple->fw_ready)
+		return 0;
+
+	if (apple->devfreq)
+		devfreq_suspend_device(apple->devfreq);
+	mutex_lock(&apple->submit_lock);
+	/* Nothing holds a job reference, so this does not wait in practice. */
+	err = pvr_apple_wait_idle(apple, 1000000);
+	if (!err) {
+		pvr_apple_fw_stop(apple);
+		/* its mailbox would keep the GPU's power domain on */
+		apple->rtk_idle = !apple_rtkit_mbox_stop(apple->rtk);
+	}
+	mutex_unlock(&apple->submit_lock);
+	if (err) {
+		if (apple->devfreq)
+			devfreq_resume_device(apple->devfreq);
+		return -EBUSY;
+	}
+	/* the pollers run only while fences are pending; none are */
+	hrtimer_cancel(&apple->poll_timer);
+	cancel_delayed_work_sync(&apple->poll_work);
 	return 0;
 }
 
@@ -846,11 +908,24 @@ static u32 pvr_apple_frag_events(struct pvr_apple *apple)
 	return READ_ONCE(apple->frag_events);
 }
 
+/* Drop the runtime-PM references of @n jobs that left the pending lists. */
+static void pvr_apple_jobs_retired(struct pvr_apple *apple, unsigned int n)
+{
+	struct device *dev = apple_dev(apple);
+
+	if (!n)
+		return;
+	pm_runtime_mark_last_busy(dev);
+	while (n--)
+		pm_runtime_put_autosuspend(dev);
+}
+
 /* Signal the fences of retired jobs; poll again while any are pending. */
 static void pvr_apple_poll_work(struct work_struct *work)
 {
 	struct pvr_apple *apple = container_of(work, struct pvr_apple, poll_work.work);
 	struct pvr_apple_fence *fence, *tmp;
+	unsigned int retired = 0;
 	bool pending = false;
 	int engine;
 
@@ -877,6 +952,7 @@ static void pvr_apple_poll_work(struct work_struct *work)
 			list_del_init(&fence->node);
 			dma_fence_signal_locked(&fence->base);
 			dma_fence_put(&fence->base);
+			retired++;
 		}
 		pending |= !list_empty(&apple->pending[engine]);
 	}
@@ -885,6 +961,7 @@ static void pvr_apple_poll_work(struct work_struct *work)
 		apple->busy_since = 0;
 	}
 	spin_unlock_irq(&apple->fence_lock);
+	pvr_apple_jobs_retired(apple, retired);
 
 	/* The firmware sends no completion message in this setup: poll. */
 	if (pending)
@@ -941,10 +1018,10 @@ void pvr_apple_report_hang(struct pvr_device *pvr_dev, struct dma_fence *fence)
 	}
 }
 
-static void pvr_apple_cancel_fences(struct pvr_apple *apple, int error)
+static unsigned int pvr_apple_cancel_fences(struct pvr_apple *apple, int error)
 {
 	struct pvr_apple_fence *fence, *tmp;
-
+	unsigned int cancelled = 0;
 	int engine;
 
 	/* each rearms the other: the timer, the work, then a timer it started */
@@ -958,9 +1035,12 @@ static void pvr_apple_cancel_fences(struct pvr_apple *apple, int error)
 			dma_fence_set_error(&fence->base, error);
 			dma_fence_signal_locked(&fence->base);
 			dma_fence_put(&fence->base);
+			cancelled++;
 		}
 	}
 	spin_unlock_irq(&apple->fence_lock);
+	pvr_apple_jobs_retired(apple, cancelled);
+	return cancelled;
 }
 
 /**
@@ -1092,7 +1172,9 @@ static void pvr_apple_switch_to_kernel_vm(struct pvr_apple *apple, struct pvr_vm
 	struct pvr_device *pvr_dev = apple->pvr_dev;
 
 	mutex_lock(&apple->submit_lock);
-	if (!only_if || pvr_vm_get_page_table_root_addr(only_if) == apple->vm_root) {
+	/* Powered off, the firmware starts again on the kernel VM. */
+	if (apple->booted &&
+	    (!only_if || pvr_vm_get_page_table_root_addr(only_if) == apple->vm_root)) {
 		if (pvr_apple_wait_idle(apple, 5000000))
 			dev_err(apple_dev(apple), "jobs did not retire before a VM switch\n");
 		pvr_apple_switch_vm(apple, pvr_dev->kernel_vm_ctx);
@@ -1465,6 +1547,42 @@ static int pvr_apple_fw_start(struct pvr_apple *apple)
 	return 0;
 }
 
+/*
+ * Shut the firmware down and power the GPU off through state 0. A wedged or
+ * crashed firmware may not answer: go on regardless. apple_rtkit_shutdown()
+ * resets RTKit's state only once the firmware acknowledged; after a crash it
+ * stays "crashed" and refuses to boot, so reset it here.
+ */
+static void pvr_apple_fw_stop(struct pvr_apple *apple)
+{
+	lockdep_assert_held(&apple->submit_lock);
+	if (!apple->booted)
+		return;
+	pvr_apple_request_power_state(apple, 0);
+	if (apple_rtkit_shutdown(apple->rtk))
+		apple_rtkit_reinit(apple->rtk);
+	writel(readl(apple->fender + FENDER_RUN) & ~FENDER_RUN_ENABLE,
+	       apple->fender + FENDER_RUN);
+	apple->booted = false;
+}
+
+/* Boot the firmware from the kept image with fresh init data, as at probe. */
+static int pvr_apple_fw_restart(struct pvr_apple *apple)
+{
+	int err;
+
+	lockdep_assert_held(&apple->submit_lock);
+	/* The window as at probe: the image, zeroes after it, RTKit buffers anew */
+	memset(apple->win, 0, pvr_apple_layout_init_offset());
+	memcpy(apple->win, apple->fw_image, apple->fw_size);
+	apple->win_next = PVR_APPLE_FW_RUNTIME;
+	wmb();
+	err = pvr_apple_boot(apple->pvr_dev);
+	if (!err)
+		err = pvr_apple_fw_start(apple);
+	return err;
+}
+
 int pvr_apple_fw_init(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
@@ -1479,6 +1597,7 @@ int pvr_apple_fw_init(struct pvr_device *pvr_dev)
 		return err;
 	}
 	pvr_apple_devfreq_start(apple);
+	apple->fw_ready = true;
 	return 0;
 }
 
@@ -1511,31 +1630,101 @@ int pvr_apple_reset(struct pvr_device *pvr_dev)
 	apple->busy_since = 0;
 	spin_unlock_irq(&apple->fence_lock);
 
-	if (apple->booted) {
-		/*
-		 * A wedged or crashed firmware may not answer: go on regardless.
-		 * apple_rtkit_shutdown() resets RTKit's state only once the
-		 * firmware acknowledged; after a crash it stays "crashed" and
-		 * refuses to boot, so reset it here.
-		 */
-		pvr_apple_request_power_state(apple, 0);
-		if (apple_rtkit_shutdown(apple->rtk))
-			apple_rtkit_reinit(apple->rtk);
-		writel(readl(apple->fender + FENDER_RUN) & ~FENDER_RUN_ENABLE,
-		       apple->fender + FENDER_RUN);
-		apple->booted = false;
-	}
-	/* The window as at probe: the image, zeroes after it, RTKit buffers anew */
-	memset(apple->win, 0, pvr_apple_layout_init_offset());
-	memcpy(apple->win, apple->fw_image, apple->fw_size);
-	apple->win_next = PVR_APPLE_FW_RUNTIME;
-	wmb();
-	err = pvr_apple_power_on(pvr_dev);
-	if (!err)
-		err = pvr_apple_fw_start(apple);
+	pvr_apple_fw_stop(apple);
+	err = pvr_apple_fw_restart(apple);
 	mutex_unlock(&apple->submit_lock);
 	if (err)
 		dev_err(dev, "GPU reset failed: %d\n", err);
+	return err;
+}
+
+/**
+ * pvr_apple_suspend() - Stop the GPU for system sleep
+ * @pvr_dev: Target device.
+ *
+ * The firmware keeps its state only while the GPU is powered, and the GPU
+ * power domain goes off in sleep. Retire every job (userspace and the job
+ * scheduler are frozen by now), then shut the firmware down and power the
+ * GPU off through state 0, as before a reset. Nothing the firmware held
+ * needs saving: pvr_apple_resume() hands it fresh init data, and each job
+ * carries the rest.
+ *
+ * Return: 0. A GPU that does not retire its jobs is stopped regardless and
+ * those jobs end with -ETIMEDOUT.
+ */
+int pvr_apple_suspend(struct pvr_device *pvr_dev)
+{
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	struct device *dev = apple_dev(apple);
+	unsigned int n;
+	int err;
+
+	/*
+	 * Runtime-suspended: nothing runs and the firmware is off, so there is
+	 * nothing to stop. The PM core holds a runtime reference across sleep,
+	 * so pvr_apple_resume() sees the same status and leaves it off too.
+	 */
+	if (pm_runtime_status_suspended(dev))
+		return 0;
+
+	if (apple->devfreq)
+		devfreq_suspend_device(apple->devfreq);
+
+	mutex_lock(&apple->submit_lock);
+	err = pvr_apple_wait_idle(apple, 5000000);
+	mutex_unlock(&apple->submit_lock);
+	if (err)
+		dev_err(dev, "GPU did not retire its jobs before sleep\n");
+	/* Signal what retired, then end anything left */
+	mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
+	flush_delayed_work(&apple->poll_work);
+
+	mutex_lock(&apple->submit_lock);
+	n = pvr_apple_cancel_fences(apple, -ETIMEDOUT);
+	if (n)
+		dev_warn(dev, "%u GPU jobs ended unfinished before sleep\n", n);
+	dma_fence_put(apple->last_frag);
+	apple->last_frag = NULL;
+	dma_fence_put(apple->last_geom);
+	apple->last_geom = NULL;
+	spin_lock_irq(&apple->fence_lock);
+	apple->busy_since = 0;
+	spin_unlock_irq(&apple->fence_lock);
+	pvr_apple_fw_stop(apple);
+	mutex_unlock(&apple->submit_lock);
+
+	cancel_delayed_work_sync(&apple->poll_work);
+	hrtimer_cancel(&apple->poll_timer);
+	return 0;
+}
+
+/**
+ * pvr_apple_resume() - Start the GPU again after system sleep
+ * @pvr_dev: Target device.
+ *
+ * Boot the firmware from the kept image with fresh init data, as at probe.
+ * If the GPU was runtime-suspended before sleep, it stays off until the next
+ * job powers it on.
+ *
+ * Return: 0 once the GPU runs again, or a negative error. The GPU then stays
+ * off until a job times out and pvr_apple_reset() boots it again.
+ */
+int pvr_apple_resume(struct pvr_device *pvr_dev)
+{
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	int err;
+
+	/* Runtime-suspended before sleep: the next job starts it. */
+	if (pm_runtime_status_suspended(apple_dev(apple)))
+		return 0;
+
+	mutex_lock(&apple->submit_lock);
+	err = pvr_apple_fw_restart(apple);
+	mutex_unlock(&apple->submit_lock);
+	if (err)
+		dev_err(apple_dev(apple), "GPU did not start after sleep: %d\n", err);
+	else if (apple->devfreq)
+		devfreq_resume_device(apple->devfreq);
 	return err;
 }
 
@@ -1585,6 +1774,7 @@ void pvr_apple_fw_fini(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
 
+	apple->fw_ready = false;
 	dma_fence_put(apple->last_frag);
 	apple->last_frag = NULL;
 	dma_fence_put(apple->last_geom);

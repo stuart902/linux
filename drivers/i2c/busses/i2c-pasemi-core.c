@@ -59,6 +59,9 @@
  */
 #define PASEMI_TRANSFER_TIMEOUT_MS	100
 
+/* Far more than any FIFO here holds: an empty flag that never comes must not hang. */
+#define PASEMI_RX_DRAIN_MAX		256
+
 static inline void reg_write(struct pasemi_smbus *smbus, int reg, int val)
 {
 	dev_dbg(smbus->dev, "smbus write reg %x val %08x\n", reg, val);
@@ -107,6 +110,22 @@ static void pasemi_begin_xfer(struct pasemi_smbus *smbus)
 	reinit_completion(&smbus->irq_completion);
 }
 
+/*
+ * Empty the receive FIFO. Not every integration flushes it on a reset (T8010
+ * runs without the legacy CTL flush bits), and a byte left behind makes every
+ * later read return the answer before its own, for good.
+ */
+static unsigned int pasemi_drain_rx(struct pasemi_smbus *smbus)
+{
+	unsigned int drained;
+
+	for (drained = 0; drained < PASEMI_RX_DRAIN_MAX; drained++)
+		if (RXFIFO_RD(smbus) & MRXFIFO_EMPTY)
+			break;
+
+	return drained;
+}
+
 static int pasemi_smb_clear(struct pasemi_smbus *smbus)
 {
 	unsigned int status;
@@ -133,6 +152,9 @@ static int pasemi_smb_clear(struct pasemi_smbus *smbus)
 			 "Issuing reset due to status 0x%08x (xfstatus 0x%08x)\n",
 			 status, reg_read(smbus, REG_XFSTA));
 		pasemi_reset(smbus);
+		if (status & SMSTA_MRNE)
+			dev_warn(smbus->dev, "Drained %u stale received bytes\n",
+				 pasemi_drain_rx(smbus));
 	}
 
 	/* Clear the flags */
@@ -159,9 +181,14 @@ static int pasemi_smb_waitready(struct pasemi_smbus *smbus)
 				"Completion wait failed with %d, status 0x%08x\n",
 				ret, status);
 			return ret;
-		} else if (ret == 0) {
+		} else if (ret == 0 && !(status & SMSTA_XEN)) {
 			dev_err(smbus->dev, "Timeout, status 0x%08x\n", status);
 			return -ETIME;
+		} else if (ret == 0) {
+			/* It finished; only its interrupt is late. */
+			dev_warn_ratelimited(smbus->dev,
+					     "Late completion interrupt, status 0x%08x\n",
+					     status);
 		}
 	} else {
 		ret = readx_poll_timeout(ioread32, smbus->ioaddr + REG_SMSTA,

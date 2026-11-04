@@ -14,6 +14,13 @@ config ARM_CPUIDLE
 	  initialized by calling the CPU operations init idle hook
 	  provided by architecture code.
 
+config ARM_APPLE_CPUIDLE
+	bool "Apple SoC CPU idle driver"
+	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
+	help
+	  Select this to give Apple SoCs, which have no PSCI, the idle state
+	  that suspend-to-idle needs to freeze the tick and suspend timekeeping.
+
 config ARM_PSCI_CPUIDLE
 	bool "PSCI CPU idle Driver"
 	depends on ARM_PSCI_FW

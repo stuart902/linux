@@ -87,6 +87,8 @@ int pvr_apple_fw_init(struct pvr_device *pvr_dev);
 void pvr_apple_fw_fini(struct pvr_device *pvr_dev);
 struct pvr_gem_object *pvr_apple_pm_pages(struct pvr_device *pvr_dev, size_t size);
 int pvr_apple_reset(struct pvr_device *pvr_dev);
+int pvr_apple_suspend(struct pvr_device *pvr_dev);
+int pvr_apple_resume(struct pvr_device *pvr_dev);
 void pvr_apple_device_info_init(struct pvr_device *pvr_dev);
 struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
 					       struct pvr_vm_context *vm_ctx, u64 stream,
@@ -113,6 +115,8 @@ static inline struct pvr_gem_object *pvr_apple_pm_pages(struct pvr_device *pvr_d
 	return ERR_PTR(-E2BIG);
 }
 static inline int pvr_apple_reset(struct pvr_device *pvr_dev) { return -ENODEV; }
+static inline int pvr_apple_suspend(struct pvr_device *pvr_dev) { return 0; }
+static inline int pvr_apple_resume(struct pvr_device *pvr_dev) { return 0; }
 static inline void pvr_apple_device_info_init(struct pvr_device *pvr_dev) {}
 static inline int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
 {

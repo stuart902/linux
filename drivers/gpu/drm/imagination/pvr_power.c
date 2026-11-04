@@ -434,9 +434,9 @@ pvr_power_device_idle(struct device *dev)
 	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
 	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
 
-	/* Apple firmware power management is not implemented: stay active. */
+	/* Apple: every job holds a reference until it retires, so idle is idle. */
 	if (pvr_device_is_apple(pvr_dev))
-		return -EBUSY;
+		return 0;
 
 	return pvr_power_is_idle(pvr_dev) ? 0 : -EBUSY;
 }

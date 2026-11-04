@@ -47,7 +47,6 @@
 #define  MCA_RESET_RX		BIT(1)
 #define MCA_FRAME		0x10
 #define  MCA_FRAME_MASTER	BIT(0)
-#define  MCA_FRAME_PROVIDER_PHASE	BIT(2)
 #define  MCA_FRAME_RUN		BIT(1)
 #define  MCA_FRAME_FMT		BIT(3)	/* set unless format flag bit 1 */
 #define  MCA_FRAME_DUTY		BIT(6)
@@ -130,9 +129,36 @@
 			 SNDRV_PCM_RATE_48000)
 #define MCA_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE)
 
+/*
+ * Both variants are _setIISConfig_v4 evaluated for the board's iisConfig (the
+ * "reg" of the ADT's audio-data node below the MCA):
+ *
+ *   J71t mca0 10 00 00 00 02 00 01 00 ...    consumer, I2S, 2 x 16 bit
+ *   J71b mca2 01 13 00 00 08 00 01 00 ...    provider, 8 x 16 bit, slots 0-3
+ *
+ * Bytes 0xc/0xe of the J71b record are the 128-bit frame and its 1-bit sync
+ * pulse: the amplifiers run in TDM mode, as MAX98357 calls it.
+ */
 struct s8000_mca_hw {
 	u32 version;
 	bool clock_provider;
+	unsigned int dai_format;	/* SND_SOC_DAIFMT_* */
+	unsigned int channels;
+	unsigned int slots;
+	u32 tx_slots;
+	u32 tx_cfg;
+	u32 rx_cfg;
+	u32 rx_slots;
+	u64 formats;
+	u32 frame_flags;		/* FRAME bits 6:2 */
+	unsigned int sync_bits;		/* 0: half a frame */
+	u32 stream_irqs;		/* error causes open while TX is prepared */
+	/*
+	 * Divisor of every sample on its way to the DMA buffer, 1 for none.
+	 * A board without volume hardware bounds its output here, where no
+	 * client can bypass it; the PCM then has no mmap access.
+	 */
+	unsigned int attenuation;
 	/* AppleAE2MCA _getMCLKClkCon: nclk / 2 (0x18) | output enable (0x40) */
 	u32 mclk_ctl;
 	unsigned long mclk_rate;
@@ -165,6 +191,8 @@ struct s8000_mca {
 	u32 fifo_tx;
 	bool capture;		/* SmartIO "rx" channel present */
 	struct snd_soc_dai_driver dai_drv;
+	struct snd_pcm_hardware pcm_hw;
+	struct snd_dmaengine_pcm_config pcm_config;
 	struct snd_dmaengine_dai_dma_data dma_tx, dma_rx;
 	struct apple_sio_dma_config sio_cfg[2];	/* per SNDRV_PCM_STREAM_* */
 
@@ -273,7 +301,7 @@ static int mca_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	/* S8000 consumes codec clocks; T8010 drives the digital speaker amps. */
 	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != provider)
 		return -EINVAL;
-	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
+	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != mca->hw->dai_format)
 		return -EINVAL;
 	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
 		return -EINVAL;
@@ -308,10 +336,11 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 	unsigned int bits = params_width(params);
 	unsigned int slot = params_physical_width(params);
 	unsigned int channels = params_channels(params);
-	unsigned int slots = 2, frame_bits = slot * slots, depth;
+	unsigned int slots = mca->hw->slots, frame_bits = slot * slots, depth;
+	unsigned int sync_bits = mca->hw->sync_bits ?: frame_bits / 2;
 	u32 width_code;
 
-	if (channels != 2)
+	if (channels != mca->hw->channels)
 		return -EINVAL;
 	/* Qualify one clock family first; no unverified v5 capture or TDM. */
 	if (mca->hw->clock_provider && params_rate(params) != 48000)
@@ -329,22 +358,22 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 	}
 
 	/*
-	 * _setIISConfig_v4 for: consumer, MCLK out, I2S, 2 slots. The DAI is
-	 * symmetric, so both directions compute the same values for both
-	 * halves; prepare writes the half (or the block) it owns.
+	 * _setIISConfig_v4 for the board's iisConfig. The DAI is symmetric,
+	 * so both directions compute the same values for both halves; prepare
+	 * writes the half (or the block) it owns.
 	 */
 	mca->sample = (32 - bits) << 8 | (32 - bits);
 	depth = mca_tx_depth(mca, params_rate(params), channels);
 	mca->tx_fifo_cfg = depth | (depth - 1) << 16;
-	mca->tx_slots = GENMASK(slots - 1, 0);
-	mca->rx_slots = GENMASK(slots - 1, 0);
-	/* bits 15:8 = data delay (1, I2S); 0x33 base; 0x4 for format 0 */
-	mca->tx_cfg = MCA_TX_CFG_I2S;
-	mca->frame = FIELD_PREP(MCA_FRAME_HALF, frame_bits / 2 - 1) |
+	mca->tx_slots = mca->hw->tx_slots;
+	mca->rx_slots = mca->hw->rx_slots;
+	/* bits 15:8 = data delay (1); 0x33 base; 0x4 for iisConfig[1] bit 4 clear */
+	mca->tx_cfg = mca->hw->tx_cfg;
+	mca->frame = FIELD_PREP(MCA_FRAME_HALF, sync_bits - 1) |
 		     FIELD_PREP(MCA_FRAME_WIDTH, width_code) |
 		     FIELD_PREP(MCA_FRAME_SLOTS, slots - 1) |
 		     FIELD_PREP(MCA_FRAME_MCLK_DIV, 0) |
-		     MCA_FRAME_DUTY | MCA_FRAME_FMT;
+		     mca->hw->frame_flags;
 
 	if (mca->hw->clock_provider) {
 		unsigned long bitclk = params_rate(params) * frame_bits;
@@ -355,7 +384,7 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 			return ret;
 		if (clk_get_rate(mca->bitclk) != bitclk)
 			return -EINVAL;
-		mca->frame |= MCA_FRAME_MASTER | MCA_FRAME_PROVIDER_PHASE;
+		mca->frame |= MCA_FRAME_MASTER;
 	}
 
 	dma->addr_width = slot == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
@@ -380,7 +409,7 @@ static void mca_write_rx(struct s8000_mca *mca)
 	mca_write(mca, MCA_RX_FIFO_CFG, MCA_RX_FIFO_CFG_IOS);
 	mca_write(mca, MCA_RX_SLOTS, mca->rx_slots);
 	mca_write(mca, MCA_RX_SLOTS_HI, 0);
-	mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
+	mca_write(mca, MCA_RX_CFG, mca->hw->rx_cfg & ~MCA_XX_CFG_EN);
 }
 
 /* The whole block, as _setIISConfig_v4: only while no direction is prepared */
@@ -422,7 +451,7 @@ static int mca_init_block(struct s8000_mca *mca)
 	mca_write(mca, MCA_RX_SLOTS, mca->rx_slots);
 	mca_write(mca, MCA_RX_SLOTS_HI, 0);
 	mca_write(mca, MCA_TX_CFG, mca->tx_cfg & ~MCA_XX_CFG_EN);
-	mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
+	mca_write(mca, MCA_RX_CFG, mca->hw->rx_cfg & ~MCA_XX_CFG_EN);
 	return 0;
 }
 
@@ -482,7 +511,8 @@ static int mca_prepare(struct snd_pcm_substream *substream,
 
 	spin_lock_irqsave(&mca->hw_lock, flags);
 	mca->prep_mask |= BIT(dir);
-	mca->irq_mask &= ~(tx ? MCA_IRQ_TX_CAUSES : MCA_IRQ_RX_CAUSES);
+	mca->irq_mask &= ~(tx ? MCA_IRQ_TX_CAUSES | mca->hw->stream_irqs :
+			   MCA_IRQ_RX_CAUSES);
 	mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
 	if (first)
 		mca_write(mca, MCA_FRAME, mca->frame);
@@ -550,7 +580,7 @@ static int mca_trigger(struct snd_pcm_substream *substream, int cmd,
 		if (tx)
 			mca_write(mca, MCA_TX_CFG, mca->tx_cfg | MCA_XX_CFG_EN);
 		else
-			mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S | MCA_XX_CFG_EN);
+			mca_write(mca, MCA_RX_CFG, mca->hw->rx_cfg | MCA_XX_CFG_EN);
 		mca->run_mask |= BIT(dir);
 		mca_write(mca, MCA_FRAME, mca->frame | MCA_FRAME_RUN);
 		spin_unlock_irqrestore(&mca->hw_lock, flags);
@@ -561,7 +591,12 @@ static int mca_trigger(struct snd_pcm_substream *substream, int cmd,
 		spin_lock_irqsave(&mca->hw_lock, flags);
 		mca_write(mca, tx ? MCA_TX_CFG : MCA_RX_CFG, 0);
 		mca->run_mask &= ~BIT(dir);
-		if (!mca->run_mask)
+		/*
+		 * MAX98357 asks not to lose LRCLK while BCLK runs and the amp
+		 * is on, and the amp stops after this DAI: a provider keeps
+		 * the frame running until hw_free.
+		 */
+		if (!mca->run_mask && !mca->hw->clock_provider)
 			mca_write(mca, MCA_FRAME, mca->frame);
 		/* TX stops with RESET = 1, RX with RESET = 2 (iOS) */
 		mca_write(mca, MCA_RESET, reset);
@@ -685,9 +720,23 @@ static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+/* Only for S16_LE PCMs: the variants with an attenuation allow nothing else. */
+static int mca_attenuate(struct snd_pcm_substream *substream, int channel,
+			 unsigned long hwoff, unsigned long bytes)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct s8000_mca *mca =
+		snd_soc_dai_get_drvdata(snd_soc_rtd_to_cpu(rtd, 0));
+	s16 *sample = (s16 *)(substream->runtime->dma_area + hwoff);
+	unsigned long i;
+
+	for (i = 0; i < bytes / sizeof(*sample); i++)
+		sample[i] /= (int)mca->hw->attenuation;
+	return 0;
+}
+
 static const struct snd_dmaengine_pcm_config mca_dma_config = {
 	.prepare_slave_config = mca_prepare_slave_config,
-	.pcm_hardware = &mca_dma_hw,
 	.prealloc_buffer_size = 128 * 1024,
 };
 
@@ -877,6 +926,9 @@ static int s8000_mca_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "failed to add MCLK provider\n");
 
 	mca->dai_drv = mca_dai;
+	mca->dai_drv.playback.channels_min = mca->hw->channels;
+	mca->dai_drv.playback.channels_max = mca->hw->channels;
+	mca->dai_drv.playback.formats = mca->hw->formats;
 	if (mca->hw->clock_provider)
 		mca->dai_drv.playback.rates = SNDRV_PCM_RATE_48000;
 	if (!mca->capture)
@@ -887,7 +939,19 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register component\n");
 
-	ret = devm_snd_dmaengine_pcm_register(dev, &mca_dma_config, 0);
+	mca->pcm_hw = mca_dma_hw;
+	mca->pcm_hw.channels_min = mca->hw->channels;
+	mca->pcm_hw.channels_max = mca->hw->channels;
+	mca->pcm_hw.formats = mca->hw->formats;
+	mca->pcm_config = mca_dma_config;
+	mca->pcm_config.pcm_hardware = &mca->pcm_hw;
+	if (mca->hw->attenuation > 1) {
+		mca->pcm_hw.info &= ~(SNDRV_PCM_INFO_MMAP |
+				      SNDRV_PCM_INFO_MMAP_VALID);
+		mca->pcm_config.process = mca_attenuate;
+	}
+
+	ret = devm_snd_dmaengine_pcm_register(dev, &mca->pcm_config, 0);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register PCM\n");
 
@@ -897,6 +961,15 @@ static int s8000_mca_probe(struct platform_device *pdev)
 /* MCA0 on S8000/S8003, from iOS 16.7.10 AppleAE2MCA and the J71t ADT */
 static const struct s8000_mca_hw s8000_mca_hw = {
 	.version = 4,
+	.dai_format = SND_SOC_DAIFMT_I2S,
+	.channels = 2,
+	.slots = 2,
+	.tx_slots = 0x3,
+	.tx_cfg = MCA_TX_CFG_I2S,
+	.rx_cfg = MCA_RX_CFG_I2S,
+	.rx_slots = 0x3,
+	.formats = MCA_FORMATS,
+	.frame_flags = MCA_FRAME_DUTY | MCA_FRAME_FMT,
 	.mclk_ctl = 0x58,
 	.mclk_rate = 12000000,
 	.sio_xfer16 = 0x21,
@@ -906,10 +979,28 @@ static const struct s8000_mca_hw s8000_mca_hw = {
 	.sio_trigger = 0x180,
 };
 
-/* J71b MCA2 TX: iPadOS 17.7.11 dma-channels, not the A9 MCA0 shim. */
+/*
+ * J71b MCA2 TX: iPadOS 17.7.11 audio-speaker iisConfig and dma-channels, not
+ * the A9 MCA0 values. Slots 0-3 carry the four amplifiers; which speaker sits
+ * in which slot is not in the ADT. FRAME has no bits 6:2 set and the IRQ mask
+ * opens the frame error, as iOS does for a fixed frame length.
+ *
+ * The attenuation bounds full scale to -12 dB: iOS protects the speakers from
+ * its side of the amplifiers (speaker protection), which Linux does not have.
+ */
 static const struct s8000_mca_hw t8010_mca_hw = {
 	.version = 5,
 	.clock_provider = true,
+	.dai_format = SND_SOC_DAIFMT_DSP_A,
+	.channels = 4,
+	.slots = 8,
+	.tx_slots = 0x0f,
+	.tx_cfg = 0x133,
+	.rx_cfg = 0x137,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.sync_bits = 1,
+	.stream_irqs = MCA_IRQ_FRAME_ERROR,
+	.attenuation = 4,
 	.sio_xfer16 = 0x21,
 	.sio_xfer32 = 0x22,
 	.sio_timeout = 0,

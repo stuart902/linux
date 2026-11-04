@@ -4,6 +4,7 @@
 #include <drm/drm_managed.h>
 #include <drm/gpu_scheduler.h>
 #include <linux/overflow.h>
+#include <linux/property.h>
 
 #include "pvr_apple.h"
 #include "pvr_cccb.h"
@@ -1502,6 +1503,9 @@ void pvr_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity)
  */
 int pvr_queue_device_init(struct pvr_device *pvr_dev)
 {
+	const struct pvr_device_data *data =
+		device_get_match_data(from_pvr_device(pvr_dev)->dev);
+	bool apple = IS_ENABLED(CONFIG_DRM_POWERVR_APPLE) && data && data->apple_fw;
 	int err;
 
 	INIT_LIST_HEAD(&pvr_dev->queues.active);
@@ -1510,7 +1514,13 @@ int pvr_queue_device_init(struct pvr_device *pvr_dev)
 	if (err)
 		return err;
 
-	pvr_dev->sched_wq = alloc_workqueue("powervr-sched", WQ_UNBOUND, 0);
+	/*
+	 * The Apple GPU stops its firmware for system sleep: no job may reach
+	 * it then, so its schedulers' work freezes with the system. Probe runs
+	 * this before pvr_device_init() sets device_data: read the match data.
+	 */
+	pvr_dev->sched_wq = alloc_workqueue("powervr-sched",
+					    WQ_UNBOUND | (apple ? WQ_FREEZABLE : 0), 0);
 	if (!pvr_dev->sched_wq)
 		return -ENOMEM;
 
