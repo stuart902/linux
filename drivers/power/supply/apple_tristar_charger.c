@@ -139,6 +139,7 @@ struct tristar_charger {
 	struct usb_current_queue current_queue;
 	u64 current_session;
 	u64 current_sequence;
+	unsigned int current_source_events;
 	bool current_stopped;
 
 	/*
@@ -754,22 +755,25 @@ static void tristar_set_usb(struct tristar_charger *chg, bool on)
 {
 	unsigned long flags;
 	unsigned int epoch;
+	bool can_track;
 	u64 session = 0;
 	int ret;
 
 	spin_lock_irqsave(&chg->current_lock, flags);
 	epoch = READ_ONCE(chg->epoch);
+	can_track = !chg->current_source_events;
 	chg->current_session = 0;
 	chg->current_sequence = 0;
 	usb_current_queue_init(&chg->current_queue);
 	spin_unlock_irqrestore(&chg->current_lock, flags);
 	if (IS_ENABLED(CONFIG_POWER_RESET_APPLE_D2365_REFERENCE) &&
-	    on && !chg->usb_on && !chg->stopping) {
+	    on && !chg->usb_on && !chg->stopping && can_track) {
 		ret = usb_role_switch_set_role_with_current_session(chg->role_sw, &session);
 		if (!ret) {
 			/* A PMU event during the sleepable role operation wins. */
 			spin_lock_irqsave(&chg->current_lock, flags);
-			if (!chg->current_stopped && epoch == READ_ONCE(chg->epoch))
+			if (!chg->current_stopped && !chg->current_source_events &&
+			    epoch == READ_ONCE(chg->epoch))
 				chg->current_session = session;
 			spin_unlock_irqrestore(&chg->current_lock, flags);
 		}
@@ -1164,11 +1168,16 @@ static void tristar_source_event(struct tristar_charger *chg)
 	u64 now;
 	unsigned long flags;
 
-	tristar_event_withdraw(chg);
-	/* Invalidate before identification, including a role handoff in flight. */
+	/* Invalidate before sleepable I/O, including a role handoff in flight. */
 	spin_lock_irqsave(&chg->current_lock, flags);
 	chg->current_session = 0;
+	chg->current_source_events++;
+	spin_unlock_irqrestore(&chg->current_lock, flags);
+	tristar_event_withdraw(chg);
+	/* Preserve the legacy epoch boundary after the withdrawal write. */
+	spin_lock_irqsave(&chg->current_lock, flags);
 	WRITE_ONCE(chg->epoch, chg->epoch + 1);
+	chg->current_source_events--;
 	spin_unlock_irqrestore(&chg->current_lock, flags);
 	mod_delayed_work(system_highpri_wq, &chg->poll_work, 0);
 

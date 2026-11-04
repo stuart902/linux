@@ -68,6 +68,7 @@ struct tristar_charger {
  spinlock_t current_lock;
  struct usb_current_queue current_queue;
  u64 current_session,current_sequence;
+ unsigned int current_source_events;
  bool current_stopped,usb_on,stopping;
  unsigned int epoch,usb_ma;
  struct usb_role_switch *role_sw;
@@ -98,7 +99,7 @@ production += function('drivers/usb/dwc2/drd.c','dwc2_drd_role_sw_set_current')
 production += function('drivers/power/supply/apple_tristar_charger.c','tristar_current_invalidate')
 production += function('drivers/power/supply/apple_tristar_charger.c','tristar_usb_current_event')
 role_fake = r'''
-static bool inject_source_event,inject_reset,spawn_delivery;
+static bool inject_source_event,inject_source_inflight,inject_reset,spawn_delivery;
 static u64 next_session;
 static pthread_t delivery;
 static void *deliver_thread(void *arg) { dwc2_current_work(arg);return NULL; }
@@ -113,6 +114,12 @@ static int usb_role_switch_set_role_with_current_session(struct usb_role_switch 
   supply->chg->current_session=0;supply->chg->epoch++;
   spin_unlock_irqrestore(&supply->chg->current_lock,flags);
  }
+ if(inject_source_inflight) {
+  unsigned long flags;
+  spin_lock_irqsave(&supply->chg->current_lock,flags);
+  supply->chg->current_session=0;supply->chg->current_source_events++;
+  spin_unlock_irqrestore(&supply->chg->current_lock,flags);
+ }
  if(inject_reset) dwc2_current_reset(sw->hsotg,dwc2_current_pending(sw->hsotg));
  if(spawn_delivery) assert(!pthread_create(&delivery,NULL,deliver_thread,&sw->hsotg->current_work));
  return 0;
@@ -121,6 +128,11 @@ static int usb_role_switch_set_role(struct usb_role_switch *sw,enum usb_role rol
 { return dwc2_drd_role_sw_set_current(sw,role,0); }
 '''
 production2 = function('drivers/power/supply/apple_tristar_charger.c','tristar_set_usb')
+source_event = function('drivers/power/supply/apple_tristar_charger.c', 'tristar_source_event')
+assert source_event.index('chg->current_source_events++') < source_event.index('tristar_event_withdraw(chg)')
+assert source_event.index('tristar_event_withdraw(chg)') < source_event.index('WRITE_ONCE(chg->epoch')
+assert source_event.index('WRITE_ONCE(chg->epoch') < source_event.index('chg->current_source_events--')
+
 tests = r'''
 struct fixture { struct dwc2_hsotg h;struct tristar_charger c;struct usb_role_switch sw;struct power_supply psy; };
 static void setup(struct fixture *f)
@@ -131,7 +143,7 @@ static void setup(struct fixture *f)
  dwc2_current_init(&f->h);usb_current_queue_init(&f->c.current_queue);
  f->h.dr_mode=USB_DR_MODE_PERIPHERAL;f->h.role_sw_default_mode=USB_DR_MODE_UNKNOWN;
  f->h.role_sw_hold=true;f->h.enabled=true;f->h.ll_hw_enabled=true;f->h.usb_psy_name="lightning";
- inject_source_event=inject_reset=spawn_delivery=false;
+ inject_source_event=inject_source_inflight=inject_reset=spawn_delivery=false;
 }
 static void finish(struct fixture *f)
 {
@@ -186,6 +198,15 @@ static void stale_reset_and_roles(void)
  dwc2_current_reset(&f.h,dwc2_current_pending(&f.h));flush_work(&f.h.current_work);
  assert(take(&f).reason==USB_CURRENT_RESET);finish(&f);
 }
+static void inflight_source_events(void)
+{
+ struct fixture f;setup(&f);f.c.current_source_events=2;
+ mutex_lock(&f.c.lock);tristar_set_usb(&f.c,true);mutex_unlock(&f.c.lock);
+ assert(!f.c.current_session&&!f.h.current_pending);finish(&f);
+ setup(&f);inject_source_inflight=true;
+ mutex_lock(&f.c.lock);tristar_set_usb(&f.c,true);mutex_unlock(&f.c.lock);
+ assert(!f.c.current_session&&f.c.current_source_events==1);finish(&f);
+}
 static void loss_and_stop(void)
 {
  struct fixture f;struct usb_current_event e;unsigned int i;setup(&f);begin(&f);
@@ -221,7 +242,7 @@ static void delivery_and_handoff(void)
 }
 int main(void)
 {
- path_and_reasons();stale_reset_and_roles();loss_and_stop();delivery_and_handoff();
+ path_and_reasons();stale_reset_and_roles();inflight_source_events();loss_and_stop();delivery_and_handoff();
  puts("actual DWC2/Tristar current stream: reasons, pending/reset epochs, FIFO loss, lifetime and handoff passed");return 0;
 }
 '''
