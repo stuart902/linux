@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Offline D2365 shutdown regression checks; never access a device.
 
 Compile the driver's actual prepare/final functions against an in-memory bus.
