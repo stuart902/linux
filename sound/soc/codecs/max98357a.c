@@ -5,24 +5,146 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/gpio/consumer.h>
+#include <linux/hrtimer.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/spinlock.h>
+#include <linux/timekeeping.h>
 #include <sound/pcm.h>
 #include <sound/soc.h>
 #include <sound/soc-dai.h>
 #include <sound/soc-dapm.h>
 
+/* Diagnostic only: one window per module lifetime, never a volume protector. */
+#define J71B_TEST_WINDOW_MS 30
+static bool j71b_test_arm;
+static atomic_t j71b_test_used = ATOMIC_INIT(0);
+#if IS_ENABLED(CONFIG_SND_SOC_MAX98357A_J71B_TEST)
+module_param_named(j71b_test_arm, j71b_test_arm, bool, 0400);
+MODULE_PARM_DESC(j71b_test_arm,
+		"Permit one 30 ms J71b amplifier test window (default: false)");
+#endif
+
 struct max98357a_priv {
 	struct gpio_desc *sdmode;
 	unsigned int sdmode_delay;
 	int sdmode_switch;
+	bool test_gate;
+	bool test_terminal;
+	raw_spinlock_t test_lock;
+	struct hrtimer test_timer;
 };
+
+/* Called with test_lock held. Do not stop BCLK/LRCLK to mute the amplifier. */
+static void max98357a_test_mute(struct max98357a_priv *max98357a)
+{
+	gpiod_set_value(max98357a->sdmode, 0);
+}
+
+static enum hrtimer_restart max98357a_test_expire(struct hrtimer *timer)
+{
+	struct max98357a_priv *max98357a =
+		container_of(timer, struct max98357a_priv, test_timer);
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&max98357a->test_lock, flags);
+	max98357a_test_mute(max98357a);
+	raw_spin_unlock_irqrestore(&max98357a->test_lock, flags);
+	return HRTIMER_NORESTART;
+}
+
+static int max98357a_test_trigger(struct max98357a_priv *max98357a, int cmd)
+{
+	ktime_t deadline;
+	unsigned long flags;
+	int ret = 0;
+
+	raw_spin_lock_irqsave(&max98357a->test_lock, flags);
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+		/* No automatic resume, retry, rebind or second-stream rearming. */
+		if (max98357a->test_terminal || !j71b_test_arm ||
+		    !max98357a->sdmode_switch ||
+		    atomic_cmpxchg(&j71b_test_used, 0, 1)) {
+			max98357a_test_mute(max98357a);
+			ret = -EPERM;
+			break;
+		}
+		/* Arm before unmute, with no sleeping GPIO or delay in this path. */
+		deadline = ktime_add_ms(ktime_get(), J71B_TEST_WINDOW_MS);
+		hrtimer_start(&max98357a->test_timer, deadline,
+			      HRTIMER_MODE_ABS_HARD);
+		if (ktime_compare(ktime_get(), deadline) >= 0) {
+			max98357a_test_mute(max98357a);
+			ret = -ETIME;
+			break;
+		}
+		gpiod_set_value(max98357a->sdmode, 1);
+		break;
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		max98357a_test_mute(max98357a);
+		ret = -EPERM;
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		max98357a_test_mute(max98357a);
+		break;
+	default:
+		max98357a_test_mute(max98357a);
+		ret = -EINVAL;
+		break;
+	}
+	raw_spin_unlock_irqrestore(&max98357a->test_lock, flags);
+	/* A pending callback may only mute; teardown synchronously drains it. */
+	return ret;
+}
+
+/* Runs before devres releases the GPIO and after ASoC unregisters the codec. */
+static void max98357a_test_quiesce(void *data)
+{
+	struct max98357a_priv *max98357a = data;
+	unsigned long flags;
+
+	if (!max98357a->test_gate)
+		return;
+	raw_spin_lock_irqsave(&max98357a->test_lock, flags);
+	max98357a->test_terminal = true;
+	max98357a_test_mute(max98357a);
+	raw_spin_unlock_irqrestore(&max98357a->test_lock, flags);
+	hrtimer_cancel(&max98357a->test_timer);
+}
+
+static int max98357a_test_init(struct device *dev,
+			     struct max98357a_priv *max98357a)
+{
+	if (!IS_ENABLED(CONFIG_SND_SOC_MAX98357A_J71B_TEST) ||
+	    !of_machine_is_compatible("apple,j71b"))
+		return 0;
+
+	/* Fail closed on this board if the diagnostic prerequisites differ. */
+	if (!device_property_read_bool(dev, "maxim,tdm") ||
+	    !max98357a->sdmode || gpiod_cansleep(max98357a->sdmode) ||
+	    max98357a->sdmode_delay)
+		return dev_err_probe(dev, -EINVAL,
+				     "J71b test gate requires TDM, atomic SD_MODE and no delay\n");
+
+	raw_spin_lock_init(&max98357a->test_lock);
+	hrtimer_setup(&max98357a->test_timer, max98357a_test_expire,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_ABS_HARD);
+	max98357a->test_gate = true;
+	dev_notice(dev, "diagnostic J71b gate: one %u ms software window, armed=%u\n",
+		   J71B_TEST_WINDOW_MS, j71b_test_arm);
+	return devm_add_action_or_reset(dev, max98357a_test_quiesce, max98357a);
+}
 
 static int max98357a_daiops_trigger(struct snd_pcm_substream *substream,
 		int cmd, struct snd_soc_dai *dai)
@@ -30,6 +152,9 @@ static int max98357a_daiops_trigger(struct snd_pcm_substream *substream,
 	struct snd_soc_component *component = dai->component;
 	struct max98357a_priv *max98357a =
 		snd_soc_component_get_drvdata(component);
+
+	if (max98357a->test_gate)
+		return max98357a_test_trigger(max98357a, cmd);
 
 	if (!max98357a->sdmode)
 		return 0;
@@ -62,6 +187,20 @@ static int max98357a_sdmode_event(struct snd_soc_dapm_widget *w,
 		snd_soc_dapm_to_component(w->dapm);
 	struct max98357a_priv *max98357a =
 		snd_soc_component_get_drvdata(component);
+
+	if (max98357a->test_gate) {
+		unsigned long flags;
+
+		raw_spin_lock_irqsave(&max98357a->test_lock, flags);
+		if (event & SND_SOC_DAPM_POST_PMU)
+			max98357a->sdmode_switch = 1;
+		if (event & SND_SOC_DAPM_POST_PMD) {
+			max98357a->sdmode_switch = 0;
+			max98357a_test_mute(max98357a);
+		}
+		raw_spin_unlock_irqrestore(&max98357a->test_lock, flags);
+		return 0;
+	}
 
 	if (event & SND_SOC_DAPM_POST_PMU)
 		max98357a->sdmode_switch = 1;
@@ -165,6 +304,10 @@ static int max98357a_platform_probe(struct platform_device *pdev)
 			"default: no delay\n");
 	}
 
+	ret = max98357a_test_init(&pdev->dev, max98357a);
+	if (ret)
+		return ret;
+
 	dev_set_drvdata(&pdev->dev, max98357a);
 
 	dai_driver = &max98357a_dai_driver;
@@ -174,6 +317,11 @@ static int max98357a_platform_probe(struct platform_device *pdev)
 	return devm_snd_soc_register_component(&pdev->dev,
 			&max98357a_component_driver,
 			dai_driver, 1);
+}
+
+static void max98357a_platform_shutdown(struct platform_device *pdev)
+{
+	max98357a_test_quiesce(dev_get_drvdata(&pdev->dev));
 }
 
 #ifdef CONFIG_OF
@@ -201,6 +349,7 @@ static struct platform_driver max98357a_platform_driver = {
 		.acpi_match_table = ACPI_PTR(max98357a_acpi_match),
 	},
 	.probe	= max98357a_platform_probe,
+	.shutdown = max98357a_platform_shutdown,
 };
 module_platform_driver(max98357a_platform_driver);
 

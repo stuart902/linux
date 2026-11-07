@@ -1447,6 +1447,20 @@ config SND_SOC_MAX98095
 config SND_SOC_MAX98357A
 	tristate "Maxim MAX98357A CODEC"
 
+config SND_SOC_MAX98357A_J71B_TEST
+	bool "J71b one-shot speaker diagnostic gate"
+	depends on SND_SOC_MAX98357A && OF && HIGH_RES_TIMERS
+	default n
+	help
+	  Diagnostic only. On J71b, keep the amplifier muted unless the read-only
+	  j71b_test_arm module parameter was set at load time. Permit one START
+	  per module lifetime, then mute SD_MODE after a 30 ms software timer.
+	  Resuming or reopening the stream cannot rearm the gate.
+
+	  This is not speaker protection or a hard deadline during a kernel
+	  stall. The timer does not stop DMA or establish physical isolation.
+	  Say N unless preparing an explicitly authorized diagnostic image.
+
 config SND_SOC_MAX98371
 	tristate
 	depends on I2C
