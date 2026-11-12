@@ -50,6 +50,19 @@ properties:
       The chip's unique ID (ECID), filled in by the bootloader. The
       firmware's boot arguments carry it.
 
+  aop-audio:
+    type: object
+    description:
+      Audio service announced by the AOP firmware. Provides the PDM clock
+      property interface for an exclusively host-owned pdm0 domain. This
+      node alone does not describe a capture route or enable microphones.
+    properties:
+      compatible:
+        const: apple,t8010-aop-audio
+    required:
+      - compatible
+    additionalProperties: false
+
 patternProperties:
   "^(accel|gyro|compass|pressure)$":
     type: object
@@ -97,6 +110,10 @@ examples:
 
             accel {
                 compatible = "apple,t8010-aop-accel";
+            };
+
+            aop-audio {
+                compatible = "apple,t8010-aop-audio";
             };
         };
     };
