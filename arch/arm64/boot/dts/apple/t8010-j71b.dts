@@ -4,6 +4,7 @@
  * Copyright (c) 2022, Konrad Dybcio <konradybcio@kernel.org>
  */
 
+/* Experimental capture: assumes one Linux host HP requester. */
 /dts-v1/;
 
 #include "t8010-ipad6.dtsi"
@@ -11,6 +12,45 @@
 / {
 	compatible = "apple,j71b", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 6 (Wi-Fi)";
+
+	dmic: dmic {
+		compatible = "dmic-codec";
+		#sound-dai-cells = <0>;
+		num-channels = <2>;
+		status = "okay";
+	};
+
+	microphones {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "J71b Microphones";
+		status = "okay";
+
+		simple-audio-card,cpu {
+			sound-dai = <&pdm>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&dmic>;
+		};
+	};
+
+	soc {
+		pdm: pdm@20a0b4000 {
+			compatible = "apple,j71b-pdm";
+			reg = <0x2 0x0a0b4000 0x0 0x1000>,
+			      <0x2 0x0a120000 0x0 0x4000>,
+			      <0x2 0x0a124000 0x0 0x4000>;
+			reg-names = "pdmc", "decimator0", "decimator1";
+			interrupts = <AIC_IRQ 238 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_hfd0>;
+			dmas = <&sio 0x5b>;
+			dma-names = "rx";
+			apple,aop-audio = <&aop_audio>;
+			#sound-dai-cells = <0>;
+			status = "okay";
+		};
+	};
+
 };
 
 &speakers {
@@ -19,6 +59,13 @@
 
 &wifi {
 	brcm,board-type = "apple,j71b";
+};
+
+&aop {
+	aop_audio: aop-audio {
+		compatible = "apple,t8010-aop-audio";
+		status = "okay";
+	};
 };
 
 &touchscreen {

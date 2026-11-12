@@ -50,6 +50,26 @@ config APPLE_AOP_T8010
 
 	  Say 'y' or 'm' here if you have an A9- or A10-based iPad or iPhone.
 
+config APPLE_AOP_AUDIO
+	tristate "Apple T8010 AOP audio clock service"
+	depends on APPLE_AOP_T8010
+	depends on EXPERT
+	help
+	  Provide the firmware PDM clock property service through the existing
+	  T8010 AOP owner. This is experimental infrastructure, not microphone
+	  enablement. A board must establish exclusive PDM ownership and safe
+	  DMA teardown before enabling a capture consumer. If unsure, say N.
+
+config APPLE_AOP_AUDIO_KUNIT_TEST
+	tristate "Apple AOP audio protocol tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test inline PDM clock property encoding and response decoding,
+	  wrapped-call checksums, malformed replies and clock-state handling.
+	  These tests do not access hardware or start audio capture.
+	  If unsure, say N.
+
 config APPLE_PMP_T8015_V1
 	tristate "Apple T8015 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST

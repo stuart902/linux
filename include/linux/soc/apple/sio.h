@@ -63,6 +63,23 @@ apple_sio_request_async_atomic(struct apple_sio *sio, u8 endpoint, u8 opcode,
 			       u8 parameter, u32 data, u8 expected_opcode,
 			       apple_sio_async_callback_t callback,
 			       void *callback_data);
+/*
+ * Owned requests retain their tag and callback data until the expected reply.
+ * Firmware errors and software cancellation do not return DMA ownership.
+ * Only a send failure before mailbox publication may complete with an error.
+ * Keep firmware-visible memory and callback data alive until completion.
+ * A waiter must retain its request reference; callbacks need no caller reference.
+ * Provider removal waits for these requests and may block indefinitely.
+ */
+struct apple_sio_async *
+apple_sio_request_async_owned(struct apple_sio *sio, u8 endpoint, u8 opcode,
+			     u8 parameter, u32 data, u8 expected_opcode,
+			     apple_sio_async_callback_t callback,
+			     void *callback_data);
+/* Sleep without cancelling: -ETIME means still pending; zero timeout waits forever. */
+int apple_sio_async_wait(struct apple_sio_async *request,
+			 unsigned long timeout, u64 *response);
+/* Returns -EBUSY for a pending owned request. */
 int apple_sio_async_cancel(struct apple_sio_async *request);
 void apple_sio_async_put(struct apple_sio_async *request);
 
@@ -70,12 +87,15 @@ int apple_sio_request(struct apple_sio *sio, u8 endpoint, u8 opcode,
 		      u8 parameter, u32 data, u8 expected_opcode,
 		      unsigned long timeout, u64 *response);
 
-/* Fail every outstanding request on @endpoint with -ECANCELED. */
+/* Cancel non-owned requests only; firmware-owned requests remain pending. */
 void apple_sio_cancel_endpoint(struct apple_sio *sio, u8 endpoint);
 
 /*
  * Pass messages on @endpoint that match no pending request to @notify.
- * Called from the interrupt handler.
+ * The callback runs in interrupt context. Registration, replacement and
+ * removal must run in sleepable context, never from the callback itself.
+ * On return the previous callback is no longer running; callers must
+ * serialize updates for an endpoint and retain data until removal returns.
  */
 void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
 			  apple_sio_notify_t notify, void *data);

@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,t8010-pdm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J71b T8010 PDM microphone controller
+
+maintainers:
+  - Henrik Klee <henrik@goat-code.com>
+
+description: |
+  The T8010 PDM controller receives two microphones through separate HP
+  decimators. On J71b, the driver reads calibration from the live Apple
+  device tree exposed by the existing bootloader as an ADT RAM MTD.
+  Only the intersection of controller destination rates and both microphone
+  coefficient providers is accepted. Calibration is validated against the
+  actual MMIO resources and copied before the temporary ADT snapshot is freed.
+  No calibration blobs or inferred clock frequencies belong in static DTS.
+  The AOP service manages host high-power PDM requests. Board enablement must
+  establish exclusive host request ownership; independent low-power firmware
+  activity may remain after the host releases its request.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    const: apple,j71b-pdm
+  reg:
+    items:
+      - description: PDM controller registers
+      - description: Decimator 0 registers and coefficient RAM
+      - description: Decimator 1 registers and coefficient RAM
+  reg-names:
+    items:
+      - const: pdmc
+      - const: decimator0
+      - const: decimator1
+  interrupts:
+    maxItems: 1
+  apple,aop-audio:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: AOP audio service controlling this PDM clock.
+  power-domains:
+    maxItems: 1
+    description: AP PDM and high-frequency decimator domain (HFD0 on T8010).
+  dmas:
+    maxItems: 1
+  dma-names:
+    const: rx
+  '#sound-dai-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - apple,aop-audio
+  - power-domains
+  - dmas
+  - dma-names
+  - '#sound-dai-cells'
+
+unevaluatedProperties: false
