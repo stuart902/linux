@@ -10,6 +10,7 @@ obj-$(CONFIG_ADIS16136) += adis16136.o
 obj-$(CONFIG_ADIS16260) += adis16260.o
 obj-$(CONFIG_ADXRS290) += adxrs290.o
 obj-$(CONFIG_ADXRS450) += adxrs450.o
+obj-$(CONFIG_APPLE_AOP_GYRO) += apple_aop_gyro.o
 obj-$(CONFIG_BMG160) += bmg160_core.o
 obj-$(CONFIG_BMG160_I2C) += bmg160_i2c.o
 obj-$(CONFIG_BMG160_SPI) += bmg160_spi.o

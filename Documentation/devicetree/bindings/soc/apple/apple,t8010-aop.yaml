@@ -4,14 +4,14 @@
 $id: http://devicetree.org/schemas/soc/apple/apple,t8010-aop.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8010 Always-On Processor
+title: Apple S8000 and T8010 Always-On Processor
 
 maintainers:
   - Dalton Alexandre <alley.nightly_0b@icloud.com>
 
 description:
-  The Always-On Processor (AOP) of the A10 is an ARMv7 coprocessor that
-  runs RTKit firmware and serves the motion sensors (accelerometer,
+  The Always-On Processor (AOP) of the A9 and A10 is an ARMv7 coprocessor
+  that runs RTKit firmware and serves the motion sensors (accelerometer,
   gyroscope, compass, pressure) and the always-on microphones. It runs from
   local SRAM, with a further firmware segment in system memory, and talks
   to the application processor through an A7 IOP mailbox. Its firmware is
@@ -19,7 +19,9 @@ description:
 
 properties:
   compatible:
-    const: apple,t8010-aop
+    enum:
+      - apple,s8000-aop
+      - apple,t8010-aop
 
   reg:
     items:
@@ -50,6 +52,24 @@ properties:
       The chip's unique ID (ECID), filled in by the bootloader. The
       firmware's boot arguments carry it.
 
+  apple,aop-target:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The AOP target number from the Apple device tree, filled in by the
+      bootloader. The S8000 firmware's boot arguments carry it.
+
+  apple,chip-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The SoC's chip ID (e.g. 0x8003), filled in by the bootloader. The S8000
+      firmware's boot arguments carry it.
+
+  apple,chip-revision:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The SoC's chip revision, filled in by the bootloader. The S8000
+      firmware's boot arguments carry it.
+
 patternProperties:
   "^(accel|gyro|compass|pressure)$":
     type: object
@@ -58,6 +78,9 @@ patternProperties:
     properties:
       compatible:
         enum:
+          - apple,s8000-aop-accel
+          - apple,s8000-aop-gyro
+          - apple,s8000-aop-pressure
           - apple,t8010-aop-accel
           - apple,t8010-aop-gyro
           - apple,t8010-aop-compass
@@ -65,6 +88,17 @@ patternProperties:
 
       mount-matrix:
         description: The sensor's mounting rotation in the device.
+
+    patternProperties:
+      "^apple,(low-temp-accel-offset|(accel|gyro)-(sensitivity|interrupt)-calibration|(accel|gyro)-range-sensitivity-cal|gyro-trim-calibration|pressure-(offset-calibration|accel-sensitivity|heater-resistance))$":
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        maxItems: 64
+        description:
+          The unit's factory calibration of the sensor, copied by the
+          bootloader from the property of the same name (without the
+          prefix) in the Apple device tree. The driver hands it to the
+          firmware as a property of the sensor's service.
+
     required:
       - compatible
     additionalProperties: false

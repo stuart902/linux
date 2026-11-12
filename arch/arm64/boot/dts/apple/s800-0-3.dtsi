@@ -421,6 +421,43 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 4 IRQ_TYPE_LEVEL_HIGH>;
 		};
+
+		aop: aop@210800000 {
+			compatible = "apple,s8000-aop";
+			reg = <0x2 0x10800000 0x0 0x4000>,
+			      <0x2 0x10000600 0x0 0x4>,
+			      <0x2 0x10e00000 0x0 0x9b000>;
+			reg-names = "akf", "control", "sram";
+			mboxes = <&aop_mbox>;
+			mbox-names = "mbox";
+			status = "disabled";
+
+			aop_accel: accel {
+				compatible = "apple,s8000-aop-accel";
+			};
+
+			aop_gyro: gyro {
+				compatible = "apple,s8000-aop-gyro";
+			};
+
+			aop_pressure: pressure {
+				compatible = "apple,s8000-aop-pressure";
+			};
+		};
+
+		aop_mbox: mbox@210804000 {
+			compatible = "apple,s8000-a7iop-mailbox", "apple,t8010-a7iop-mailbox";
+			reg = <0x2 0x10804000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 130 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 131 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 132 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 133 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
 	};
 
 	timer {

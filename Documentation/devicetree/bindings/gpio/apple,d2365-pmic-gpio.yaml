@@ -15,20 +15,21 @@ description: |
   respectively. The controller is accessed through the regmap exported by the
   parent Apple I2C PMIC device.
 
-  The D2365 also latches 240 PMU events (charger, ADC, GPIO edges and
-  others) in one read-to-clear block and signals them on a single active-low
-  line to the AP. As an interrupt controller the node owns that block: the
-  interrupt specifier is the PMU event number and a flags cell. PMIC GPIO
-  line N is event 0x30 + N, so GPIO consumers get their interrupt through the
-  GPIO specifier as well. Events are latched; what triggers a GPIO event is
-  the line configuration left by the boot firmware, so only edge flags are
-  accepted.
+  The D2207 and D2365 also latch 112 and 240 PMU events respectively
+  (charger, ADC, GPIO edges and others) in one read-to-clear block and
+  signal them on a single active-low line to the AP. As an interrupt
+  controller the node owns that block: the interrupt specifier is the PMU
+  event number and a flags cell. PMIC GPIO line N is event 0x18 + N on the
+  D2207 and 0x30 + N on the D2365, so GPIO consumers get their interrupt
+  through the GPIO specifier as well. Events are latched; what triggers a
+  GPIO event is the line configuration left by the boot firmware, so only
+  edge flags are accepted.
 
-  Interrupt 240, one past the last event, is the event line itself. Its
-  consumers run on every assertion of the line, before the event block is
-  read, so that a consumer can act before the I2C read that tells which
-  event it was (the Lightning charger withdraws its input-current grant
-  there).
+  Interrupt 112 (D2207) or 240 (D2365), one past the last event, is the
+  event line itself. Its consumers run on every assertion of the line,
+  before the event block is read, so that a consumer can act before the I2C
+  read that tells which event it was (the Lightning charger withdraws its
+  input-current grant there).
 
 properties:
   compatible:
@@ -59,12 +60,13 @@ properties:
     minItems: 1
     maxItems: 24
     items:
-      minimum: 0x30
+      minimum: 0x18
       maximum: 0x47
     description: |
-      GPIO events (0x30 plus the line number) that end system sleep and have
-      no interrupt consumer, such as the iPad Smart Cover hall sensors on
-      lines 0 and 10 (events 0x30 and 0x3a). They stay masked while the
+      GPIO events (the first GPIO event plus the line number) that end system
+      sleep and have no interrupt consumer, such as the iPad Smart Cover hall
+      sensors on D2365 lines 0 and 10 (events 0x30 and 0x3a) or D2207 lines
+      10 and 12 (events 0x22 and 0x24). They stay masked while the
       system is awake, where the line is read through the GPIO instead, and
       are unmasked only while it sleeps: a hall sensor drives the PMU line on
       every change of the magnet field. They cannot be mapped as interrupts.
@@ -82,15 +84,32 @@ allOf:
   - if:
       properties:
         compatible:
-          enum:
-            - apple,d2207-pmic-gpio
-            - apple,d2333-pmic-gpio
+          const: apple,d2333-pmic-gpio
     then:
       properties:
         interrupt-controller: false
         "#interrupt-cells": false
         interrupts: false
         apple,wake-events: false
+  - if:
+      properties:
+        compatible:
+          const: apple,d2207-pmic-gpio
+    then:
+      properties:
+        apple,wake-events:
+          maxItems: 21
+          items:
+            maximum: 0x2c
+  - if:
+      properties:
+        compatible:
+          const: apple,d2365-pmic-gpio
+    then:
+      properties:
+        apple,wake-events:
+          items:
+            minimum: 0x30
 
 additionalProperties: false
 

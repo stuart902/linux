@@ -13,6 +13,11 @@
  */
 #include "t8010-ipad6.dtsi"
 
+/* The iPad 7 has its own AOP firmware (ipad7caop). */
+&aop {
+	firmware-name = "apple/aop-ipad7c.bin", "apple/aop-ipad7c-ext.bin";
+};
+
 /* The iPad 7 port controller is Bellatrix, with its own charger policy. */
 /delete-node/ &tristar_charger;
 /delete-node/ &tristar;

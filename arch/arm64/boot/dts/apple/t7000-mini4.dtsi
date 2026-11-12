@@ -235,6 +235,11 @@
 			/* Only REG_ON (3) is used; the others stay as iBoot left them. */
 			gpio-reserved-ranges = <0 3>, <4 6>, <11 1>, <13 8>;
 			/* Lines 10 and 12 are the Smart Cover hall sensors. */
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&pinctrl 107 IRQ_TYPE_LEVEL_LOW>;
+			/* Smart Cover hall sensors (lines 10 and 12): wake only. */
+			apple,wake-events = <0x22 0x24>;
 		};
 	};
 };

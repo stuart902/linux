@@ -152,6 +152,11 @@
 			/* Only Bluetooth (2) and Wi-Fi (3) REG_ON are used; the other lines stay as iBoot left them. */
 			gpio-reserved-ranges = <0 2>, <4 6>, <11 1>, <13 8>;
 			/* Lines 10 and 12 are the Smart Cover hall sensors. */
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&pinctrl 86 IRQ_TYPE_LEVEL_LOW>;
+			/* Smart Cover hall sensors (lines 10 and 12): wake only. */
+			apple,wake-events = <0x22 0x24>;
 		};
 
 		rtc@5c0 {

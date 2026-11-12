@@ -3,11 +3,12 @@
  * GPIO and PMU event interrupt driver for Apple/Dialog PMICs used with the
  * A8X, A9 and A10 SoCs.
  *
- * The D2365 latches 240 PMU events in a read-to-clear block. Any unmasked
- * pending event pulls the PMU interrupt line to the AP low; reading the
- * block acknowledges everything and releases the line. Every PMU client
- * shares that block, so this driver owns it and hands each event to its
- * consumer as an ordinary interrupt. PMIC GPIO line N is event 0x30 + N.
+ * The D2365 latches 240 PMU events and the D2207 112 in a read-to-clear
+ * block. Any unmasked pending event pulls the PMU interrupt line to the AP
+ * low; reading the block acknowledges everything and releases the line.
+ * Every PMU client shares that block, so this driver owns it and hands each
+ * event to its consumer as an ordinary interrupt. PMIC GPIO line N is event
+ * 0x30 + N on the D2365 and 0x18 + N on the D2207.
  * One more interrupt, numbered after the last event, is the line itself: its
  * consumers run before the block is read, for a consumer that must act
  * within the shortest time after an assertion (charger withdrawal).
@@ -54,6 +55,20 @@
 #define D2207_GPIO_MODE_MASK		GENMASK(7, 5)
 #define D2207_GPIO_OUTPUT		0
 #define D2207_GPIO_INPUT		(3 << 5)
+
+/*
+ * D2207 PMU events, laid out as on the D2365. iOS AppleD2207PMU reads all
+ * 14 bytes at 0x50 in its interrupt handler and dispatches every set bit
+ * (event n: byte n / 8, bit n % 8) without writing them back; dropping the
+ * events before standby is a plain read as well. 0x70 is the interrupt
+ * mask (set = masked): iOS sets it to all ones at start and masks or
+ * unmasks one event with a single byte write to 0x70 + n / 8. GPIO line n
+ * is event 0x18 + n, as its wake reason decoding names them.
+ */
+#define D2207_EVENTS		0x50
+#define D2207_EVENT_MASK	0x70
+#define D2207_EVENT_BYTES	14
+#define D2207_GPIO_EVENT	0x18
 
 #define D2365_GPIO_SPLIT		18
 #define D2365_GPIO_CFG_0_17	0x900
@@ -905,6 +920,13 @@ static int apple_pmic_gpio_probe(struct platform_device *pdev)
 	return devm_gpiochip_add_data(dev, &gpio->chip, gpio);
 }
 
+static const struct apple_pmic_event_info d2207_event_info = {
+	.status_base = D2207_EVENTS,
+	.mask_base = D2207_EVENT_MASK,
+	.bytes = D2207_EVENT_BYTES,
+	.gpio_event = D2207_GPIO_EVENT,
+};
+
 static const struct apple_pmic_gpio_info d2207_gpio_info = {
 	.label = "d2207-pmic-gpio",
 	.ngpio = 21,
@@ -914,6 +936,7 @@ static const struct apple_pmic_gpio_info d2207_gpio_info = {
 	.input_mode = D2207_GPIO_INPUT,
 	.output_mode = D2207_GPIO_OUTPUT,
 	.config_reg = d2207_gpio_config_reg,
+	.events = &d2207_event_info,
 };
 
 static const struct apple_pmic_gpio_info d2333_gpio_info = {

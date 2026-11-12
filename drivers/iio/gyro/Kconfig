@@ -63,6 +63,18 @@ config ADXRS450
 	  This driver can also be built as a module.  If so, the module
 	  will be called adxrs450.
 
+config APPLE_AOP_GYRO
+	tristate "Apple AOP gyroscope"
+	depends on APPLE_AOP_T8010
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Say yes here to get support for the gyroscope that the Always-On
+	  Processor (AOP) of Apple A9 and A10 iPads and iPhones serves.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called apple_aop_gyro.
+
 config BMG160
 	tristate "BOSCH BMG160 Gyro Sensor"
 	depends on (I2C || SPI_MASTER)

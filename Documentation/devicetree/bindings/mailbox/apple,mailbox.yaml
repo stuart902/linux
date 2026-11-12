@@ -59,6 +59,12 @@ properties:
         items:
           - const: apple,t8010-a7iop-mailbox
 
+      - description:
+          The same A7 IOP mailbox on the A9.
+        items:
+          - const: apple,s8000-a7iop-mailbox
+          - const: apple,t8010-a7iop-mailbox
+
   reg:
     maxItems: 1
 

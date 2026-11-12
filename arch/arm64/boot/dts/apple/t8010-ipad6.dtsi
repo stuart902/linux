@@ -249,6 +249,27 @@
 	};
 };
 
+/* The iPad 6 models (J71b, J72b) use the same AOP firmware (ipad7baop). */
+&aop {
+	firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+/*
+ * The AOP reports the accelerometer in the device frame with y up when the
+ * iPad is upright; desktops (iio-sensor-proxy) take upright as y down and
+ * left/right accordingly, with z unchanged.
+ */
+&aop_accel {
+	mount-matrix = "-1", "0", "0",
+		       "0", "-1", "0",
+		       "0", "0", "1";
+};
+
 &i2s_switch {
 	status = "okay";
 };

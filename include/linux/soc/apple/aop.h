@@ -7,6 +7,8 @@
 
 #include <linux/types.h>
 
+struct device;
+
 struct apple_aop;
 
 /*
@@ -39,5 +41,31 @@ void apple_aop_unlisten(const struct apple_aop_service *service);
  */
 int apple_aop_call(const struct apple_aop_service *service, u16 subtype,
 		   const void *data, size_t len, void *reply, size_t reply_len);
+
+/* The EPIC notification subtype that sets a service property */
+#define APPLE_AOP_SET_PROPERTY		0x4
+
+/* Set property @key of a service to @len (at most 64) bytes at @value. */
+int apple_aop_set_property(const struct apple_aop_service *service, u32 key,
+			   const void *value, size_t len);
+
+/*
+ * A factory calibration blob of a sensor: the bootloader copies it from the
+ * Apple device tree into the sensor's node as @property, and the firmware
+ * takes it as property @key. The calibration is complete once a blob of each
+ * @group (1 to 31) was applied; group 0 blobs are not needed for that.
+ */
+struct apple_aop_calibration {
+	const char *property;
+	u32 key;
+	u8 group;
+};
+
+/*
+ * Send the factory calibration found in @dev's node, then tell the firmware
+ * whether it is complete. Some firmware (S8000) sends no reports before.
+ */
+int apple_aop_calibrate(const struct apple_aop_service *service, struct device *dev,
+			const struct apple_aop_calibration *cal, unsigned int count);
 
 #endif /* _LINUX_SOC_APPLE_AOP_H_ */

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple T8010 Always-On Processor (AOP)
+ * Apple S8000 and T8010 Always-On Processor (AOP)
  *
  * The AOP runs RTKit firmware that the operating system loads: a main image
  * into the AOP's SRAM and an external segment into system memory, with boot
- * arguments filled in. Its services talk AFK/EPIC over shared ring buffers on
- * the RTKit application endpoints, as on later SoCs (see the Asahi Linux AOP
+ * arguments filled in. On the S8000 (A9) the AOP sees its SRAM through a window
+ * that has to be set up first, and its firmware takes more boot arguments.
+ * Its services talk AFK/EPIC over shared ring buffers on the RTKit
+ * application endpoints, as on later SoCs (see the Asahi Linux AOP
  * driver). Each service with a device tree child node of the same name gets a
  * child platform device; its driver receives the service's reports through
  * apple_aop_listen() and sends requests with apple_aop_call().
@@ -41,6 +43,14 @@
 #define APPLE_AOP_IRQ_MASK_ALL		0x1111
 #define APPLE_AOP_IRQ_INBOX		BIT(0)
 #define APPLE_AOP_IRQ_OUTBOX		BIT(12)
+/* S8000: the window through which the AOP sees its SRAM */
+#define APPLE_AOP_REMAP_PA_LO		0x08
+#define APPLE_AOP_REMAP_PA_HI		0x10
+#define APPLE_AOP_REMAP_IOVA_LO		0x18
+#define APPLE_AOP_REMAP_IOVA_HI		0x20
+#define APPLE_AOP_REMAP_SIZE		0x28
+#define APPLE_AOP_REMAP_RESERVED	0x30
+#define APPLE_AOP_REMAP_ENABLE		0x38
 
 #define APPLE_AOP_CONTROL_AUTO_BOOT	0x0
 
@@ -54,6 +64,13 @@
 #define APPLE_AOP_BOOTARG_ECID		APPLE_AOP_FOURCC('E', 'C', 'I', 'D')
 #define APPLE_AOP_BOOTARG_NONC		APPLE_AOP_FOURCC('N', 'O', 'N', 'C')
 #define APPLE_AOP_BOOTARG_EC0P		APPLE_AOP_FOURCC('E', 'C', '0', 'p')
+#define APPLE_AOP_BOOTARG_AOPT		APPLE_AOP_FOURCC('A', 'O', 'P', 't')
+#define APPLE_AOP_BOOTARG_NCAL		APPLE_AOP_FOURCC('n', 'C', 'a', 'l')
+#define APPLE_AOP_BOOTARG_WRAD		APPLE_AOP_FOURCC('W', 'r', 'A', 'd')
+#define APPLE_AOP_BOOTARG_SOC		APPLE_AOP_FOURCC('S', 'O', 'C', '_')
+#define APPLE_AOP_BOOTARG_SOCR		APPLE_AOP_FOURCC('S', 'O', 'C', 'R')
+#define APPLE_AOP_BOOTARG_STKG		APPLE_AOP_FOURCC('S', 'T', 'K', 'G')
+#define APPLE_AOP_MAX_BOOTARGS		10
 
 #define APPLE_AOP_HALT_TIMEOUT_US	10000
 
@@ -99,6 +116,12 @@
 
 #define APPLE_AOP_MAX_CALLS		8
 #define APPLE_AOP_CALL_TIMEOUT		msecs_to_jiffies(1000)
+
+/* Service properties */
+#define APPLE_AOP_PROPERTY_MAX		64
+#define APPLE_AOP_PROP_CALIBRATION	0x3d
+#define APPLE_AOP_CALIBRATION_PARTIAL	1
+#define APPLE_AOP_CALIBRATION_COMPLETE	2
 
 struct afk_qe_header {
 	__le32 magic;
@@ -182,12 +205,27 @@ struct apple_aop_register_work {
 	struct apple_aop_service service;
 };
 
+struct apple_aop_hw {
+	/* Set up the AOP's window onto its SRAM before starting it */
+	bool sram_window;
+	/* Write the SRAM 32 bits at a time, as Apple's loader does */
+	bool sram_32bit;
+	/* A fresh NONC boot argument */
+	bool nonce;
+	/* AOPt, SOC_, SOCR, WrAd, STKG and nCal boot arguments */
+	bool soc_bootargs;
+};
+
 struct apple_aop {
 	struct device *dev;
+	const struct apple_aop_hw *hw;
 	void __iomem *akf;
 	void __iomem *control;
 	void __iomem *sram;
+	resource_size_t akf_base;
+	resource_size_t sram_base;
 	resource_size_t sram_size;
+	u32 target, chip_id, chip_revision;
 	struct apple_rtkit *rtk;
 
 	void *ext;
@@ -232,11 +270,19 @@ struct apple_aop_bootarg {
 	bool found;
 };
 
+static void apple_aop_add_bootarg(struct apple_aop_bootarg *args, unsigned int *count,
+				  u32 key, const void *value, u32 size)
+{
+	if (WARN_ON(*count >= APPLE_AOP_MAX_BOOTARGS))
+		return;
+	args[(*count)++] = (struct apple_aop_bootarg){ .key = key, .value = value, .size = size };
+}
+
 static int apple_aop_patch_bootargs(struct apple_aop *aop, u8 *image, size_t size,
-				    struct apple_aop_bootarg *args, int count)
+				    struct apple_aop_bootarg *args, unsigned int count)
 {
 	size_t offset, end, pos;
-	int i;
+	unsigned int i;
 
 	offset = get_unaligned_le32(image + APPLE_AOP_IMAGE_BOOTARGS_OFFSET);
 	end = get_unaligned_le32(image + APPLE_AOP_IMAGE_BOOTARGS_SIZE);
@@ -269,13 +315,47 @@ static int apple_aop_patch_bootargs(struct apple_aop *aop, u8 *image, size_t siz
 	return 0;
 }
 
+/* Copy the main image into the SRAM and clear the rest of it. */
+static void apple_aop_write_sram(struct apple_aop *aop, const u8 *image, size_t size)
+{
+	size_t offset;
+
+	if (!aop->hw->sram_32bit) {
+		memcpy_toio(aop->sram, image, size);
+		memset_io(aop->sram + size, 0, aop->sram_size - size);
+		return;
+	}
+
+	/* The image size is a multiple of 4, checked by the caller. */
+	__iowrite32_copy(aop->sram, image, size / 4);
+	for (offset = size; offset + 4 <= aop->sram_size; offset += 4)
+		writel_relaxed(0, aop->sram + offset);
+	for (; offset < aop->sram_size; offset++)
+		writeb_relaxed(0, aop->sram + offset);
+}
+
+/* S8000: point the AOP's window at its SRAM; the firmware runs from there. */
+static void apple_aop_map_sram(struct apple_aop *aop)
+{
+	writel(0, aop->akf + APPLE_AOP_REMAP_IOVA_LO);
+	writel(0, aop->akf + APPLE_AOP_REMAP_IOVA_HI);
+	writel(aop->sram_size & ~0xfffULL, aop->akf + APPLE_AOP_REMAP_SIZE);
+	writel(0, aop->akf + APPLE_AOP_REMAP_RESERVED);
+	writel(lower_32_bits(aop->sram_base), aop->akf + APPLE_AOP_REMAP_PA_LO);
+	writel(upper_32_bits(aop->sram_base), aop->akf + APPLE_AOP_REMAP_PA_HI);
+	writel(1, aop->akf + APPLE_AOP_REMAP_ENABLE);
+}
+
 static int apple_aop_load(struct apple_aop *aop, u64 ecid)
 {
+	struct apple_aop_bootarg args[APPLE_AOP_MAX_BOOTARGS];
 	const struct firmware *main_fw, *ext_fw;
 	const char *main_name, *ext_name;
 	struct device_node *np = aop->dev->of_node;
-	u8 prng[32], nonce[8];
-	__le64 ecid_le = cpu_to_le64(ecid), ext_le;
+	u8 prng[32], nonce[8], guard[4], ncal = 0;
+	__le64 ecid_le = cpu_to_le64(ecid), ext_le, wrapper_le;
+	__le32 target_le, chip_le, revision_le;
+	unsigned int count = 0;
 	u8 *image;
 	int ret;
 
@@ -316,28 +396,43 @@ static int apple_aop_load(struct apple_aop *aop, u64 ecid)
 	}
 
 	get_random_bytes(prng, sizeof(prng));
-	get_random_bytes(nonce, sizeof(nonce));
-	{
-		struct apple_aop_bootarg args[] = {
-			{ APPLE_AOP_BOOTARG_PRNG, prng, sizeof(prng) },
-			{ APPLE_AOP_BOOTARG_ECID, &ecid_le, sizeof(ecid_le) },
-			{ APPLE_AOP_BOOTARG_NONC, nonce, sizeof(nonce) },
-			{ APPLE_AOP_BOOTARG_EC0P, &ext_le, sizeof(ext_le) },
-		};
+	apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_PRNG, prng, sizeof(prng));
+	apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_ECID, &ecid_le, sizeof(ecid_le));
+	apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_EC0P, &ext_le, sizeof(ext_le));
+	if (aop->hw->nonce) {
+		get_random_bytes(nonce, sizeof(nonce));
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_NONC, nonce, sizeof(nonce));
+	}
+	if (aop->hw->soc_bootargs) {
+		/* A random stack guard with one zero byte */
+		get_random_bytes(guard, sizeof(guard));
+		guard[get_random_u32_below(sizeof(guard))] = 0;
+		target_le = cpu_to_le32(aop->target);
+		chip_le = cpu_to_le32(aop->chip_id);
+		revision_le = cpu_to_le32(aop->chip_revision);
+		wrapper_le = cpu_to_le64(aop->akf_base);
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_AOPT,
+				      &target_le, sizeof(target_le));
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_NCAL, &ncal, sizeof(ncal));
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_WRAD,
+				      &wrapper_le, sizeof(wrapper_le));
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_SOC,
+				      &chip_le, sizeof(chip_le));
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_SOCR,
+				      &revision_le, sizeof(revision_le));
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_STKG, guard, sizeof(guard));
+	}
 
-		ret = apple_aop_patch_bootargs(aop, image, main_fw->size, args,
-					       ARRAY_SIZE(args));
-	}
-	if (ret) {
+	ret = apple_aop_patch_bootargs(aop, image, main_fw->size, args, count);
+	if (ret)
 		dev_err(aop->dev, "unexpected boot arguments in %s: %d\n", main_name, ret);
-	} else {
-		memcpy_toio(aop->sram, image, main_fw->size);
-		memset_io(aop->sram + main_fw->size, 0, aop->sram_size - main_fw->size);
-	}
+	else
+		apple_aop_write_sram(aop, image, main_fw->size);
 
 	kfree_sensitive(image);
 	memzero_explicit(prng, sizeof(prng));
 	memzero_explicit(nonce, sizeof(nonce));
+	memzero_explicit(guard, sizeof(guard));
 	memzero_explicit(&ecid_le, sizeof(ecid_le));
 out_ext:
 	release_firmware(ext_fw);
@@ -448,7 +543,8 @@ static void apple_aop_announce(struct apple_aop_ep *ep, u32 channel, const void 
 	const struct epic_service_announce *announce = data;
 	struct apple_aop_register_work *rw;
 
-	if (len < sizeof(*announce))
+	/* Only the name and channel are used; the S8000's announcements are shorter. */
+	if (len < offsetofend(struct epic_service_announce, channel))
 		return;
 
 	rw = kzalloc_obj(*rw);
@@ -797,6 +893,58 @@ int apple_aop_call(const struct apple_aop_service *service, u16 subtype, const v
 }
 EXPORT_SYMBOL_GPL(apple_aop_call);
 
+int apple_aop_set_property(const struct apple_aop_service *service, u32 key,
+			   const void *value, size_t len)
+{
+	u8 buf[8 + APPLE_AOP_PROPERTY_MAX];
+	int ret;
+
+	if (len > APPLE_AOP_PROPERTY_MAX)
+		return -EINVAL;
+	put_unaligned_le32(0, buf);
+	put_unaligned_le32(key, buf + 4);
+	memcpy(buf + 8, value, len);
+
+	ret = apple_aop_call(service, APPLE_AOP_SET_PROPERTY, buf, 8 + len, NULL, 0);
+	return ret > 0 ? -EIO : ret;
+}
+EXPORT_SYMBOL_GPL(apple_aop_set_property);
+
+int apple_aop_calibrate(const struct apple_aop_service *service, struct device *dev,
+			const struct apple_aop_calibration *cal, unsigned int count)
+{
+	unsigned long needed = 0, applied = 0;
+	__le32 state;
+	unsigned int i;
+	int len, ret;
+
+	for (i = 0; i < count; i++) {
+		const void *blob;
+
+		if (cal[i].group)
+			needed |= BIT(cal[i].group);
+		blob = of_get_property(dev->of_node, cal[i].property, &len);
+		if (!blob)
+			continue;
+		ret = apple_aop_set_property(service, cal[i].key, blob, len);
+		if (ret) {
+			dev_warn(dev, "%s not applied: %d\n", cal[i].property, ret);
+			continue;
+		}
+		if (cal[i].group)
+			applied |= BIT(cal[i].group);
+	}
+
+	if (needed && applied == needed) {
+		state = cpu_to_le32(APPLE_AOP_CALIBRATION_COMPLETE);
+	} else {
+		dev_warn(dev, "factory calibration incomplete\n");
+		state = cpu_to_le32(APPLE_AOP_CALIBRATION_PARTIAL);
+	}
+	return apple_aop_set_property(service, APPLE_AOP_PROP_CALIBRATION, &state, sizeof(state));
+}
+EXPORT_SYMBOL_GPL(apple_aop_calibrate);
+
 /* Driver */
 
 static void apple_aop_free_buffers(struct apple_aop *aop)
@@ -825,20 +973,24 @@ static int apple_aop_probe(struct platform_device *pdev)
 	if (!aop)
 		return -ENOMEM;
 	aop->dev = dev;
+	aop->hw = of_device_get_match_data(dev);
 	mutex_init(&aop->listeners_lock);
 	INIT_LIST_HEAD(&aop->listeners);
 	mutex_init(&aop->children_lock);
 	INIT_LIST_HEAD(&aop->children);
 
-	aop->akf = devm_platform_ioremap_resource_byname(pdev, "akf");
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "akf");
+	aop->akf = devm_ioremap_resource(dev, res);
 	if (IS_ERR(aop->akf))
 		return PTR_ERR(aop->akf);
+	aop->akf_base = res->start;
 	aop->control = devm_platform_ioremap_resource_byname(pdev, "control");
 	if (IS_ERR(aop->control))
 		return PTR_ERR(aop->control);
 	aop->sram = devm_platform_get_and_ioremap_resource(pdev, 2, &res);
 	if (IS_ERR(aop->sram))
 		return PTR_ERR(aop->sram);
+	aop->sram_base = res->start;
 	aop->sram_size = resource_size(res);
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(44));
@@ -853,6 +1005,17 @@ static int apple_aop_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "no apple,ecid from the bootloader\n");
 
+	if (aop->hw->soc_bootargs) {
+		ret = of_property_read_u32(np, "apple,aop-target", &aop->target);
+		if (!ret)
+			ret = of_property_read_u32(np, "apple,chip-id", &aop->chip_id);
+		if (!ret)
+			ret = of_property_read_u32(np, "apple,chip-revision", &aop->chip_revision);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "no AOP target or chip ID from the bootloader\n");
+	}
+
 	aop->eps = devm_kcalloc(dev, AFK_ENDPOINT_COUNT, sizeof(*aop->eps), GFP_KERNEL);
 	if (!aop->eps)
 		return -ENOMEM;
@@ -866,6 +1029,9 @@ static int apple_aop_probe(struct platform_device *pdev)
 	memzero_explicit(&ecid, sizeof(ecid));
 	if (ret)
 		goto err_free;
+
+	if (aop->hw->sram_window)
+		apple_aop_map_sram(aop);
 
 	aop->rtk = apple_rtkit_init(dev, aop, "mbox", 0, &apple_aop_rtkit_ops);
 	if (IS_ERR(aop->rtk)) {
@@ -888,7 +1054,14 @@ static int apple_aop_probe(struct platform_device *pdev)
 	       aop->akf + APPLE_AOP_CPU_CONTROL);
 	writel(1, aop->control + APPLE_AOP_CONTROL_AUTO_BOOT);
 
-	ret = apple_rtkit_wake(aop->rtk);
+	/*
+	 * The firmware was just loaded and starts from scratch: wait for its
+	 * hello and its own power state report, as for any freshly started
+	 * coprocessor. Asking for a power state first (apple_rtkit_wake(), for
+	 * firmware that is already running) reaches it before its mailbox is
+	 * up.
+	 */
+	ret = apple_rtkit_boot(aop->rtk);
 	if (ret) {
 		dev_err(dev, "firmware did not boot: %d\n", ret);
 		goto err_halt;
@@ -939,8 +1112,19 @@ static void apple_aop_shutdown(struct platform_device *pdev)
 		dev_err(aop->dev, "failed to halt\n");
 }
 
+static const struct apple_aop_hw apple_aop_s8000_hw = {
+	.sram_window = true,
+	.sram_32bit = true,
+	.soc_bootargs = true,
+};
+
+static const struct apple_aop_hw apple_aop_t8010_hw = {
+	.nonce = true,
+};
+
 static const struct of_device_id apple_aop_of_match[] = {
-	{ .compatible = "apple,t8010-aop" },
+	{ .compatible = "apple,s8000-aop", .data = &apple_aop_s8000_hw },
+	{ .compatible = "apple,t8010-aop", .data = &apple_aop_t8010_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_aop_of_match);
@@ -957,5 +1141,5 @@ static struct platform_driver apple_aop_driver = {
 module_platform_driver(apple_aop_driver);
 
 MODULE_AUTHOR("Dalton Alexandre <alley.nightly_0b@icloud.com>");
-MODULE_DESCRIPTION("Apple T8010 Always-On Processor driver");
+MODULE_DESCRIPTION("Apple S8000 and T8010 Always-On Processor driver");
 MODULE_LICENSE("Dual MIT/GPL");
