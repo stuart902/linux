@@ -318,29 +318,30 @@ int apple_vxd_cmdbuf_chunk_end_exact(struct apple_vxd_cmdbuf *cb,
 }
 
 /*
- * Close a chunk made only of 0x000f0000 pairs (the per-picture kind-4
- * chunk, 0x62b7ab0): pad by 0x40 - (pairs & 7) * 8 bytes, a full 64 when
- * the pair count is a multiple of eight, and report the byte count
- * including that pad (the kext measures it after the pad; the message
- * sends it as a pair count, >> 3).
+ * Close a chunk made only of 0x000f0000 pairs (the HEVC per-picture kind-4
+ * chunk, 0x62b7ab0): report its byte count (the message sends it as a pair
+ * count, >> 3), then zero 0x40 - (pairs & 7) * 8 bytes past it, a full 64
+ * when the pair count is a multiple of eight.  The kext writes that pad
+ * past its write pointer and neither counts it nor advances over it, so
+ * this must be the buffer's last chunk.
  */
 int apple_vxd_cmdbuf_pair_chunk_end(struct apple_vxd_cmdbuf *cb, u32 *offset,
 				    u32 *bytes)
 {
 	size_t pad;
-	int ret;
 
 	if (cb->group_open || cb->used - cb->chunk_start != cb->npairs * 8)
 		cb->error = true;
-	if (cb->error)
+	pad = VXD_CMD_CHUNK_ALIGN - (cb->npairs & 7) * 8;
+	if (cb->error || pad > cb->size - cb->used) {
+		cb->error = true;
 		return -ENOSPC;
+	}
 
 	*offset = cb->chunk_start;
-	pad = VXD_CMD_CHUNK_ALIGN - (cb->npairs & 7) * 8;
-	ret = vxd_cmd_pad(cb, pad);
-	if (!ret)
-		*bytes = cb->used - *offset;
-	return ret;
+	*bytes = cb->used - cb->chunk_start;
+	memset((u8 *)cb->vaddr + cb->used, 0, pad);
+	return 0;
 }
 
 /*

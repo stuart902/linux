@@ -13,6 +13,7 @@
 	chassis-type = "tablet";
 
 	aliases {
+		als0 = &als;
 		bluetooth0 = &bluetooth;
 		touchscreen0 = &touchscreen;
 		wifi0 = &wifi;
@@ -56,6 +57,42 @@
 			label = "Volume Up";
 			gpios = <&pinctrl_ap 90 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_VOLUMEUP>;
+		};
+	};
+
+	/*
+	 * Smart Cover hall sensors: PMIC GPIO 0 ("halleffect") and 10
+	 * ("halleffect1") in the ADT /buttons node. Both read low while the
+	 * cover is closed (measured on a J71b). Reported as
+	 * SW_MACHINE_COVER, not as a lid switch, so that closing the cover
+	 * doesn't suspend the system. Each line is its own device, so that
+	 * one the PMIC keeps for itself can't take the other down.
+	 */
+	smart-cover {
+		compatible = "gpio-keys-polled";
+		poll-interval = <50>;
+		label = "iPad Smart Cover";
+
+		cover-switch {
+			label = "Smart Cover (PMIC GPIO 0)";
+			gpios = <&pmu_gpio 0 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_MACHINE_COVER>;
+			debounce-interval = <50>;
+		};
+	};
+
+	smart-cover-aux {
+		compatible = "gpio-keys-polled";
+		poll-interval = <50>;
+		label = "iPad Smart Cover 2";
+
+		cover-switch {
+			label = "Smart Cover (PMIC GPIO 10)";
+			gpios = <&pmu_gpio 10 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_MACHINE_COVER>;
+			debounce-interval = <50>;
 		};
 	};
 
@@ -136,10 +173,12 @@
 			compatible = "apple,d2365-pmic-gpio";
 			gpio-controller;
 			#gpio-cells = <2>;
-			gpio-reserved-ranges = <0 13>, <15 9>;
+			gpio-reserved-ranges = <1 9>, <11 2>, <15 9>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupts-extended = <&pinctrl_ap 38 IRQ_TYPE_LEVEL_LOW>;
+			/* Smart Cover hall sensors (lines 0 and 10): wake only. */
+			apple,wake-events = <0x30 0x3a>;
 		};
 
 		rtc@500 {
@@ -192,6 +231,21 @@
 				};
 			};
 		};
+	};
+};
+
+/*
+ * The ambient light sensor, as in Apple's device tree of the iPad 6 and
+ * iPad 7 (i2c2 als1, als,ct819 at 0x39, GPIO 27 level-low).
+ */
+&i2c2 {
+	status = "okay";
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als: light-sensor@39 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x39>;
+		interrupts-extended = <&pinctrl_ap 27 IRQ_TYPE_LEVEL_LOW>;
 	};
 };
 

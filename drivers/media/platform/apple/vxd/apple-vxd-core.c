@@ -249,11 +249,22 @@ static const struct dev_pm_ops apple_vxd_pm_ops = {
 	RUNTIME_PM_OPS(apple_vxd_runtime_suspend, apple_vxd_runtime_resume, NULL)
 };
 
+/*
+ * HEVC: AppleD5500 keys its per-SoC HEVC choices on the ADT vxd-version
+ * (VACreateDecodeDeviceHEVC 0xfffffff006293f2c): the buffer multiplier
+ * (2 for versions 9 and 10), the 0x7474 pair after each slice structure
+ * (versions 7 and 9) and the 0x701c line split base (0x1800 from 10 on).
+ */
 static const struct apple_vxd_variant s8000_vxd_variant = {
 	.vxd_version	= 7,
 	.num_gart_pts	= 512,		/* "setting 2GB mapping" [E] */
 	/* HEVCSupported = ((rev - 7) < 4) && ((0xD >> (rev - 7)) & 1) [E] */
 	.hevc_supported	= true,
+	.hevc = {
+		.buf_mult	= 1,
+		.tail_7474	= true,
+		.cache_base	= 0xc00,
+	},
 };
 
 /* The T8010 core has two pixel pipes; it reports them in CORE_ID. */
@@ -262,6 +273,11 @@ static const struct apple_vxd_variant t8010_vxd_variant = {
 	.num_gart_pts	= 512,
 	.hevc_supported	= true,
 	.has_integration = true,
+	.hevc = {
+		.buf_mult	= 2,
+		.tail_7474	= false,
+		.cache_base	= 0x1800,
+	},
 };
 
 static const struct of_device_id apple_vxd_of_match[] = {
@@ -354,6 +370,8 @@ static int apple_vxd_probe(struct platform_device *pdev)
 		goto err_disable_runtime_pm;
 
 	ret = apple_vxd_h264_register(vxd);
+	if (!ret)
+		ret = apple_vxd_hevc_register(vxd);
 	if (!ret)
 		ret = apple_vxd_v4l2_init(vxd);
 	if (ret)

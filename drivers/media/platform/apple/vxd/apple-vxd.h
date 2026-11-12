@@ -10,7 +10,8 @@
  *   - host<->firmware mailbox: ring geometry, 0x80 init message, push,
  *     IRQ drain, fences (apple-vxd-mbox.c)
  *   - command buffers and their encoders (apple-vxd-cmdbuf.c, -cmd.c)
- *   - the V4L2 stateless H.264 decoder (apple-vxd-v4l2.c, -h264*.c)
+ *   - the V4L2 stateless node (apple-vxd-v4l2.c) and its codec units:
+ *     H.264 (apple-vxd-h264*.c) and HEVC (apple-vxd-hevc*.c)
  *
  * [E] marks facts taken from the kext.
  */
@@ -38,6 +39,7 @@
 #include <media/videobuf2-v4l2.h>
 
 #include "apple-vxd-cmd.h"
+#include "apple-vxd-hevc-cmd.h"
 #include "apple-vxd-regs.h"
 
 #define APPLE_VXD_DRV_NAME		"apple-vxd"
@@ -60,12 +62,17 @@ enum apple_vxd_image_fmt {
 	APPLE_VXD_IMG_FMT_420_8BIT,
 };
 
+/* One per codec unit (H.264, HEVC). */
+#define APPLE_VXD_MAX_CODED_FMTS	2
+
 /* SoC variant data (compatible table). */
 struct apple_vxd_variant {
 	unsigned int vxd_version;	/* ADT "vxd-version" */
 	u32 num_gart_pts;		/* mapped page tables (512 = 2 GiB) */
 	bool hevc_supported;
 	bool has_integration;		/* second reg range, see VXD_INTEG_CTRL */
+	/* HEVC buffer multiplier and command quirks; zero leaves HEVC off. */
+	struct apple_vxd_hevc_caps hevc;
 };
 
 /*
@@ -342,10 +349,11 @@ struct apple_vxd_dev {
 	struct v4l2_m2m_dev *m2m_dev;
 	struct mutex vdev_lock;		/* serializes ioctls */
 	/*
-	 * Coded formats, filled by apple_vxd_h264_register() during probe
-	 * before any V4L2 node exists.
+	 * Coded formats, one per codec unit, added with
+	 * apple_vxd_register_coded_fmt() during probe before any V4L2 node
+	 * exists.
 	 */
-	const struct apple_vxd_coded_fmt_desc *coded_fmts;
+	const struct apple_vxd_coded_fmt_desc *coded_fmts[APPLE_VXD_MAX_CODED_FMTS];
 	unsigned int num_coded_fmts;
 };
 
@@ -483,11 +491,18 @@ int apple_vxd_packet_msg(struct apple_vxd_dev *vxd, u32 *pkt, u16 fence,
 /* v4l2.c */
 u32 apple_vxd_buf_va(struct vb2_v4l2_buffer *vbuf);
 u32 apple_vxd_buf_aux_va(struct vb2_v4l2_buffer *vbuf);
+void *apple_vxd_buf_aux_cpu(struct vb2_v4l2_buffer *vbuf);
+size_t apple_vxd_buf_aux_size(struct vb2_v4l2_buffer *vbuf);
+int apple_vxd_register_coded_fmt(struct apple_vxd_dev *vxd,
+				 const struct apple_vxd_coded_fmt_desc *desc);
 int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd);
 void apple_vxd_v4l2_cleanup(struct apple_vxd_dev *vxd);
 extern const struct v4l2_ctrl_ops apple_vxd_ctrl_ops;
 
 /* h264.c */
 int apple_vxd_h264_register(struct apple_vxd_dev *vxd);
+
+/* hevc.c */
+int apple_vxd_hevc_register(struct apple_vxd_dev *vxd);
 
 #endif /* __APPLE_VXD_H__ */

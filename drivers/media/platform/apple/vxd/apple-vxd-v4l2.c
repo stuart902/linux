@@ -97,8 +97,8 @@ apple_vxd_find_coded_fmt_desc(struct apple_vxd_ctx *ctx, u32 fourcc)
 	unsigned int i;
 
 	for (i = 0; i < vxd->num_coded_fmts; i++)
-		if (vxd->coded_fmts[i].fourcc == fourcc)
-			return &vxd->coded_fmts[i];
+		if (vxd->coded_fmts[i]->fourcc == fourcc)
+			return vxd->coded_fmts[i];
 	return NULL;
 }
 
@@ -107,7 +107,7 @@ static void apple_vxd_reset_coded_fmt(struct apple_vxd_ctx *ctx)
 	struct v4l2_format *f = &ctx->coded_fmt;
 
 	/* apple_vxd_ctx_init() checked vxd->coded_fmts before calling us. */
-	ctx->coded_fmt_desc = &ctx->vxd->coded_fmts[0];
+	ctx->coded_fmt_desc = ctx->vxd->coded_fmts[0];
 	apple_vxd_reset_fmt(ctx, f, ctx->coded_fmt_desc->fourcc);
 	f->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	f->fmt.pix_mp.width = ctx->coded_fmt_desc->frmsize.min_width;
@@ -208,12 +208,12 @@ static int apple_vxd_init_ctrls(struct apple_vxd_ctx *ctx)
 	int ret;
 
 	for (i = 0; i < vxd->num_coded_fmts; i++)
-		nctrls += vxd->coded_fmts[i].ctrls->num_ctrls;
+		nctrls += vxd->coded_fmts[i]->ctrls->num_ctrls;
 
 	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, nctrls);
 
 	for (i = 0; i < vxd->num_coded_fmts; i++) {
-		ret = apple_vxd_add_ctrls(ctx, vxd->coded_fmts[i].ctrls);
+		ret = apple_vxd_add_ctrls(ctx, vxd->coded_fmts[i]->ctrls);
 		if (ret)
 			goto err_free_handler;
 	}
@@ -297,7 +297,7 @@ static int apple_vxd_do_try_output_fmt(struct apple_vxd_ctx *ctx,
 
 	desc = apple_vxd_find_coded_fmt_desc(ctx, pix_mp->pixelformat);
 	if (!desc) {
-		desc = &ctx->vxd->coded_fmts[0];
+		desc = ctx->vxd->coded_fmts[0];
 		pix_mp->pixelformat = desc->fourcc;
 	}
 
@@ -404,7 +404,7 @@ static int apple_vxd_do_enum_output_fmt(struct apple_vxd_ctx *ctx,
 {
 	if (f->index >= ctx->vxd->num_coded_fmts)
 		return -EINVAL;
-	f->pixelformat = ctx->vxd->coded_fmts[f->index].fourcc;
+	f->pixelformat = ctx->vxd->coded_fmts[f->index]->fourcc;
 	return 0;
 }
 
@@ -648,6 +648,18 @@ u32 apple_vxd_buf_va(struct vb2_v4l2_buffer *vbuf)
 u32 apple_vxd_buf_aux_va(struct vb2_v4l2_buffer *vbuf)
 {
 	return vxd_buf(vbuf)->aux.va;
+}
+
+/* CPU address of a CAPTURE buffer's side buffer, NULL if it has none. */
+void *apple_vxd_buf_aux_cpu(struct vb2_v4l2_buffer *vbuf)
+{
+	return vxd_buf(vbuf)->aux.va ? vxd_buf(vbuf)->aux.mem.vaddr : NULL;
+}
+
+/* Size of a CAPTURE buffer's side buffer, 0 if it has none. */
+size_t apple_vxd_buf_aux_size(struct vb2_v4l2_buffer *vbuf)
+{
+	return vxd_buf(vbuf)->aux.va ? vxd_buf(vbuf)->aux.mem.size : 0;
 }
 
 static void apple_vxd_buf_queue(struct vb2_buffer *vb)
@@ -930,11 +942,25 @@ static const struct v4l2_file_operations apple_vxd_fops = {
 
 /* --- registration ------------------------------------------------------ */
 
+/*
+ * Add one coded format to the device's table.  The codec units call this
+ * during probe, before any V4L2 node exists; the first one added is the
+ * default OUTPUT format.
+ */
+int apple_vxd_register_coded_fmt(struct apple_vxd_dev *vxd,
+				 const struct apple_vxd_coded_fmt_desc *desc)
+{
+	if (vxd->num_coded_fmts >= ARRAY_SIZE(vxd->coded_fmts))
+		return -ENOSPC;
+	vxd->coded_fmts[vxd->num_coded_fmts++] = desc;
+	return 0;
+}
+
 int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
 {
 	int ret;
 
-	if (!vxd->coded_fmts || !vxd->num_coded_fmts) {
+	if (!vxd->num_coded_fmts) {
 		dev_err(vxd->dev, "v4l2: no coded formats registered, not exposing a node\n");
 		return -ENODEV;
 	}

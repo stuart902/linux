@@ -22,12 +22,14 @@
 #define SYS_DEV_PSTATE_SUSPEND 1
 
 /*
- * T8010 SoC/memory states (iOS's PMGR driver: a table indexed by the SoC
- * and the memory state, each low or high): both low, as the system boots,
- * and both high
+ * A9 and A10 (S8000, S8003, T8010) SoC/memory states (iOS's PMGR driver: a
+ * table indexed by the SoC and the memory state, each low or high): both
+ * low, as the system boots, and both high. iOS waits up to 8 ms for a
+ * change to complete; one takes about 0.5-0.7 ms on the S8003.
  */
-#define T8010_SOC_PSTATE_LOW 0xd
-#define T8010_SOC_PSTATE_HIGH 0xc
+#define S8000_SOC_PSTATE_LOW 0xd
+#define S8000_SOC_PSTATE_HIGH 0xc
+#define S8000_SOC_PSTATE_TIMEOUT_US 8000
 
 enum sys_device {
 	DEV_FABRIC,
@@ -83,7 +85,8 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 
 	if (misc->hw->wait_pending &&
 	    readl_relaxed_poll_timeout_atomic(misc->devices[dev].base + APPLE_CLKGEN_PSTATE, val,
-					      !(val & APPLE_CLKGEN_PSTATE_PENDING), 1, 1000))
+					      !(val & APPLE_CLKGEN_PSTATE_PENDING), 1,
+					      S8000_SOC_PSTATE_TIMEOUT_US))
 		dev_warn(misc->dev, "%s state change to %u did not complete\n",
 			 sys_device_names[dev], pstate);
 }
@@ -187,20 +190,22 @@ static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t602x = {
 };
 
 /*
- * The T8010 boots with SoC and memory in their low states (memory at 396
- * of 792 MHz, half the bandwidth): run both high while active
+ * The A9 and A10 boot with SoC and memory in their low states (memory at
+ * 800 of 1200 MHz on the S8000/S8003, 396 of 792 MHz on the T8010): run
+ * both high while active
  */
-static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t8010 = {
+static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_s8000 = {
 	.devices = BIT(DEV_SOC),
-	.dev_min_ps = { [DEV_SOC] = T8010_SOC_PSTATE_LOW },
-	.dev_active_ps = { [DEV_SOC] = T8010_SOC_PSTATE_HIGH },
+	.dev_min_ps = { [DEV_SOC] = S8000_SOC_PSTATE_LOW },
+	.dev_active_ps = { [DEV_SOC] = S8000_SOC_PSTATE_HIGH },
 	.wait_pending = true,
 };
 
 static const struct of_device_id apple_pmgr_misc_of_match[] = {
+	{ .compatible = "apple,s8000-pmgr-misc", .data = &apple_pmgr_misc_hw_s8000 },
 	{ .compatible = "apple,t6000-pmgr-misc", .data = &apple_pmgr_misc_hw_t600x },
 	{ .compatible = "apple,t6020-pmgr-misc", .data = &apple_pmgr_misc_hw_t602x },
-	{ .compatible = "apple,t8010-pmgr-misc", .data = &apple_pmgr_misc_hw_t8010 },
+	{ .compatible = "apple,t8010-pmgr-misc", .data = &apple_pmgr_misc_hw_s8000 },
 	{}
 };
 

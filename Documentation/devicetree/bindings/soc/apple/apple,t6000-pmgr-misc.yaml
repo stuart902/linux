@@ -12,12 +12,13 @@ maintainers:
 description: |
   Certain Apple SoCs include additional PMGR power states that are controlled
   via a different "misc" control block. This includes the fabric and memory
-  controller states. On the T8010 (A10) one register selects the combined
-  SoC and memory performance state.
+  controller states. On the S8000/S8003 (A9) and T8010 (A10) one register
+  selects the combined SoC and memory performance state.
 
 properties:
   compatible:
     enum:
+      - apple,s8000-pmgr-misc
       - apple,t6000-pmgr-misc
       - apple,t6020-pmgr-misc
       - apple,t8010-pmgr-misc
@@ -40,7 +41,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8010-pmgr-misc
+            enum:
+              - apple,s8000-pmgr-misc
+              - apple,t8010-pmgr-misc
     then:
       properties:
         reg:

@@ -557,14 +557,8 @@ static const struct apple_vxd_coded_fmt_desc apple_vxd_h264_fmt = {
 	.decoded_fmts = apple_vxd_h264_decoded_fmts,
 };
 
-static const struct apple_vxd_coded_fmt_desc apple_vxd_coded_fmts[] = {
-	apple_vxd_h264_fmt,
-};
-
-/* Fills the device's coded-format table, before any V4L2 node exists. */
+/* Adds H.264 to the device's coded formats, before any V4L2 node exists. */
 int apple_vxd_h264_register(struct apple_vxd_dev *vxd)
 {
-	vxd->coded_fmts = apple_vxd_coded_fmts;
-	vxd->num_coded_fmts = ARRAY_SIZE(apple_vxd_coded_fmts);
-	return 0;
+	return apple_vxd_register_coded_fmt(vxd, &apple_vxd_h264_fmt);
 }

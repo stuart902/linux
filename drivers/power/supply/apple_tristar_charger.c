@@ -155,7 +155,6 @@ struct tristar_charger {
 	unsigned int source_ma;
 	/* USB data is on for this attachment: the mux must stay untouched. */
 	bool usb_on;
-	bool source_seen;	/* an attachment since probe */
 	/* What the USB host allows (vbus_draw), valid for usb_epoch only. */
 	unsigned int usb_ma;
 	unsigned int usb_epoch;
@@ -698,7 +697,6 @@ static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 {
 	/* Before anything else: a host must not start a session yet. */
 	tristar_set_usb(chg, false);
-	chg->source_seen = true;
 	chg->present = true;
 	chg->phase = TRISTAR_SETTLING;
 	chg->attach_ns = now;
@@ -910,12 +908,18 @@ static void tristar_guard(struct tristar_charger *chg, u64 now)
  * up on the source: USB serial and SSH must not depend on charging. An attachment
  * later holds USB data off again and identifies as usual. Caller holds lock.
  */
+/*
+ * Input is present but no source was identified: the PMIC can stay in a
+ * transitional state (e.g. 0x62) for any attachment, not only the first
+ * since probe. USB data must not stay off for it: after TRISTAR_HOLD_MS
+ * turn it on, at the fallback limit. Caller holds lock.
+ */
 static void tristar_no_source(struct tristar_charger *chg, unsigned int status, u64 now)
 {
-	if (chg->usb_on || chg->source_seen ||
+	if (chg->usb_on ||
 	    (s64)(now - chg->hold_ns) < (s64)TRISTAR_HOLD_MS * NSEC_PER_MSEC)
 		return;
-	dev_warn(chg->dev, "no source seen since probe (status %#x), turning USB data on\n", status);
+	dev_info(chg->dev, "no source identified (status %#x), turning USB data on\n", status);
 	tristar_set_usb(chg, true);
 }
 
@@ -939,6 +943,8 @@ static void tristar_poll(struct work_struct *work)
 	}
 	chg->online = status != 0;
 	if (!status) {
+		/* The hold of the next attachment starts when input returns. */
+		chg->hold_ns = now;
 		if (chg->present) {
 			tristar_set_usb(chg, false);
 			chg->present = false;
@@ -1335,7 +1341,8 @@ static int tristar_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	init_completion(&chg->adc_done);
-	chg->wq = devm_alloc_workqueue(dev, "tristar-charger", WQ_HIGHPRI | WQ_FREEZABLE, 1);
+	chg->wq = devm_alloc_workqueue(dev, "tristar-charger",
+				       WQ_UNBOUND | WQ_HIGHPRI | WQ_FREEZABLE, 1);
 	if (!chg->wq)
 		return -ENOMEM;
 	INIT_DELAYED_WORK(&chg->poll_work, tristar_poll);

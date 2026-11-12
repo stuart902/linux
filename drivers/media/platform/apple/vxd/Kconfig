@@ -11,7 +11,8 @@ config VIDEO_APPLE_VXD
 	help
 	  Support for the Apple "VXD" video decoder of the S8000/S8003 (A9)
 	  SoCs: an Imagination PowerVR MSVDX core driven by the DEVA (MTX)
-	  firmware. It is exposed as a V4L2 stateless H.264 decoder.
+	  firmware. It is exposed as a V4L2 stateless H.264 decoder, and as
+	  an HEVC (H.265 Main) decoder on the SoCs whose decoder has it.
 
 	  The driver needs the DEVA firmware as apple/vxd-deva.bin.
 
