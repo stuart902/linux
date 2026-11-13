@@ -95,6 +95,8 @@ struct sio_dma_chan {
 	struct sio_dma_desc *active;
 	unsigned int inflight;
 	bool stopping;
+	bool faulted;
+	bool idle_seen;
 	struct work_struct submit_work;
 	struct work_struct stop_work;
 	struct completion drained;
@@ -222,7 +224,7 @@ sio_dma_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 	unsigned int nsegs = 0, i;
 	u32 *seg;
 
-	if (!sio_dma_dir_ok(dir) || !sg_len)
+	if (READ_ONCE(chan->faulted) || !sio_dma_dir_ok(dir) || !sg_len)
 		return NULL;
 
 	for_each_sg(sgl, sg, sg_len, i) {
@@ -261,7 +263,8 @@ sio_dma_prep_cyclic(struct dma_chan *c, dma_addr_t buf, size_t buf_len,
 	struct sio_dma_desc *desc;
 	unsigned int n, i;
 
-	if (!sio_dma_dir_ok(dir) || !period_len || buf_len % period_len)
+	if (READ_ONCE(chan->faulted) || !sio_dma_dir_ok(dir) ||
+	    !period_len || buf_len % period_len)
 		return NULL;
 
 	n = buf_len / period_len;
@@ -291,6 +294,42 @@ sio_dma_prep_cyclic(struct dma_chan *c, dma_addr_t buf, size_t buf_len,
 	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
 }
 
+static void sio_dma_fault(struct sio_dma_chan *chan)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&chan->vc.lock, flags);
+	chan->faulted = true;
+	if (chan->active)
+		chan->active->status = -EIO;
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
+}
+
+/* Never return a published configuration slot on a local deadline. */
+static int sio_dma_request_owned(struct sio_dma_chan *chan, u8 opcode,
+				u32 data, unsigned long timeout)
+{
+	struct apple_sio_async *request;
+	int ret;
+
+	request = apple_sio_request_async_owned(chan->host->sio, chan->endpoint,
+					       opcode, 0, data, SIO_DMA_OP_ACK,
+					       NULL, NULL);
+	if (IS_ERR(request))
+		return PTR_ERR(request);
+	ret = apple_sio_async_wait(request, timeout, NULL);
+	if (ret == -ETIME) {
+		sio_dma_fault(chan);
+		dev_err(chan->host->dev,
+			"ep %#x: waiting for opcode %#x reply; teardown may block indefinitely\n",
+			chan->endpoint, opcode);
+		/* A late expected reply returns ownership, but does not heal the channel. */
+		ret = apple_sio_async_wait(request, 0, NULL);
+	}
+	apple_sio_async_put(request);
+	return ret;
+}
+
 static int sio_dma_configure(struct sio_dma_chan *chan)
 {
 	struct apple_sio *sio = chan->host->sio;
@@ -300,6 +339,10 @@ static int sio_dma_configure(struct sio_dma_chan *chan)
 	int ret;
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
+	if (chan->faulted) {
+		spin_unlock_irqrestore(&chan->vc.lock, flags);
+		return -EIO;
+	}
 	if (!chan->cfg_dirty) {
 		spin_unlock_irqrestore(&chan->vc.lock, flags);
 		return 0;
@@ -326,10 +369,8 @@ static int sio_dma_configure(struct sio_dma_chan *chan)
 	rec[SIO_DMA_HDR_FLAGS] = 0;
 	dma_wmb();
 
-	ret = apple_sio_request(sio, chan->endpoint, SIO_DMA_OP_CONFIGURE, 0,
-				slot, SIO_DMA_OP_ACK,
-				msecs_to_jiffies(SIO_DMA_CONFIG_TIMEOUT_MS),
-				NULL);
+	ret = sio_dma_request_owned(chan, SIO_DMA_OP_CONFIGURE, slot,
+				    msecs_to_jiffies(SIO_DMA_CONFIG_TIMEOUT_MS));
 	apple_sio_desc0_free(sio, slot, SIO_DMA_CFG_SLOTS);
 	if (ret)
 		goto fail;
@@ -362,7 +403,10 @@ static void sio_dma_block_done(void *data, int status, u64 response)
 	if (!WARN_ON_ONCE(!chan->inflight))
 		chan->inflight--;
 
-	if (chan->active == desc && !chan->stopping) {
+	if (chan->active == desc && !chan->stopping && !chan->faulted) {
+		/* Tagged completion data is the transferred byte count. */
+		if (!status && FIELD_GET(SIO_DMA_MSG_DATA, response) != b->len)
+			status = -EIO;
 		if (status) {
 			desc->status = status;
 			dev_err_ratelimited(chan->host->dev,
@@ -370,7 +414,7 @@ static void sio_dma_block_done(void *data, int status, u64 response)
 					    chan->endpoint, status);
 		}
 		if (desc->cyclic) {
-			if (!status) {
+			if (!desc->status) {
 				desc->done++;
 				vchan_cyclic_callback(&desc->vd);
 				kick = true;
@@ -385,12 +429,14 @@ static void sio_dma_block_done(void *data, int status, u64 response)
 		}
 	}
 
-	if (chan->stopping && !chan->inflight)
+	if (chan->stopping && !status)
+		chan->idle_seen = !chan->inflight;
+	if (chan->stopping && !chan->inflight && chan->idle_seen)
 		complete(&chan->drained);
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
+	/* Serialize the kick with the transition to stopping. */
 	if (kick)
 		queue_work(system_highpri_wq, &chan->submit_work);
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static void sio_dma_submit_work(struct work_struct *work)
@@ -412,7 +458,7 @@ static void sio_dma_submit_work(struct work_struct *work)
 		unsigned int idx;
 
 		spin_lock_irqsave(&chan->vc.lock, flags);
-		if (chan->stopping)
+		if (chan->stopping || chan->faulted)
 			goto unlock_out;
 		if (!chan->active) {
 			vd = vchan_next_desc(&chan->vc);
@@ -434,7 +480,7 @@ static void sio_dma_submit_work(struct work_struct *work)
 		spin_unlock_irqrestore(&chan->vc.lock, flags);
 
 		dma_wmb();
-		req = apple_sio_request_async(sio, chan->endpoint,
+		req = apple_sio_request_async_owned(sio, chan->endpoint,
 					      SIO_DMA_OP_SUBMIT, 0,
 					      b->first_slot,
 					      SIO_DMA_OP_COMPLETE,
@@ -449,7 +495,7 @@ static void sio_dma_submit_work(struct work_struct *work)
 		b->queued = false;
 		chan->inflight--;
 		desc->next = idx;
-		if (chan->stopping && !chan->inflight)
+		if (chan->stopping && !chan->inflight && chan->idle_seen)
 			complete(&chan->drained);
 		spin_unlock_irqrestore(&chan->vc.lock, flags);
 
@@ -472,32 +518,38 @@ static void sio_dma_stop_work(struct work_struct *work)
 {
 	struct sio_dma_chan *chan = container_of(work, struct sio_dma_chan,
 						 stop_work);
-	struct apple_sio *sio = chan->host->sio;
 	struct sio_dma_desc *desc;
 	unsigned long flags, timeout;
-	bool busy, issued;
+	bool issued;
 	int ret;
+	unsigned int attempts = 0;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
-	busy = chan->inflight;
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	/* No earlier submission or configuration may overtake STOP. */
+	flush_work(&chan->submit_work);
 
-	if (busy) {
-		ret = apple_sio_request(sio, chan->endpoint, SIO_DMA_OP_STOP, 0,
-					0, SIO_DMA_OP_ACK,
-					msecs_to_jiffies(SIO_DMA_STOP_TIMEOUT_MS),
-					NULL);
-		if (ret)
-			dev_warn(chan->host->dev, "ep %#x: stop failed: %d\n",
-				 chan->endpoint, ret);
-
-		timeout = msecs_to_jiffies(SIO_DMA_DRAIN_TIMEOUT_MS);
-		if (!wait_for_completion_timeout(&chan->drained, timeout)) {
-			dev_warn(chan->host->dev,
-				 "ep %#x: %u commands left after stop, cancelling\n",
-				 chan->endpoint, READ_ONCE(chan->inflight));
-			apple_sio_cancel_endpoint(sio, chan->endpoint);
+	for (;;) {
+		ret = sio_dma_request_owned(chan, SIO_DMA_OP_STOP, 0,
+					    msecs_to_jiffies(SIO_DMA_STOP_TIMEOUT_MS));
+		if (!ret)
+			break;
+		/* Owned requests return errors only when never published. */
+		if (++attempts == SIO_DMA_SUBMIT_RETRIES) {
+			sio_dma_fault(chan);
+			dev_err(chan->host->dev,
+				"ep %#x: cannot send STOP (%d); retaining buffers and retrying\n",
+				chan->endpoint, ret);
 		}
+		msleep(100);
+	}
+
+	/* STOP ACK alone does not retire any submitted descriptor. */
+	timeout = msecs_to_jiffies(SIO_DMA_DRAIN_TIMEOUT_MS);
+	if (!wait_for_completion_timeout(&chan->drained, timeout)) {
+		sio_dma_fault(chan);
+		dev_err(chan->host->dev,
+			"ep %#x: waiting for firmware idle and %u commands; teardown may block indefinitely\n",
+			chan->endpoint, READ_ONCE(chan->inflight));
+		wait_for_completion(&chan->drained);
 	}
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
@@ -505,13 +557,12 @@ static void sio_dma_stop_work(struct work_struct *work)
 	chan->active = NULL;
 	if (desc)
 		vchan_terminate_vdesc(&desc->vd);
-	chan->inflight = 0;
+	WARN_ON_ONCE(chan->inflight);
 	chan->stopping = false;
-	issued = !list_empty(&chan->vc.desc_issued);
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
+	issued = !chan->faulted && !list_empty(&chan->vc.desc_issued);
 	if (issued)
 		queue_work(system_highpri_wq, &chan->submit_work);
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static void sio_dma_issue_pending(struct dma_chan *c)
@@ -521,11 +572,12 @@ static void sio_dma_issue_pending(struct dma_chan *c)
 	bool issued;
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
-	issued = vchan_issue_pending(&chan->vc) && !chan->stopping;
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
-
+	issued = vchan_issue_pending(&chan->vc) && !chan->stopping &&
+		 !chan->faulted;
+	/* A stop must observe this queued work before it flushes. */
 	if (issued)
 		queue_work(system_highpri_wq, &chan->submit_work);
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static int sio_dma_terminate_all(struct dma_chan *c)
@@ -543,8 +595,7 @@ static int sio_dma_terminate_all(struct dma_chan *c)
 		if (chan->vc.cyclic == &chan->active->vd)
 			chan->vc.cyclic = NULL;
 		reinit_completion(&chan->drained);
-		if (!chan->inflight)
-			complete(&chan->drained);
+		chan->idle_seen = false;
 		stop = true;
 	}
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
@@ -559,7 +610,9 @@ static void sio_dma_synchronize(struct dma_chan *c)
 {
 	struct sio_dma_chan *chan = to_sio_chan(c);
 
-	/* the stop work is bounded by its own timeouts */
+	/* A queued configure may exist even when no descriptor became active. */
+	flush_work(&chan->submit_work);
+	/* Failure waits deliberately retain client buffers until firmware retires them. */
 	flush_work(&chan->stop_work);
 	vchan_synchronize(&chan->vc);
 }
@@ -620,6 +673,8 @@ static int sio_dma_slave_config(struct dma_chan *c,
 	struct apple_sio_dma_config cfg = sio_dma_default_cfg;
 	unsigned long flags;
 
+	if (READ_ONCE(chan->faulted))
+		return -EIO;
 	if (!sio_dma_dir_ok(sc->direction))
 		return -EINVAL;
 
@@ -651,6 +706,8 @@ static int sio_dma_alloc_chan_resources(struct dma_chan *c)
 {
 	struct sio_dma_chan *chan = to_sio_chan(c);
 
+	if (READ_ONCE(chan->faulted))
+		return -EIO;
 	chan->cfg = sio_dma_default_cfg;
 	chan->cfg_dirty = true;
 	return 0;
@@ -687,12 +744,25 @@ static void sio_dma_notify(void *data, u64 message)
 {
 	struct sio_dma_chan *chan = data;
 	u8 op = FIELD_GET(SIO_DMA_MSG_OPCODE, message);
+	unsigned long flags;
 
 	switch (op) {
 	case SIO_DMA_OP_ACK:		/* ack of an async submit */
-	case SIO_DMA_OP_COMPLETE:	/* idle notification (no tag) */
 		break;
+	case SIO_DMA_OP_COMPLETE:	/* idle notification (no tag) */
+		/* Unmatched tagged completions cannot establish this stop's idle. */
+		if (message & BIT_ULL(31))
+			break;
+		spin_lock_irqsave(&chan->vc.lock, flags);
+		if (chan->stopping && !chan->inflight) {
+			chan->idle_seen = true;
+			complete(&chan->drained);
+		}
+		spin_unlock_irqrestore(&chan->vc.lock, flags);
+		break;
+	case 0x6a:			/* request error is not an ownership fence */
 	case SIO_DMA_OP_ASYNC_ERROR:
+		sio_dma_fault(chan);
 		dev_err_ratelimited(chan->host->dev,
 				    "ep %#x: async error %#llx\n",
 				    chan->endpoint,
